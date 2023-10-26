@@ -55,7 +55,7 @@ include conf/$(mode).mk
 # But also allow the user to specify a cross-compiled target architecture
 # by setting either "ARCH" or "arch" in the make command line, or the "ARCH"
 # environment variable.
-HOST_CXX := g++
+HOST_CXX := c++
 
 detect_arch = $(word 1, $(shell { echo "x64        __x86_64__";  \
                                   echo "aarch64    __aarch64__"; \
@@ -102,7 +102,7 @@ include conf/profiles/$(arch)/$(drivers_profile).mk
 include conf/profiles/$(arch)/base.mk
 
 CROSS_PREFIX ?= $(if $(filter-out $(arch),$(host_arch)),$(arch)-linux-gnu-)
-CXX=$(CROSS_PREFIX)g++
+CXX=$(CROSS_PREFIX)c++
 CC=$(CROSS_PREFIX)gcc
 LD=$(CROSS_PREFIX)ld.bfd
 export STRIP=$(CROSS_PREFIX)strip
@@ -292,7 +292,7 @@ endif
 #     returns option if file builds with -ffoo, empty otherwise
 compiler-flag = $(shell $(CXX) $(CFLAGS_WERROR) $1 -o /dev/null -c $3  > /dev/null 2>&1 && echo $2)
 
-compiler-specific := $(call compiler-flag, -std=gnu++11, -DHAVE_ATTR_COLD_LABEL, compiler/attr/cold-label.cc)
+compiler-specific := $(call compiler-flag, -std=gnu++14, -DHAVE_ATTR_COLD_LABEL, compiler/attr/cold-label.cc)
 
 source-dialects = -D_GNU_SOURCE
 
@@ -356,7 +356,7 @@ gc-flags = $(gc-flags-$(conf_hide_symbols))
 
 gcc-opt-Og := $(call compiler-flag, -Og, -Og, compiler/empty.cc)
 
-CXXFLAGS = -std=gnu++11 $(COMMON) $(cxx-hide-flags)
+CXXFLAGS = -std=gnu++14 $(COMMON) $(cxx-hide-flags)
 CFLAGS = -std=gnu99 $(COMMON)
 
 # should be limited to files under libc/ eventually
@@ -2053,7 +2053,6 @@ else
     boost-mt := $(if $(filter %-mt.a, $(wildcard $(boost-lib-dir)/*.a)),-mt)
     boost-includes = -isystem $(boost_base)/usr/include
 endif
-
 boost-libs := $(boost-lib-dir)/libboost_system$(boost-mt).a
 
 objects += fs/nfs/nfs_null_vfsops.o

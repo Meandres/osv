@@ -28,32 +28,24 @@ qemu-utils \
 libaio-dev \
 vim \
 ack
+RUN apt install -y wget
 
 # - prepare directories
 RUN mkdir /git-repos
 
 # - clone OSv
-WORKDIR /git-repos
-ARG GIT_ORG_OR_USER=Meandres
-RUN git clone https://github.com/${GIT_ORG_OR_USER}/osv.git
+#WORKDIR /git-repos
+#ARG GIT_ORG_OR_USER=Meandres
+#RUN git clone https://github.com/${GIT_ORG_OR_USER}/osv.git
 
-WORKDIR /git-repos/osv
-RUN git submodule update --init --recursive
-RUN ./scripts/setup.py
-
-# - install Capstan
-ADD https://github.com/cloudius-systems/capstan/releases/latest/download/capstan /usr/local/bin/capstan
-RUN chmod u+x /usr/local/bin/capstan
+#WORKDIR /git-repos/osv
+#RUN git submodule update --init --recursive
+#RUN ./scripts/setup.py
 
 # - add vmcache
 WORKDIR /git-repos
 RUN git clone https://github.com/Meandres/vmcache.git
-RUN cd vmcache && make 
-
-# - add the sample test
-WORKDIR /git-repos
-RUN git clone https://github.com/Meandres/sample_osv_block_device.git
-RUN cd sample_osv_block_device && make 
+#RUN cd vmcache && make 
 
 WORKDIR /git-repos
 RUN wget http://nz2.archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
