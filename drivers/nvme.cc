@@ -5,6 +5,7 @@
 #include "drivers/pci-device.hh"
 #include "drivers/rdtsc.h"
 #include <osv/interrupt.hh>
+#include <osv/virt_to_phys.hh>
 
 #include <cassert>
 #include <sstream>
@@ -49,6 +50,8 @@ vfio_dma_t* vfio_dma_alloc(size_t size)
       p->buf = (void*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(p->buf, size, MADV_NOHUGEPAGE);
       memset(p->buf, 0, size);
+      //p->addr = mmu::virt_to_phys(p->buf) * 4096;
+      //p->addr = (uintptr_t)p->buf;
       p->addr = walk(p->buf).phys * 4096;
    } else {
       assert(size <= 2*1024*1024);

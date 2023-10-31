@@ -50,3 +50,5 @@ modules/dl_tests/usr.manifest
 .idea
 compile_commands.json
 downloaded_packages
+
+nvme.img
