@@ -95,7 +95,7 @@ nvme::nvme(pci::device &dev)
     const unvme_ns_t* ns = unvme_open();
     if (!ns) exit(1);
     printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
-    printf("ps=%d qc=%d/%d qs=%d/%d bc=%#lx bs=%d mbio=%d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
+    printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
 
     unsigned datasize = 4096;
     char* buf = (char*)unvme_alloc(ns, datasize);
@@ -105,12 +105,12 @@ nvme::nvme(pci::device &dev)
 
     {
        unsigned repeat = 10000;
-       double start = gettime();
+       //double start = gettime();
        for (unsigned i=0; i<repeat; i++) {
           ret = unvme_read(ns, 0, buf, (i*8) % 32768, 8);
           assert(ret==0);
        }
-       double end = gettime();
+       //double end = gettime();
        //printf("%llu us\n", (end-start)*1e6/repeat);
     }
 }
