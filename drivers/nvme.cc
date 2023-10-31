@@ -111,7 +111,7 @@ nvme::nvme(pci::device &dev)
           assert(ret==0);
        }
        double end = gettime();
-       std::cout << (end-start)*1e6/repeat << "us" << std::endl;
+       //printf("%llu us\n", (end-start)*1e6/repeat);
     }
 }
 
@@ -139,7 +139,6 @@ void nvme::parse_pci_config()
 
 hw_driver* nvme::probe(hw_device* dev)
 {
-   printf("probing nvme\n");
    if (auto pci_dev = dynamic_cast<pci::device*>(dev)) {
       if ((pci_dev->get_base_class_code()==1) && (pci_dev->get_sub_class_code()==8) && (pci_dev->get_programming_interface()==2)) // detect NVMe device
          return aligned_new<nvme>(*pci_dev);
