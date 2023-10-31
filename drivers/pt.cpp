@@ -2,7 +2,7 @@
 
 constexpr uintptr_t get_mem_area_base(u64 area)
 {
-    return 0xffff800000000000 | uintptr_t(area) << 44;
+    return 0x400000000000 | uintptr_t(area) << 44;
 }
 
 /*Page* phys_to_virt(u64 phys) {
