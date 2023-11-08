@@ -14,6 +14,8 @@ FROM ubuntu:${DIST_VERSION}
 ENV DEBIAN_FRONTEND noninteractive
 ENV TERM=linux
 
+RUN mkdir -p /root/.config/gdb && echo "add-auto-load-safe-path /git-repos/osv/scripts/loader.py" > /root/.config/gdb/gdbinit
+
 #COPY ./etc/keyboard /etc/default/keyboard
 #COPY ./etc/console-setup /etc/default/console-setup
 
