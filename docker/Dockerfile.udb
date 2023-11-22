@@ -45,9 +45,13 @@ RUN mkdir /git-repos
 #RUN ./scripts/setup.py
 
 # - add vmcache
-WORKDIR /git-repos
-RUN git clone https://github.com/Meandres/vmcache.git
+#WORKDIR /git-repos
+#RUN git clone https://github.com/Meandres/vmcache.git
 #RUN cd vmcache && make 
+
+# - add exmap
+#WORKDIR /git-repos
+#RUN git clone https://github.com/tuhhosg/exmap.git
 
 WORKDIR /git-repos
 RUN wget http://nz2.archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb

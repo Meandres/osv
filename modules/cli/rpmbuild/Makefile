@@ -5,7 +5,10 @@ VERSION=1.0
 
 MAIN=rpm
 CLI_DIR=osv-cli-$(VERSION)/usr/lib64/osv-cli
-LUA_LIB_PATH = $(shell ldconfig -p | grep -Po "/.*liblua*.5\.3.so" | head -1)
+if [[ -z "$(LUA_LIB_PATH)" ]]; then
+	LUA_LIB_PATH = $(shell ldconfig -p | grep -Po "/.*liblua*.5\.3.so" | head -1)
+fi
+
 
 module: clean all
 

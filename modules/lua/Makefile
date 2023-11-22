@@ -87,7 +87,7 @@ $(CDIR)/path.lua: $(LUA_ROCKS)
 LuaSec: $(CDIR)/ssl.lua
 
 $(CDIR)/ssl.lua: $(LUA_ROCKS)
-	$(LUA_ROCKS_INSTALL_MODULE) LuaSec 0.8-1
+	$(LUA_ROCKS_INSTALL_MODULE) LuaSec 0.8-1 OPENSSL_DIR=$(OPENSSL_DIR)
 
 clean:
 	rm -rf install
