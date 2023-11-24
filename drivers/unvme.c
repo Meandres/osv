@@ -34,7 +34,12 @@
  * @brief UNVMe client library interface functions.
  */
 
+//#include "osv/trace.hh"
+
 #include "unvme_core.h"
+#include "unvme_log.h"
+
+//TRACEPOINT(trace_unvme_read, "size=%d, nlb=%u", int, u32); 
 
 /**
  * Open a client session with specified number of IO queues and queue size.
@@ -201,6 +206,7 @@ int unvme_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid,
  */
 int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb)
 {
+    //trace_unvme_read(qid, nlb);
     unvme_iod_t iod = unvme_aread(ns, qid, buf, slba, nlb);
     if (iod) {
         sched_yield();

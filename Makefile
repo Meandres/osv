@@ -872,6 +872,7 @@ drivers += drivers/pci-bridge.o
 endif
 ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
+#drivers += drivers/unvme.o
 endif
 drivers += drivers/driver.o
 

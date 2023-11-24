@@ -36,7 +36,7 @@ class linked_item {
 public:
     T value;
     linked_item<T> *next;
-    linked_item<T>() : value(), next(nullptr) { }
+    linked_item() : value(), next(nullptr) { }
     explicit linked_item<T>(T val) : value(val), next(nullptr) { }
  };
 

@@ -94,8 +94,8 @@ nvme::nvme(pci::device &dev)
 
     const unvme_ns_t* ns = unvme_open();
     if (!ns) exit(1);
-    //printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
-    //printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
+    printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
+    printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
 
     unsigned datasize = 4096;
     char* buf = (char*)unvme_alloc(ns, datasize);
@@ -114,9 +114,6 @@ nvme::nvme(pci::device &dev)
        //printf("%llu us\n", (end-start)*1e6/repeat);
     }
 
-    //struct device *dev;
-    //std::string dev_name("nvme0");
-    //dev = device_create(&
 }
 
 void nvme::dump_config(void)
