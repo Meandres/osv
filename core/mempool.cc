@@ -1216,7 +1216,7 @@ struct l1 {
     }
     void push(void* page)
     {
-        assert(nr < 512);
+        assert(nr < max);
         _pages[nr++] = page;
         l1_pool_stats[cpu_id]._nr = nr;
 

@@ -367,6 +367,8 @@ ASFLAGS = -g $(autodepend) -D__ASSEMBLY__
 
 $(out)/fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
 
+$(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w
+
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/sys
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/
 # for machine/
@@ -872,7 +874,9 @@ drivers += drivers/pci-bridge.o
 endif
 ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
-#drivers += drivers/unvme.o
+endif
+ifeq ($(conf_drivers_vmcache),1)
+drivers += drivers/vmcache.o
 endif
 drivers += drivers/driver.o
 
