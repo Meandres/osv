@@ -189,9 +189,11 @@ def start_osv_qemu(options):
         args += [
         "-device", "virtio-blk-pci,id=blk1,drive=hd1,scsi=off%s" % options.virtio_device_suffix,
         "-drive", "file=%s,if=none,id=hd1" % (options.second_disk_image)]
-    
+   
+    if options.nvme_file:
+        args += ["-device", "nvme,serial=nvme-1,drive=nvm", "-drive", "format=raw,file=nvme.img,if=none,id=nvm"];
+
     if options.nvme:
-        #args += ["-device", "nvme,serial=nvme-1,drive=nvm", "-drive", "format=raw,file=nvme.img,if=none,id=nvm"];
         args += [ "-device", "vfio-pci,host=%s"%options.nvme ];
 
     if options.virtio_fs_tag:
@@ -541,6 +543,8 @@ if __name__ == "__main__":
                         help="use virtio-scsi instead of virtio-blk")
     parser.add_argument("-A", "--sata", action="store_true", default=False,
                         help="use AHCI instead of virtio-blk")
+    parser.add_argument( "--nvme-file", action="store_true", default=False,
+                        help="use qemu emulated nvme device (need nvme.img")
     parser.add_argument( "--nvme", action="store", default="",
                         help="use nvme device (provide PCI_ID)")
     parser.add_argument("-I", "--ide", action="store_true", default=False,
