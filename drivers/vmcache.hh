@@ -27,10 +27,10 @@
 
 #include <cstring>
 #include "drivers/nvme.hh"
-//#include "drivers/ymap.hh"
 #include "drivers/rdtsc.h"
 #include "osv/trace.hh"
 #include <osv/clock.hh>
+#include "drivers/ymap.hh"
 
 #include <chrono>
 #include <mutex>
@@ -38,22 +38,13 @@
 typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
 enum parts{
 	allocpage,
-	allocpageinsert,
-	allocpagetrylock,
 	readpage,
-	readnvme,
-	readcpy,
+	readpage_copy,
 	evictpage,
-	evictpaged0,
-	evictpaged1,
-	evictpaged2,
-	evictpaged3,
-	evictpaged4,
-	evictpaged5,
 	btreeinsert
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "allocPage -> residentSet.insert()", "allocPage -> tryLock()", "BufferManager::readPage()", "readPage -> unvme_read()", "readPage -> memcpy()", "BufferManager::evict()", "evict -> find candidates", "evict -> write dirty pages", "evict -> try lock clean", "evict -> try upgrade lock", "evict -> remove page table", "evict -> remove hash table", "BTree::insert()" };
-const unsigned parts_num = 14;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage() -> unvme_read()", "BufferManager::readPage() -> memcpy()", "BufferManager::evict()", "BTree::insert()" };
+const unsigned parts_num = 4;
 
 std::mutex thread_mutex;
 extern __thread elapsed_time parts_time[parts_num];
@@ -79,11 +70,11 @@ void print_aggregate_avg(){
 
 typedef u64 PID; // page id type
 
-static const u64 pageSize = 4096;
+//static const u64 pageSize = 4096;
 
-struct alignas(4096) Page {
+/*struct alignas(4096) Page {
    bool dirty;
-};
+};*/
 
 static const int16_t maxWorkerThreads = 32;
 static const int16_t maxQueues = 32;
@@ -190,24 +181,27 @@ struct OSvAIOInterface {
    
    const unvme_ns_t* ns;
    int qid;
-   Page* virtMem;
+   //Page* virtMem;
    void* buffer[maxIOs];
    unvme_iod_t io_desc_array[maxIOs];
 
    //OSvAIOInterface(Page* virtMem, int workerThread, const unvme_ns_t* ns);
    //void writePages(const std::vector<PID>& pages); 
-   OSvAIOInterface(Page* virtMem, int workerThread, const unvme_ns_t* ns) : ns(ns), qid(workerThread%maxQueues), virtMem(virtMem) {
+   OSvAIOInterface(int workerThread, const unvme_ns_t* ns) : ns(ns), qid(workerThread%maxQueues){ //, virtMem(virtMem) {
       for(u64 i=0; i<maxIOs; i++){
          buffer[i]=unvme_alloc(ns, pageSize);
+	 assert(buffer[i] != NULL);
       }
    }
 
-   void writePages(const std::vector<PID>& pages) {
+   void writePages(Page* virtMem, const std::vector<PID>& pages) {
         assert(pages.size() < maxIOs);
         for (u64 i=0; i<pages.size(); i++) {
                 PID pid = pages[i];
+		//std::cout << i << " : " << virtMem+pid << " into " << buffer[i] <<  std::endl;
                 virtMem[pid].dirty = false;
-                memcpy(buffer[i], &virtMem[pid], pageSize);
+		//std::cout << i << " : " << virtMem+pid << " into " << buffer[i] <<  std::endl;
+                memcpy(buffer[i], virtMem+pid, pageSize);
                 io_desc_array[i] = unvme_awrite(ns, qid, buffer[i], (pageSize*pid)/blockSize, pageSize/blockSize);
                 assert(io_desc_array[i]!=NULL);
         }
@@ -218,7 +212,7 @@ struct OSvAIOInterface {
    }
 };
 
-extern __thread uint16_t workerThreadId;
+extern __thread uint16_t wtid;
 
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
@@ -227,7 +221,8 @@ struct BufferManager {
    u64 physSize;
    u64 virtCount;
    u64 physCount;
-   std::vector<OSvAIOInterface> osvaioInterface;
+   int n_threads;
+   std::vector<OSvAIOInterface*> osvaioInterfaces;
 
    std::atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
@@ -243,7 +238,7 @@ struct BufferManager {
    bool initialized=false;
 
    const unvme_ns_t* ns; //NVMe thingies
-   void* dma_read_buffer[maxWorkerThreads];
+   std::vector<void*> dma_read_buffers;
 
    PageState& getPageState(PID pid) {
       return pageState[pid];
@@ -272,6 +267,17 @@ struct BufferManager {
 struct OLCRestartException{};
 
 extern BufferManager bm;
+
+void handle_segfault(int signo, siginfo_t* info, void* extra){
+	void* page = info->si_addr;
+	if(bm.isValidPtr(page)){
+		std::cerr << "Segfault restart " << bm.toPID(page) << std::endl;
+		throw OLCRestartException();
+	}else{
+		std::cerr << "Real segfault " << page << std::endl;
+		exit(1);
+	}
+}
 
 /*static BufferManager* getBM(){
 	return &bm;
@@ -733,8 +739,9 @@ struct BTree {
    ~BTree();
    
    GuardO<BTreeNode> findLeafO(std::span<u8> key);
-   int lookup(std::span<u8> key, u8* payloadOut, unsigned payloadOutSize);
-   template<class Fn> inline bool lookup(std::span<u8> key, Fn fn){
+   int lookup(std::span<u8> key, u8* payloadOut, unsigned payloadOutSize, u16 tid);
+   template<class Fn> inline bool lookup(std::span<u8> key, Fn fn, u16 tid){
+	   wtid = tid;
 	   for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
@@ -751,10 +758,11 @@ struct BTree {
    }
    //bool lookup(std::span<u8> key, void(*fn)(std::span<u8>));
 
-   void insert(std::span<u8> key, std::span<u8> payload);
-   bool remove(std::span<u8> key);
+   void insert(std::span<u8> key, std::span<u8> payload, u16 tid);
+   bool remove(std::span<u8> key, u16 tid);
 
-   template<class Fn> inline bool updateInPlace(std::span<u8> key, Fn fn) {
+   template<class Fn> inline bool updateInPlace(std::span<u8> key, Fn fn, u16 tid) {
+      wtid = tid;
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
@@ -772,9 +780,10 @@ struct BTree {
       }
    }
 
-   GuardS<BTreeNode> findLeafS(std::span<u8> key);
-   template<class Fn> inline void scanAsc(std::span<u8> key, Fn fn) {
-      GuardS<BTreeNode> node = findLeafS(key);
+   GuardS<BTreeNode> findLeafS(std::span<u8> key, u16 tid);
+   template<class Fn> inline void scanAsc(std::span<u8> key, Fn fn, u16 tid) {
+      wtid = tid;
+      GuardS<BTreeNode> node = findLeafS(key, tid);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -791,8 +800,9 @@ struct BTree {
       }
    }
 
-   template<class Fn>inline void scanDesc(std::span<u8> key, Fn fn) {
-	GuardS<BTreeNode> node = findLeafS(key);
+   template<class Fn>inline void scanDesc(std::span<u8> key, Fn fn, u16 tid) {
+	wtid = tid;
+	GuardS<BTreeNode> node = findLeafS(key, tid);
 	bool exactMatch;
     int pos = node->lowerBound(key, exactMatch);
     if (pos == node->count) {
@@ -807,7 +817,7 @@ struct BTree {
         }
     	if (!node->hasLowerFence())
         	return;
-        node = findLeafS(node->getLowerFence());
+        node = findLeafS(node->getLowerFence(), tid);
         pos = node->count-1;
     }
 }

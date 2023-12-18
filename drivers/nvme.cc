@@ -60,7 +60,7 @@
 #include <osv/device.h>
 #include <osv/ioctl.h>
 #include <osv/contiguous_alloc.hh>
-#include "drivers/pt.cpp"
+#include "drivers/ymap.hh"
 #include <sys/time.h>
 
 // Static global variables

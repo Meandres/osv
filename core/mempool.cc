@@ -36,6 +36,7 @@
 #include <boost/lockfree/policies.hpp>
 #include <osv/migration-lock.hh>
 #include <osv/export.h>
+#include "drivers/ymap.hh"
 
 TRACEPOINT(trace_memory_malloc, "buf=%p, len=%d, align=%d", void *, size_t,
            size_t);
@@ -1802,6 +1803,12 @@ void free_initial_memory_range(void* addr, size_t size)
     if (!size) {
         return;
     }
+    /*u64 threshold = 16ull * 1024*1024*1024;
+    if(size > threshold){
+	size-=threshold;
+	YmapRegionStartAddr = (reinterpret_cast<u64>(addr+size));
+	YmapRegionSize = threshold;
+    }*/
 
     on_new_memory(size);
 

@@ -74,3 +74,4 @@ export conf_drivers_mmio?=0
 export conf_drivers_scsi?=0
 export conf_drivers_nvme?=0
 export conf_drivers_vmcache?=0
+export conf_vmcache_ymap?=0

@@ -11,7 +11,6 @@
 #include <set>
 #include <thread>
 #include <vector>
-//#include "drivers/span.hh"
 #include <span>
 
 #include <libaio.h>
@@ -24,6 +23,7 @@
 #include <immintrin.h>
 
 #include "drivers/vmcache.hh"
+#include <osv/mmu.hh>
 //#include "drivers/nvme.hh"
 
 using namespace std;
@@ -158,14 +158,13 @@ void OSvAIOInterface::writePages(const vector<PID>& pages) {
        		assert(ret==0);
 	}
 }*/
-__thread uint16_t workerThreadId=0;
+__thread uint16_t wtid = 0;
 BufferManager bm;
 
 template<class T>
-struct AllocGuard : public GuardX<T> {
-	
+struct AllocGuard : public GuardX<T> {	
    template <typename ...Params>
-   AllocGuard(Params&&... params): GuardX<T>() {
+   AllocGuard(Params&&... params) {
       GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
       GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
@@ -181,6 +180,8 @@ u64 envOr(const char* env, u64 value) {
 BufferManager::BufferManager(){}
 	//: virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
 void BufferManager::init(){
+   n_threads = envOr("THREADS", 1);
+   assert(n_threads<=maxWorkerThreads);
    virtSize = envOr("VIRTGB", 16)*gb;
    physSize = envOr("PHYSGB", 4)*gb;
    virtCount = virtSize / pageSize;
@@ -189,22 +190,47 @@ void BufferManager::init(){
    assert(virtSize>=physSize);
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-    virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+   // Initialise phys mappers
+#ifdef VMCACHE_YMAP
+	createYmapInterfaces(physCount, n_threads);
+#endif //VMCACHE_YMAP
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
    for (u64 i=0; i<virtCount; i++)
       pageState[i].init();
-   if (virtMem == MAP_FAILED)
-      cerr << "mmap failed" << endl;
 
    ns = unvme_open();
-   for(int i=0; i<maxWorkerThreads; i++)
-      dma_read_buffer[i] = unvme_alloc(ns, pageSize);
-   osvaioInterface.reserve(maxWorkerThreads);
-   for(unsigned i=0; i<maxWorkerThreads; i++)
-      osvaioInterface.emplace_back(OSvAIOInterface(virtMem, i, ns));
+   dma_read_buffers.reserve(n_threads);
+   for(int i=0; i<n_threads; i++)
+      dma_read_buffers.push_back(unvme_alloc(ns, pageSize));
+   osvaioInterfaces.reserve(n_threads);
+   for(unsigned i=0; i<n_threads; i++)
+      osvaioInterfaces.emplace_back(new OSvAIOInterface(i, ns));
+
+   // Initialize virtual pages
+   virtMem = (Page*) mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+   //std::cout << "virtMem "<< virtMem << " - " << virtMem+virtCount << std::endl;
+   if (virtMem == MAP_FAILED)
+      cerr << "mmap failed" << endl;
+   for(u64 i=0; i<virtCount; i++){
+	//if(i%512 == 0){
+   	//	madvise(virtMem+1, pageSize*512, MADV_NOHUGEPAGE);
+	//}
+	// page fault to create page table levels
+	// do we need this ?
+	bool b = virtMem[i].dirty;
+	assert(!b);
+	
+	madvise(virtMem+i, pageSize, MADV_DONTNEED);
+	// install zeroPages
+	atomic<u64>* ptePtr = walkRef(virtMem+i);
+	ptePtr->store(0ull);
+   }
+   invalidateTLB();
    
+   //u64 phys = PTE(*walkRef(virtMem+512)).phys;
+      
    batch = envOr("BATCH", 64);
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
@@ -222,7 +248,7 @@ void BufferManager::ensureFreePages() {
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
-   auto start = osv::clock::uptime::now();
+   //auto start = osv::clock::uptime::now();
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
@@ -230,24 +256,20 @@ Page* BufferManager::allocPage() {
       cerr << "VIRTGB is too low" << endl;
       exit(EXIT_FAILURE);
    }
+   //std::cout << "alloc " << pid << std::endl;
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
-   auto mid = osv::clock::uptime::now();
    assert(succ);
+#ifdef VMCACHE_YMAP
+   ymapInterfaces[wtid]->mapPhysPage(virtMem+pid);
+#endif
    residentSet.insert(pid);
-
    virtMem[pid].dirty = true;
    
-   auto end = osv::clock::uptime::now();
+   /*auto end = osv::clock::uptime::now();
    auto elapsed = end - start;
-   auto elapsed_mid = mid - start;
-   auto elapsed_end = end - mid;
-   parts_time[allocpageinsert] += elapsed_end;
-   parts_count[allocpageinsert]++; 
-   parts_time[allocpagetrylock] += elapsed_mid;
-   parts_count[allocpagetrylock]++; 
    parts_time[allocpage] += elapsed;
-   parts_count[allocpage]++; 
+   parts_count[allocpage]++;*/
 
    return virtMem + pid;
 }
@@ -255,6 +277,9 @@ Page* BufferManager::allocPage() {
 void BufferManager::handleFault(PID pid) {
    physUsedCount++;
    ensureFreePages();
+#ifdef VMCACHE_YMAP
+   ymapInterfaces[wtid]->mapPhysPage(virtMem+pid);
+#endif
    readPage(pid);
    residentSet.insert(pid);
 }
@@ -313,26 +338,23 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-      auto start = osv::clock::uptime::now();
-      int ret = unvme_read(ns, workerThreadId%maxQueues, dma_read_buffer[workerThreadId], (pid*pageSize)/blockSize, pageSize/blockSize);
-      auto middle = osv::clock::uptime::now();
+      //auto start = osv::clock::uptime::now();
+      int ret = unvme_read(ns, wtid%maxQueues, dma_read_buffers[wtid], (pid*pageSize)/blockSize, pageSize/blockSize);
       assert(ret==0);
-      memcpy(virtMem+pid, dma_read_buffer[workerThreadId], pageSize);
+      //auto mid = osv::clock::uptime::now();
+      memcpy(virtMem+pid, dma_read_buffers[wtid], pageSize);
       readCount++;
-      auto end = osv::clock::uptime::now();
-      auto elapsed_mid = middle - start;
-      auto elapsed_end = end - middle;
-      auto elapsed = end - start;
-      parts_time[readnvme] += elapsed_mid;
-      parts_count[readnvme]++; 
-      parts_time[readcpy] += elapsed_end;
-      parts_count[readcpy]++;
+      /*auto end = osv::clock::uptime::now();
+      auto elapsed = mid - start;
+      auto elapsed_mid = mid - start;
+      parts_time[readpage_copy] += elapsed_mid;
+      parts_count[readpage_copy]++;
       parts_time[readpage] += elapsed;
-      parts_count[readpage]++; 
+      parts_count[readpage]++;*/
    }
 
 void BufferManager::evict() {
-   auto start = osv::clock::uptime::now();
+   //auto start = osv::clock::uptime::now();
    vector<PID> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
@@ -360,14 +382,13 @@ void BufferManager::evict() {
          };
       });
    }
-   auto m1 = osv::clock::uptime::now();
+
 
    // 1. write dirty pages
-   osvaioInterface[workerThreadId].writePages(toWrite);
+   osvaioInterfaces[wtid]->writePages(virtMem, toWrite);
+
    writeCount += toWrite.size();
    
-   auto m2 = osv::clock::uptime::now();
-
    // 2. try to lock clean page candidates
    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
       PageState& ps = getPageState(pid);
@@ -375,7 +396,6 @@ void BufferManager::evict() {
       return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
    
-   auto m3 = osv::clock::uptime::now();
 
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
@@ -387,14 +407,14 @@ void BufferManager::evict() {
          ps.unlockS();
    }
    
-   auto m4 = osv::clock::uptime::now();
-
    // 4. remove from page table
     for (u64& pid : toEvict)
+#ifdef VMCACHE_YMAP
+	    ymapInterfaces[wtid]->unmapPhysPage(virtMem + pid);
+#else
 	    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+#endif
    
-    auto m5 = osv::clock::uptime::now();
-
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
       bool succ = residentSet.remove(pid);
@@ -403,28 +423,10 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
-   auto end = osv::clock::uptime::now();
+   /*auto end = osv::clock::uptime::now();
    auto elapsed = end - start;
-   auto d0 = m1 - start;
-   auto d1 = m2 - m1;
-   auto d2 = m3 - m2;
-   auto d3 = m4 - m3;
-   auto d4 = m5 - m4;
-   auto d5 = end - m5;
-   parts_time[evictpaged0] += d0;
-   parts_count[evictpaged0]++; 
-   parts_time[evictpaged1] += d1;
-   parts_count[evictpaged1]++; 
-   parts_time[evictpaged2] += d2;
-   parts_count[evictpaged2]++; 
-   parts_time[evictpaged3] += d3;
-   parts_count[evictpaged3]++; 
-   parts_time[evictpaged4] += d4;
-   parts_count[evictpaged4]++; 
-   parts_time[evictpaged5] += d5;
-   parts_count[evictpaged5]++; 
    parts_time[evictpage] += elapsed;
-   parts_count[evictpage]++; 
+   parts_count[evictpage]++;*/
 }
 
 //---------------------------------------------------------------------------
@@ -715,6 +717,9 @@ void BTreeNode::splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep)
       PID leftPID = bm.toPID(this);
       u16 oldParentSlot = parent->lowerBound(sep);
       if (oldParentSlot == parent->count) {
+	 if(parent->upperInnerNode != leftPID){
+		 std::cout << "leftPID " << leftPID << std::endl;
+	 }
          assert(parent->upperInnerNode == leftPID);
          parent->upperInnerNode = newNode.pid;
       } else {
@@ -754,7 +759,8 @@ GuardO<BTreeNode> BTree::findLeafO(span<u8> key) {
    }
 
    // point lookup, returns payload len on success, or -1 on failure
-int BTree::lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize) {
+int BTree::lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize, u16 tid) {
+      wtid = tid;
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
@@ -788,7 +794,8 @@ int BTree::lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize) {
       }
    }
 */
-GuardS<BTreeNode> BTree::findLeafS(span<u8> key) {
+GuardS<BTreeNode> BTree::findLeafS(span<u8> key, u16 tid) {
+      wtid = tid;
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<MetaDataPage> meta(metadataPageId);
@@ -847,10 +854,12 @@ template<class Fn>void BTree::scanDesc(span<u8> key, Fn fn) {
 BTree::BTree() : splitOrdered(false) {
    if(!bm.initialized)
 	bm.init();
+   //print_pf = true;
    GuardX<MetaDataPage> page(metadataPageId);
    AllocGuard<BTreeNode> rootNode(true);
    slotId = btreeslotcounter++;
    page->roots[slotId] = rootNode.pid;
+   //std::cout << "End of Btree init" << std::endl;
 }
 
 BTree::~BTree() {}
@@ -908,12 +917,13 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
    }
 }
 
-void BTree::insert(span<u8> key, span<u8> payload)
+void BTree::insert(span<u8> key, span<u8> payload, u16 tid)
 {
+   wtid = tid;
    assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
-
+   //std::cout << "BTree::insert" << std::endl;
    trace_vmcache_btree_insert();
-   auto start = osv::clock::uptime::now(); 
+   //auto start = osv::clock::uptime::now(); 
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
          GuardO<BTreeNode> parent(metadataPageId);
@@ -927,26 +937,30 @@ void BTree::insert(span<u8> key, span<u8> payload)
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
             GuardX<BTreeNode> nodeLocked(move(node));
+	    assert(walk(nodeLocked.ptr).phys!=0ull);
             parent.release();
             nodeLocked->insertInPage(key, payload);
    	    trace_vmcache_btree_insert_ret();
-	    auto elapsed = osv::clock::uptime::now() - start;
+	    /*auto elapsed = osv::clock::uptime::now() - start;
 	    parts_time[btreeinsert] += elapsed;
-	    parts_count[btreeinsert]++; 
+	    parts_count[btreeinsert]++;*/
             return; // success
          }
 
          // lock parent and leaf
          GuardX<BTreeNode> parentLocked(move(parent));
          GuardX<BTreeNode> nodeLocked(move(node));
+	 assert(walk(nodeLocked.ptr).phys!=0ull);
+	 assert(walk(parentLocked.ptr).phys!=0ull);
          trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
       } catch(const OLCRestartException&) {}
    }
 }
 
-bool BTree::remove(span<u8> key)
+bool BTree::remove(span<u8> key, u16 tid)
 {
+   wtid = tid;
    trace_vmcache_btree_remove();
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {

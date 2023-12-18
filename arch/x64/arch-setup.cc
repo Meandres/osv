@@ -313,6 +313,7 @@ void arch_init_premain()
 #if CONF_drivers_nvme
 #include "drivers/nvme.hh"
 #endif
+//#include "drivers/ymap.hh"
 
 extern bool opt_pci_disabled;
 void arch_init_drivers()

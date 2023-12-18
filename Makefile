@@ -367,7 +367,11 @@ ASFLAGS = -g $(autodepend) -D__ASSEMBLY__
 
 $(out)/fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
 
+ifeq ($(conf_vmcache_ymap), 1)
+$(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w -DVMCACHE_YMAP
+else
 $(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w
+endif
 
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/sys
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/
@@ -878,6 +882,7 @@ endif
 ifeq ($(conf_drivers_vmcache),1)
 drivers += drivers/vmcache.o
 endif
+drivers += drivers/ymap.o
 drivers += drivers/driver.o
 
 ifeq ($(arch),x64)
