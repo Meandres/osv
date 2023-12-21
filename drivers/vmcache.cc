@@ -385,7 +385,6 @@ void BufferManager::evict() {
       });
    }
 
-   auto m0 = osv::clock::uptime::now();
    // 1. write dirty pages
    //osvaioInterfaces[wtid]->writePages(virtMem, toWrite);
    //std::cout << "Writing" << wtid%maxQueues << std::endl;
@@ -405,7 +404,6 @@ void BufferManager::evict() {
    }
    writeCount += toWrite.size();
    
-   auto m1 = osv::clock::uptime::now();
    // 2. try to lock clean page candidates
    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
       PageState& ps = getPageState(pid);
@@ -414,7 +412,6 @@ void BufferManager::evict() {
    }), toEvict.end());
    
 
-   auto m2 = osv::clock::uptime::now();
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
       PageState& ps = getPageState(pid);
@@ -425,7 +422,6 @@ void BufferManager::evict() {
          ps.unlockS();
    }
    
-   auto m3 = osv::clock::uptime::now();
    // 4. remove from page table
     for (u64& pid : toEvict)
 #ifdef VMCACHE_YMAP
@@ -434,7 +430,6 @@ void BufferManager::evict() {
 	    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
 #endif
    
-   auto m4 = osv::clock::uptime::now();
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
       bool succ = residentSet.remove(pid);
@@ -444,27 +439,9 @@ void BufferManager::evict() {
 
    physUsedCount -= toEvict.size();
    auto end = osv::clock::uptime::now();
-   auto elapsed_m0 = m0-start;
-   auto elapsed_m1 = m1-m0;
-   auto elapsed_m2 = m2-m1;
-   auto elapsed_m3 = m3-m2;
-   auto elapsed_m4 = m4-m3;
-   auto elapsed_m5 = end-m4;
    auto elapsed = end - start;
    parts_time[evictpage] += elapsed;
    parts_count[evictpage]++;
-   parts_time[evictpagem0] += elapsed_m0;
-   parts_count[evictpagem0]++;
-   parts_time[evictpagem1] += elapsed_m1;
-   parts_count[evictpagem1]++;
-   parts_time[evictpagem2] += elapsed_m2;
-   parts_count[evictpagem2]++;
-   parts_time[evictpagem3] += elapsed_m3;
-   parts_count[evictpagem3]++;
-   parts_time[evictpagem4] += elapsed_m4;
-   parts_count[evictpagem4]++;
-   parts_time[evictpagem5] += elapsed_m5;
-   parts_count[evictpagem5]++;
 }
 
 //---------------------------------------------------------------------------

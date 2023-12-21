@@ -39,18 +39,11 @@ typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
 enum parts{
 	allocpage,
 	readpage,
-	//readpage_copy,
 	evictpage,
-	evictpagem0,
-	evictpagem1,
-	evictpagem2,
-	evictpagem3,
-	evictpagem4,
-	evictpagem5,
 	btreeinsert
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BufferManager::evict() -> find candidates", "BufferManager::evict() -> write dirty pages", "BufferManager::evict() -> try to lock clean page candidates", "BufferManager::evict() -> try to update lock for dirty page candidates", "BufferManager::evict() -> remove from page table", "BufferManager::evict() -> remove from hash table and unlock", "BTree::insert()" };
-const unsigned parts_num = 10;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()" };
+const unsigned parts_num = 4;
 
 std::mutex thread_mutex;
 extern __thread elapsed_time parts_time[parts_num];
