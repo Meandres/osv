@@ -39,12 +39,18 @@ typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
 enum parts{
 	allocpage,
 	readpage,
-	readpage_copy,
+	//readpage_copy,
 	evictpage,
+	evictpagem0,
+	evictpagem1,
+	evictpagem2,
+	evictpagem3,
+	evictpagem4,
+	evictpagem5,
 	btreeinsert
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage() -> unvme_read()", "BufferManager::readPage() -> memcpy()", "BufferManager::evict()", "BTree::insert()" };
-const unsigned parts_num = 4;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BufferManager::evict() -> find candidates", "BufferManager::evict() -> write dirty pages", "BufferManager::evict() -> try to lock clean page candidates", "BufferManager::evict() -> try to update lock for dirty page candidates", "BufferManager::evict() -> remove from page table", "BufferManager::evict() -> remove from hash table and unlock", "BTree::insert()" };
+const unsigned parts_num = 10;
 
 std::mutex thread_mutex;
 extern __thread elapsed_time parts_time[parts_num];
@@ -63,8 +69,8 @@ void add_thread_results(){
 void print_aggregate_avg(){
 	std::cout << "Results of the profiling :"<<std::endl;
 	for(unsigned i=0; i<parts_num; i++){
-		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::nanoseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "ns on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
-		std::cout << "\t\t Total duration: " << double(std::chrono::duration_cast<std::chrono::milliseconds>(thread_aggregate_time[i]).count()) << " ms" <<std::endl;
+		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+		//std::cout << "\t\t Total duration: " << double(std::chrono::duration_cast<std::chrono::milliseconds>(thread_aggregate_time[i]).count()) << " ms" <<std::endl;
 	}	
 }
 
@@ -80,6 +86,7 @@ static const int16_t maxWorkerThreads = 32;
 static const int16_t maxQueues = 32;
 static const int16_t maxQueueSize = 8192;
 static const int16_t blockSize=512;
+static const u64 maxIOs = 256;
 
 // allocate memory using huge pages
 void* allocHuge(size_t size);
@@ -222,7 +229,8 @@ struct BufferManager {
    u64 virtCount;
    u64 physCount;
    int n_threads;
-   std::vector<OSvAIOInterface*> osvaioInterfaces;
+   //std::vector<OSvAIOInterface*> osvaioInterfaces;
+   unvme_iod_t io_desc_array[maxWorkerThreads][maxIOs];
 
    std::atomic<u64> physUsedCount;
    ResidentPageSet residentSet;

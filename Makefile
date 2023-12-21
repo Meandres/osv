@@ -878,6 +878,7 @@ drivers += drivers/pci-bridge.o
 endif
 ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
+$(out)/drivers/nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
 endif
 ifeq ($(conf_drivers_vmcache),1)
 drivers += drivers/vmcache.o

@@ -200,12 +200,12 @@ void BufferManager::init(){
       pageState[i].init();
 
    ns = unvme_open();
-   dma_read_buffers.reserve(n_threads);
+   /*dma_read_buffers.reserve(n_threads);
    for(int i=0; i<n_threads; i++)
       dma_read_buffers.push_back(unvme_alloc(ns, pageSize));
    osvaioInterfaces.reserve(n_threads);
    for(unsigned i=0; i<n_threads; i++)
-      osvaioInterfaces.emplace_back(new OSvAIOInterface(i, ns));
+      osvaioInterfaces.emplace_back(new OSvAIOInterface(i, ns));*/
 
    // Initialize virtual pages
    virtMem = (Page*) mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -248,7 +248,7 @@ void BufferManager::ensureFreePages() {
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
-   //auto start = osv::clock::uptime::now();
+   auto start = osv::clock::uptime::now();
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
@@ -266,10 +266,10 @@ Page* BufferManager::allocPage() {
    residentSet.insert(pid);
    virtMem[pid].dirty = true;
    
-   /*auto end = osv::clock::uptime::now();
+   auto end = osv::clock::uptime::now();
    auto elapsed = end - start;
    parts_time[allocpage] += elapsed;
-   parts_count[allocpage]++;*/
+   parts_count[allocpage]++;
 
    return virtMem + pid;
 }
@@ -338,23 +338,25 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-      //auto start = osv::clock::uptime::now();
-      int ret = unvme_read(ns, wtid%maxQueues, dma_read_buffers[wtid], (pid*pageSize)/blockSize, pageSize/blockSize);
+      auto start = osv::clock::uptime::now();
+      int ret = unvme_read(ns, wtid%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
       assert(ret==0);
-      //auto mid = osv::clock::uptime::now();
-      memcpy(virtMem+pid, dma_read_buffers[wtid], pageSize);
+      /*int ret = unvme_read(ns, wtid%maxQueues, dma_read_buffers[wtid], (pid*pageSize)/blockSize, pageSize/blockSize);
+      assert(ret==0);
+      auto mid = osv::clock::uptime::now();
+      memcpy(virtMem+pid, dma_read_buffers[wtid], pageSize);*/
       readCount++;
-      /*auto end = osv::clock::uptime::now();
-      auto elapsed = mid - start;
-      auto elapsed_mid = mid - start;
+      auto end = osv::clock::uptime::now();
+      auto elapsed = end - start;
+      /*auto elapsed_mid = mid - start;
       parts_time[readpage_copy] += elapsed_mid;
-      parts_count[readpage_copy]++;
+      parts_count[readpage_copy]++;*/
       parts_time[readpage] += elapsed;
-      parts_count[readpage]++;*/
+      parts_count[readpage]++;
    }
 
 void BufferManager::evict() {
-   //auto start = osv::clock::uptime::now();
+   auto start = osv::clock::uptime::now();
    vector<PID> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
@@ -383,12 +385,27 @@ void BufferManager::evict() {
       });
    }
 
-
+   auto m0 = osv::clock::uptime::now();
    // 1. write dirty pages
-   osvaioInterfaces[wtid]->writePages(virtMem, toWrite);
-
+   //osvaioInterfaces[wtid]->writePages(virtMem, toWrite);
+   //std::cout << "Writing" << wtid%maxQueues << std::endl;
+   assert(toWrite.size() <= maxIOs);
+   for (u64 i=0; i<toWrite.size(); i++) {
+	PID pid = toWrite[i];
+	virtMem[pid].dirty = false;
+	io_desc_array[wtid][i] = unvme_awrite(ns, wtid%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
+	assert(io_desc_array[wtid][i]!=NULL);
+   }
+   for(u64 i=0; i<toWrite.size(); i++){
+	int ret=unvme_apoll(io_desc_array[wtid][i], 3);
+	if(ret!=0){
+		std::cout << "Error ret " << ret << ", i " << i << ", pid " << toWrite[i] << std::endl;
+	}
+	assert(ret==0);
+   }
    writeCount += toWrite.size();
    
+   auto m1 = osv::clock::uptime::now();
    // 2. try to lock clean page candidates
    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
       PageState& ps = getPageState(pid);
@@ -397,6 +414,7 @@ void BufferManager::evict() {
    }), toEvict.end());
    
 
+   auto m2 = osv::clock::uptime::now();
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
       PageState& ps = getPageState(pid);
@@ -407,6 +425,7 @@ void BufferManager::evict() {
          ps.unlockS();
    }
    
+   auto m3 = osv::clock::uptime::now();
    // 4. remove from page table
     for (u64& pid : toEvict)
 #ifdef VMCACHE_YMAP
@@ -415,6 +434,7 @@ void BufferManager::evict() {
 	    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
 #endif
    
+   auto m4 = osv::clock::uptime::now();
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
       bool succ = residentSet.remove(pid);
@@ -423,10 +443,28 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
-   /*auto end = osv::clock::uptime::now();
+   auto end = osv::clock::uptime::now();
+   auto elapsed_m0 = m0-start;
+   auto elapsed_m1 = m1-m0;
+   auto elapsed_m2 = m2-m1;
+   auto elapsed_m3 = m3-m2;
+   auto elapsed_m4 = m4-m3;
+   auto elapsed_m5 = end-m4;
    auto elapsed = end - start;
    parts_time[evictpage] += elapsed;
-   parts_count[evictpage]++;*/
+   parts_count[evictpage]++;
+   parts_time[evictpagem0] += elapsed_m0;
+   parts_count[evictpagem0]++;
+   parts_time[evictpagem1] += elapsed_m1;
+   parts_count[evictpagem1]++;
+   parts_time[evictpagem2] += elapsed_m2;
+   parts_count[evictpagem2]++;
+   parts_time[evictpagem3] += elapsed_m3;
+   parts_count[evictpagem3]++;
+   parts_time[evictpagem4] += elapsed_m4;
+   parts_count[evictpagem4]++;
+   parts_time[evictpagem5] += elapsed_m5;
+   parts_count[evictpagem5]++;
 }
 
 //---------------------------------------------------------------------------
@@ -923,7 +961,7 @@ void BTree::insert(span<u8> key, span<u8> payload, u16 tid)
    assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
    //std::cout << "BTree::insert" << std::endl;
    trace_vmcache_btree_insert();
-   //auto start = osv::clock::uptime::now(); 
+   auto start = osv::clock::uptime::now(); 
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
          GuardO<BTreeNode> parent(metadataPageId);
@@ -941,9 +979,9 @@ void BTree::insert(span<u8> key, span<u8> payload, u16 tid)
             parent.release();
             nodeLocked->insertInPage(key, payload);
    	    trace_vmcache_btree_insert_ret();
-	    /*auto elapsed = osv::clock::uptime::now() - start;
+	    auto elapsed = osv::clock::uptime::now() - start;
 	    parts_time[btreeinsert] += elapsed;
-	    parts_count[btreeinsert]++;*/
+	    parts_count[btreeinsert]++;
             return; // success
          }
 

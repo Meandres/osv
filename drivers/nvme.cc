@@ -68,6 +68,8 @@ static FILE*                log_fp = NULL;  ///< log file pointer
 static int                  log_count = 0;  ///< log open count
 static pthread_mutex_t      log_lock = PTHREAD_MUTEX_INITIALIZER; ///< log lock
 nvme_controller_reg_t* globalReg;
+/// IO descriptor debug print
+#define PDEBUG(fmt, arg...) //fprintf(stderr, fmt "\n", ##arg)
 
 /**
  * Open log file.  Only one log file is supported and thus only the first
@@ -275,12 +277,11 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 #endif
 
     if (*stat == 0) {
-        DEBUG_FN("q=%d cq=%d sq=%d-%d cid=%#x (C)", q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid);
+        PDEBUG("q=%d cq=%d sq=%d-%d cid=%#x (C)", q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid);
     } else {
         ERROR("q=%d cq=%d sq=%d-%d cid=%#x stat=%#x (dnr=%d m=%d sct=%d sc=%#x) (C)",
               q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
     }
-
     return cqe->cid;
 }
 
@@ -783,8 +784,6 @@ void nvme_delete(nvme_device_t* dev)
 }
 
 
-/// IO descriptor debug print
-#define PDEBUG(fmt, arg...) //fprintf(stderr, fmt "\n", ##arg)
 
 // Global static variables
 static const char*      unvme_log = "/dev/shm/unvme.log";   ///< Log filename
@@ -938,10 +937,12 @@ static u16 unvme_get_cid(unvme_desc_t* desc)
  */
 static u64 unvme_map_dma(const unvme_ns_t* ns, void* buf, u64 bufsz)
 {
-    unvme_device_t* dev = ((unvme_session_t*)ns->ses)->dev;
 #ifdef UNVME_IDENTITY_MAP_DMA
-    u64 addr = (u64)buf & dev->vfiodev.iovamask;
+    //u64 addr = (u64)buf & dev->vfiodev.iovamask;
+    u64 addr = walk(buf).phys<<12;
+    assert(addr!=0);
 #else
+    unvme_device_t* dev = ((unvme_session_t*)ns->ses)->dev;
     vfio_dma_t* dma = NULL;
     unvme_lockr(&dev->iomem.lock);
     int i;
@@ -980,6 +981,7 @@ static int unvme_map_prps(const unvme_ns_t* ns, unvme_queue_t* q, int cid,
 
     *prp1 = addr;
     *prp2 = 0;
+    return 0;
     int numpages = (bufsz + ns->pagesize - 1) >> ns->pageshift;
     if (numpages == 2) {
         *prp2 = addr + ns->pagesize;
@@ -1082,7 +1084,7 @@ static void unvme_queue_cleanup(unvme_queue_t* q)
  */
 static void unvme_adminq_create(unvme_device_t* dev, int qsize)
 {
-    DEBUG_FN("%x", dev->vfiodev.pci);
+    //DEBUG_FN("%x", dev->vfiodev.pci);
     unvme_queue_t* adminq = &dev->adminq;
     unvme_queue_init(dev, adminq, qsize);
     if (!nvme_adminq_setup(&dev->nvmedev, qsize,
@@ -1098,7 +1100,7 @@ static void unvme_adminq_create(unvme_device_t* dev, int qsize)
  */
 static void unvme_adminq_delete(unvme_device_t* dev)
 {
-    DEBUG_FN("%x", dev->vfiodev.pci);
+    //DEBUG_FN("%x", dev->vfiodev.pci);
     unvme_queue_cleanup(&dev->adminq);
 }
 
@@ -1109,15 +1111,15 @@ static void unvme_adminq_delete(unvme_device_t* dev)
  */
 static void unvme_ioq_create(unvme_device_t* dev, int q)
 {
-    DEBUG_FN("%x q=%d", dev->vfiodev.pci, q+1);
+    //DEBUG_FN("%x q=%d", dev->vfiodev.pci, q+1);
     unvme_queue_t* ioq = dev->ioqs + q;
     unvme_queue_init(dev, ioq, dev->ns.qsize);
     if (!(ioq->nvmeq = nvme_ioq_create(&dev->nvmedev, NULL, q+1, ioq->size,
                                        ioq->sqdma->buf, ioq->sqdma->addr,
                                        ioq->cqdma->buf, ioq->cqdma->addr)))
         FATAL("nvme_ioq_create %d failed", q+1);
-    DEBUG_FN("%x q=%d qd=%d db=%#04lx", dev->vfiodev.pci, ioq->nvmeq->id,
-             ioq->size, (u64)ioq->nvmeq->sq_doorbell - (u64)dev->nvmedev.reg);
+    //DEBUG_FN("%x q=%d qd=%d db=%#04lx", dev->vfiodev.pci, ioq->nvmeq->id,
+    //        ioq->size, (u64)ioq->nvmeq->sq_doorbell - (u64)dev->nvmedev.reg);
 }
 
 /**
@@ -1127,7 +1129,7 @@ static void unvme_ioq_create(unvme_device_t* dev, int q)
  */
 static void unvme_ioq_delete(unvme_device_t* dev, int q)
 {
-    DEBUG_FN("%x %d", dev->vfiodev.pci, q+1);
+    //DEBUG_FN("%x %d", dev->vfiodev.pci, q+1);
     unvme_queue_t* ioq = dev->ioqs + q;
     (void)nvme_ioq_delete(ioq->nvmeq);
     unvme_queue_cleanup(ioq);
@@ -1158,8 +1160,8 @@ static void unvme_ns_init(unvme_ns_t* ns, int nsid)
     vfio_dma_free(dma);
 
     //sprintf(ns->device + strlen(ns->device), "/%d", nsid);
-    DEBUG_FN("%s qc=%d qd=%d bs=%d bc=%#lx mbio=%d", ns->device, ns->qcount,
-             ns->qsize, ns->blocksize, ns->blockcount, ns->maxbpio);
+    /*DEBUG_FN("%s qc=%d qd=%d bs=%d bc=%#lx mbio=%d", ns->device, ns->qcount,
+             ns->qsize, ns->blocksize, ns->blockcount, ns->maxbpio);*/
 }
 
 /**
@@ -1169,7 +1171,7 @@ static void unvme_cleanup(unvme_session_t* ses)
 {
     unvme_device_t* dev = ses->dev;
     if (--dev->refcount == 0) {
-        DEBUG_FN("%s", ses->ns.device);
+        //DEBUG_FN("%s", ses->ns.device);
         int q;
         for (q = 0; q < (int)dev->ns.qcount; q++) unvme_ioq_delete(dev, q);
         unvme_adminq_delete(dev);
@@ -1301,7 +1303,7 @@ unvme_ns_t* unvme_do_open(int nsid, int qcount, int qsize)
  */
 int unvme_do_close(const unvme_ns_t* ns)
 {
-    DEBUG_FN("%s", ns->device);
+    //DEBUG_FN("%s", ns->ses->device);
     unvme_session_t* ses = (unvme_session_t*)ns->ses;
     //if (ns->pci != ses->dev->vfiodev.pci) return -1;
     unvme_lockw(&unvme_lock);
@@ -1318,7 +1320,7 @@ int unvme_do_close(const unvme_ns_t* ns)
  */
 void* unvme_do_alloc(const unvme_ns_t* ns, u64 size)
 {
-    DEBUG_FN("%s %#lx", ns->device, size);
+    //DEBUG_FN("%s %#lx", ns->ses->dev, size);
     unvme_device_t* dev = ((unvme_session_t*)ns->ses)->dev;
     unvme_iomem_t* iomem = &dev->iomem;
     void* buf = NULL;
@@ -1345,7 +1347,7 @@ void* unvme_do_alloc(const unvme_ns_t* ns, u64 size)
  */
 int unvme_do_free(const unvme_ns_t* ns, void* buf)
 {
-    DEBUG_FN("%s %p", ns->device, buf);
+    //DEBUG_FN("%s %p", ns->ses->dev, buf);
     unvme_device_t* dev = ((unvme_session_t*)ns->ses)->dev;
     unvme_iomem_t* iomem = &dev->iomem;
 
@@ -1730,8 +1732,9 @@ nvme::nvme(pci::device &dev)
     printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
     printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
 
-    unsigned datasize = 4096;
+    /*unsigned datasize = 4096;
     char* buf = (char*)unvme_alloc(ns, datasize);
+    char* buf = (char*)malloc(datasize);
     for (unsigned i=0; i<datasize; i++) buf[i] = i%10;
     int ret = unvme_write(ns, 0, buf, 1, 4);
     assert(ret == 0);
@@ -1745,7 +1748,7 @@ nvme::nvme(pci::device &dev)
        }
        //double end = gettime();
        //printf("%llu us\n", (end-start)*1e6/repeat);
-    }
+    }*/
 
 }
 
