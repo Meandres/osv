@@ -325,7 +325,10 @@ int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id)
     if (clock_id) {
         pthread *p = pthread::from_libc(thread);
         auto id = p->_thread->id();
-        *clock_id = id + _OSV_CLOCK_SLOTS;
+        //Follow the same formula glibc and musl use to create
+        //a negative clock_id that is then used by Linux kernel when
+        //handling get_clocktime (see https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_getcpuclockid.c)
+        *clock_id = (-id - 1) * 8U + 6;
     }
     return 0;
 }
@@ -361,8 +364,12 @@ int pthread_spin_lock(pthread_spinlock_t *lock)
     bool* b = from_libc(lock);
     while (__sync_lock_test_and_set(b, 1)) {
         while (*b) {
-            barrier();
-            // FIXME: use "PAUSE" instruction here
+#ifdef __x86_64__
+            __asm __volatile("pause");
+#endif
+#ifdef __aarch64__
+            __asm __volatile("isb sy");
+#endif
         }
     }
     return 0; // We can't really do deadlock detection

@@ -711,7 +711,10 @@ public:
     bool unsafe_stop();
     void setup_large_syscall_stack();
     void free_tiny_syscall_stack();
+#ifdef __x86_64__
     void* get_syscall_stack_top();
+#endif
+    void* get_exception_stack_top() { return _arch.exception_stack + sizeof(_arch.exception_stack); }
 private:
     static void wake_impl(detached_state* st,
             unsigned allowed_initial_states_mask = 1 << unsigned(status::waiting));
@@ -831,8 +834,10 @@ private:
     std::shared_ptr<osv::application_runtime> _app_runtime;
 public:
     void destroy();
+#ifdef __x86_64__
     unsigned long get_app_tcb() { return _tcb->app_tcb; }
     void set_app_tcb(unsigned long tcb) { _tcb->app_tcb = tcb; }
+#endif
 private:
 #ifdef __aarch64__
     friend void ::destroy_current_cpu_terminating_thread();
