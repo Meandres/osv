@@ -96,6 +96,13 @@ enum {
     pte_cow = 0,
 };
 
+// Invalidate TLB entry (locally)
+void invlpg_tlb_entry(void* addr);
+// Invalidate TLB entry range (locally)
+void invlpg_tlb_entry_range();
+// Invalidate TLB range locally and sends IPI to all other CPUs
+void invlpg_tlb_all(std::vector<void*> addresses);
+
 /* flush tlb for the current processor */
 void flush_tlb_local();
 /* flush tlb for all */

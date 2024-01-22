@@ -40,21 +40,30 @@ enum parts{
 	allocpage,
 	readpage,
 	evictpage,
-	btreeinsert
+	findleafO,
+	btreeinsert,
+	btreelookup,
+	btreescanasc,
+	btreescandesc,
+	btreeupdateinplace,
+	btreeremove
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()" };
-const unsigned parts_num = 4;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::findLeafO()", "BTree::insert()", "BTree::lookup()", "BTree::scanAsc()", "BTree::scanDesc", "BTree::updateInPlace()", "BTree::remove()" };
+const unsigned parts_num = 10;
 
 std::mutex thread_mutex;
 extern __thread elapsed_time parts_time[parts_num];
+extern __thread uint64_t parts_retry[parts_num];
 extern __thread uint64_t parts_count[parts_num];
 extern elapsed_time thread_aggregate_time[parts_num];
+extern uint64_t thread_aggregate_retry[parts_num];
 extern uint64_t thread_aggregate_count[parts_num];
 
 void add_thread_results(){
 	const std::lock_guard<std::mutex> lock(thread_mutex);
 	for(unsigned i=0; i<parts_num; i++){
 		thread_aggregate_time[i] += parts_time[i];
+		thread_aggregate_retry[i] += parts_retry[i];
 		thread_aggregate_count[i] += parts_count[i];
 	}
 }
@@ -63,8 +72,11 @@ void print_aggregate_avg(){
 	std::cout << "Results of the profiling :"<<std::endl;
 	for(unsigned i=0; i<parts_num; i++){
 		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+		if(thread_aggregate_retry[i] != 0){
+			std::cout << "\t\tAverage number of retries : "<< double(thread_aggregate_retry[i])/thread_aggregate_count[i] << std::endl;
+		}
 		//std::cout << "\t\t Total duration: " << double(std::chrono::duration_cast<std::chrono::milliseconds>(thread_aggregate_time[i]).count()) << " ms" <<std::endl;
-	}	
+	}
 }
 
 typedef u64 PID; // page id type
@@ -75,7 +87,7 @@ typedef u64 PID; // page id type
    bool dirty;
 };*/
 
-static const int16_t maxWorkerThreads = 32;
+static const int16_t maxWorkerThreads = 64;
 static const int16_t maxQueues = 32;
 static const int16_t maxQueueSize = 8192;
 static const int16_t blockSize=512;
@@ -743,16 +755,26 @@ struct BTree {
    int lookup(std::span<u8> key, u8* payloadOut, unsigned payloadOutSize, u16 tid);
    template<class Fn> inline bool lookup(std::span<u8> key, Fn fn, u16 tid){
 	   wtid = tid;
+	   auto start = osv::clock::uptime::now();
 	   for (u64 repeatCounter=0; ; repeatCounter++) {
-         try {
+            try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found)
+            if (!found){
+	       auto elapsed = osv::clock::uptime::now() - start;
+	       parts_time[btreelookup] +=elapsed;
+	       parts_retry[btreelookup] += repeatCounter;
+	       parts_count[btreelookup]++;
                return false;
+	    }
 
             // key found
             fn(node->getPayload(pos));
+	    auto elapsed = osv::clock::uptime::now() - start;
+	    parts_time[btreelookup] +=elapsed;
+	    parts_retry[btreelookup] += repeatCounter;
+	    parts_count[btreelookup]++;
             return true;
          } catch(const OLCRestartException&) {}
       }
@@ -764,17 +786,27 @@ struct BTree {
 
    template<class Fn> inline bool updateInPlace(std::span<u8> key, Fn fn, u16 tid) {
       wtid = tid;
+      auto start = osv::clock::uptime::now();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found)
+            if (!found){
+	       auto elapsed = osv::clock::uptime::now() - start;
+	       parts_time[btreeupdateinplace] +=elapsed;
+	       parts_retry[btreeupdateinplace] += repeatCounter;
+	       parts_count[btreeupdateinplace]++;
                return false;
+	    }
 
             {
                	GuardX<BTreeNode> nodeLocked(std::move(node));
                	fn(nodeLocked->getPayload(pos));
+	        auto elapsed = osv::clock::uptime::now() - start;
+	        parts_time[btreeupdateinplace] +=elapsed;
+	        parts_retry[btreeupdateinplace] += repeatCounter;
+	        parts_count[btreeupdateinplace]++;
                	return true;
             }
          } catch(const OLCRestartException&) {}
@@ -784,17 +816,28 @@ struct BTree {
    GuardS<BTreeNode> findLeafS(std::span<u8> key, u16 tid);
    template<class Fn> inline void scanAsc(std::span<u8> key, Fn fn, u16 tid) {
       wtid = tid;
+      auto start = osv::clock::uptime::now();
       GuardS<BTreeNode> node = findLeafS(key, tid);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) {
          if (pos<node->count) {
-            if (!fn(*node.ptr, pos))
+            if (!fn(*node.ptr, pos)){
+	       auto elapsed = osv::clock::uptime::now() - start;
+	       parts_time[btreescanasc] +=elapsed;
+	       parts_retry[btreescanasc] += repeatCounter;
+	       parts_count[btreescanasc]++;
                return;
+	    }
             pos++;
          } else {
-            if (!node->hasRightNeighbour())
+            if (!node->hasRightNeighbour()){
+	       auto elapsed = osv::clock::uptime::now() - start;
+	       parts_time[btreescanasc] += elapsed;
+	       parts_retry[btreescanasc] += repeatCounter;
+	       parts_count[btreescanasc]++;
                return;
+	    }
             pos = 0;
             node = GuardS<BTreeNode>(node->nextLeafNode);
          }
@@ -803,24 +846,35 @@ struct BTree {
 
    template<class Fn>inline void scanDesc(std::span<u8> key, Fn fn, u16 tid) {
 	wtid = tid;
+      	auto start = osv::clock::uptime::now();
 	GuardS<BTreeNode> node = findLeafS(key, tid);
 	bool exactMatch;
-    int pos = node->lowerBound(key, exactMatch);
-    if (pos == node->count) {
-        pos--;
-        exactMatch = true; // XXX:
-    }
-    for (u64 repeatCounter=0; ; repeatCounter++) {
-        while (pos>=0) {
-        	if (!fn(*node.ptr, pos, exactMatch))
-               return;
-            pos--;
-        }
-    	if (!node->hasLowerFence())
-        	return;
-        node = findLeafS(node->getLowerFence(), tid);
-        pos = node->count-1;
-    }
-}
+    	int pos = node->lowerBound(key, exactMatch);
+    		if (pos == node->count) {
+        	pos--;
+        	exactMatch = true; // XXX:
+    	}
+    	for (u64 repeatCounter=0; ; repeatCounter++) {
+        	while (pos>=0) {
+        		if (!fn(*node.ptr, pos, exactMatch)){
+	       			auto elapsed = osv::clock::uptime::now() - start;
+	       			parts_time[btreescandesc] +=elapsed;
+	       			parts_retry[btreescandesc] += repeatCounter;
+	       			parts_count[btreescandesc]++;
+               			return;
+			}
+            		pos--;
+        	}
+    		if (!node->hasLowerFence()){
+	       		auto elapsed = osv::clock::uptime::now() - start;
+	       		parts_time[btreescandesc] +=elapsed;
+	       		parts_retry[btreescandesc] += repeatCounter;
+	       		parts_count[btreescandesc]++;
+        		return;
+		}
+        	node = findLeafS(node->getLowerFence(), tid);
+        	pos = node->count-1;
+    	}
+  }
 };
 #endif

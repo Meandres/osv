@@ -51,6 +51,7 @@ protected:
 enum ipi_id {
     IPI_WAKEUP,
     IPI_TLB_FLUSH,
+    IPI_TLB_INVLPG,
     IPI_SAMPLER_START,
     IPI_SAMPLER_STOP,
     IPI_SMP_STOP,

@@ -57,8 +57,10 @@ TRACEPOINT(trace_vmcache_insert_in_page, "");
 TRACEPOINT(trace_vmcache_insert_in_page_ret, "");
 
 __thread elapsed_time parts_time[parts_num] = { };
+__thread uint64_t parts_retry[parts_num] = { };
 __thread uint64_t parts_count[parts_num] = { };
 elapsed_time thread_aggregate_time[parts_num] = { };
+uint64_t thread_aggregate_retry[parts_num] = { };
 uint64_t thread_aggregate_count[parts_num] = { };
 
 ResidentPageSet::ResidentPageSet(){}
@@ -358,7 +360,9 @@ void BufferManager::readPage(PID pid) {
 void BufferManager::evict() {
    auto start = osv::clock::uptime::now();
    vector<PID> toEvict;
+   vector<void*> toEvictAddresses;
    toEvict.reserve(batch);
+   toEvictAddresses.reserve(batch);
    vector<PID> toWrite;
    toWrite.reserve(batch);
 
@@ -423,11 +427,16 @@ void BufferManager::evict() {
    }
    
    // 4. remove from page table
-    for (u64& pid : toEvict)
+    for (u64& pid : toEvict){
 #ifdef VMCACHE_YMAP
 	    ymapInterfaces[wtid]->unmapPhysPage(virtMem + pid);
+	    toEvictAddresses.push_back(virtMem+pid);
+    }
+    mmu::invlpg_tlb_all(toEvictAddresses);
+    //ymapInterfaces[wtid]->unmapBatch(virtMem, toEvict);
 #else
 	    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+    }
 #endif
    
    // 5. remove from hash table and unlock
@@ -764,12 +773,16 @@ static_assert(sizeof(BTreeNode) == pageSize, "btree node size problem");
 
 
 GuardO<BTreeNode> BTree::findLeafO(span<u8> key) {
+	auto start = osv::clock::uptime::now();
 	GuardO<MetaDataPage> meta(metadataPageId);
 	GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
 	meta.release();
 
       while (node->isInner())
          node = GuardO<BTreeNode>(node->lookupInner(key), node);
+      auto elapsed = osv::clock::uptime::now() - start;
+      parts_time[findleafO] += elapsed;
+      parts_count[findleafO]++;
       return node;
    }
 
@@ -958,6 +971,7 @@ void BTree::insert(span<u8> key, span<u8> payload, u16 tid)
    	    trace_vmcache_btree_insert_ret();
 	    auto elapsed = osv::clock::uptime::now() - start;
 	    parts_time[btreeinsert] += elapsed;
+	    parts_retry[btreeinsert] += repeatCounter;
 	    parts_count[btreeinsert]++;
             return; // success
          }
@@ -977,6 +991,7 @@ bool BTree::remove(span<u8> key, u16 tid)
 {
    wtid = tid;
    trace_vmcache_btree_remove();
+   auto start = osv::clock::uptime::now(); 
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
          GuardO<BTreeNode> parent(metadataPageId);
@@ -994,6 +1009,10 @@ bool BTree::remove(span<u8> key, u16 tid)
          unsigned slotId = node->lowerBound(key, found);
          if (!found){
    	    trace_vmcache_btree_remove_ret();
+	    auto elapsed = osv::clock::uptime::now() - start;
+	    parts_time[btreeremove] += elapsed;
+	    parts_retry[btreeremove] += repeatCounter;
+	    parts_count[btreeremove]++;
             return false;
 	 }
 
@@ -1014,6 +1033,10 @@ bool BTree::remove(span<u8> key, u16 tid)
             nodeLocked->removeSlot(slotId);
          }
    	 trace_vmcache_btree_remove_ret();
+	 auto elapsed = osv::clock::uptime::now() - start;
+	 parts_time[btreeremove] += elapsed;
+	 parts_retry[btreeremove] += repeatCounter;
+	 parts_count[btreeremove]++;
          return true;
       } catch(const OLCRestartException&) {}
    }

@@ -27,12 +27,13 @@ void Ymap::unlock(){
 }
 
 void Ymap::setPhysAddr(void* virt, u64 phys){
-	PTE pagePTE(0ull);
+	PTE pagePTE(~0ull);
 	std::atomic<u64>* ptePtr = walkRef(virt);
 	u64 oldPhys = PTE(ptePtr->load()).phys;
 	assert(oldPhys == 0);
 	pagePTE.present = 1;
 	pagePTE.writable = 1;
+	pagePTE.huge_page_null=0;
 	pagePTE.phys = phys;
 	ptePtr->store(pagePTE.word);
 }
@@ -41,9 +42,12 @@ u64 Ymap::clearPhysAddr(void* virt){
 	//memset(virt, 0, pageSize);
 	std::atomic<u64>* ptePtr = walkRef(virt);
 	u64 phys = PTE(ptePtr->load()).phys;
+	//std::cout << std::bitset<64>(ptePtr->load()) << std::endl;
 	assert(phys!=0ull);
 	ptePtr->store(0ull);
-	invalidateTLBEntry(virt);
+	//invalidateTLBEntry(virt);
+	//std::vector<void*> addresses = { virt };
+	//mmu::invlpg_tlb_all(addresses);
 	return phys;
 }
 
@@ -118,6 +122,13 @@ void Ymap::unmapPhysPage(void* virtAddr){
 	u64 physAddr = clearPhysAddr(virtAddr);
 	putPage(physAddr);
 	unlock();
+}
+
+void Ymap::unmapBatch(void* virtMem, std::vector<PID> toEvict){
+	for(auto pid: toEvict){
+		unmapPhysPage(virtMem + pid);
+	}
+	//mmu::flush_tlb_all();
 }
 
 void createYmapInterfaces(u64 pageCount, int n_threads){

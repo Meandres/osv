@@ -47,6 +47,65 @@ namespace mmu {
 
 uint8_t phys_bits = max_phys_bits, virt_bits = 52;
 
+void invlpg_tlb_entry(void* addr){
+	asm volatile("invlpg (%0)" :: "r" (addr) : "memory");
+}
+
+mutex tlb_invlpg_mutex;
+sched::thread_handle tlb_invlpg_waiter;
+std::atomic<int> tlb_invlpg_pendingconfirms;
+std::vector<void*> pages_to_invalidate;
+
+void invlpg_tlb_entry_range(){
+	for(void* addr: pages_to_invalidate){
+		if(addr!=NULL)
+			invlpg_tlb_entry(addr);
+    }
+}
+
+inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
+	invlpg_tlb_entry_range();
+		if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
+			tlb_invlpg_waiter.wake_from_kernel_or_with_irq_disabled();
+		}
+	}
+};
+
+void invlpg_tlb_all(std::vector<void*> addresses){
+    pages_to_invalidate.clear();
+    for(void* addr: addresses){
+	    pages_to_invalidate.push_back(addr);
+    }
+    std::vector<sched::cpu*> ipis(sched::max_cpus);
+
+    if (sched::cpus.size() <= 1) {
+		invlpg_tlb_entry_range();
+		return;
+    }
+
+    SCOPE_LOCK(migration_lock);
+    invlpg_tlb_entry_range();
+    std::lock_guard<mutex> guard(tlb_invlpg_mutex);
+    tlb_invlpg_waiter.reset(*sched::thread::current());
+    int count;
+    ipis.clear();
+    for(sched::cpu* c: sched::cpus){
+	    if(c!=sched::cpu::current()){
+		    ipis.push_back(c);
+	    }
+    }
+    count = ipis.size();
+
+    tlb_invlpg_pendingconfirms.store(count);
+    tlb_invlpg_ipi.send_allbutself();
+
+    sched::thread::wait_until([] {
+            return tlb_invlpg_pendingconfirms.load() == 0;
+    });
+    tlb_invlpg_waiter.clear();
+
+}
+
 void flush_tlb_local() {
     // TODO: we can use page_table_root instead of read_cr3(), can be faster
     // when shadow page tables are used.

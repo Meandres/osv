@@ -4,7 +4,9 @@
 #include <atomic>
 #include <vector>
 #include "osv/types.h"
-#include "osv/mmu.hh"
+#include <osv/mmu.hh>
+#include <osv/sched.hh>
+#include <osv/interrupt.hh>
 #include <sys/mman.h>
 #include <cstring>
 #include <bitset>
@@ -192,6 +194,7 @@ struct Ymap {
 	void putPage(u64 phys);
 	void mapPhysPage(void* virtAddr);
 	void unmapPhysPage(void* virtAddr);
+	void unmapBatch(void* virtMem, std::vector<PID> toEvict);
 };
 extern std::vector<Ymap*>ymapInterfaces;
 void createYmapInterfaces(u64 pageCount, int n_threads);
