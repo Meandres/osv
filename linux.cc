@@ -48,9 +48,12 @@
 #include <sys/prctl.h>
 #include <sys/timerfd.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <termios.h>
 #include <poll.h>
+#ifdef __x86_64__
 #include "tls-switch.hh"
+#endif
 
 #include <unordered_map>
 
@@ -225,12 +228,17 @@ static int sys_sched_setaffinity(
             pid, len, reinterpret_cast<cpu_set_t *>(mask));
 }
 
+#define __NR_long_mmap __NR_mmap
+
+#define __NR_long_shmat __NR_shmat
 // Only void* return value of mmap is type casted, as syscall returns long.
 long long_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     return (long) mmap(addr, length, prot, flags, fd, offset);
 }
-#define __NR_long_mmap __NR_mmap
 
+long long_shmat(int shmid, const void *shmaddr, int shmflg) {
+    return (long) shmat(shmid, shmaddr, shmflg);
+}
 
 #define SYSCALL0(fn) case (__NR_##fn): do { long ret = fn(); trace_syscall_##fn(ret); return ret; } while (0)
 
@@ -367,8 +375,17 @@ int rt_sigprocmask(int how, sigset_t * nset, sigset_t * oset, size_t sigsetsize)
     return sigprocmask(how, nset, oset);
 }
 
-#define __NR_sys_exit __NR_exit
+int rt_sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout, size_t sigsetsize)
+{
+    if (!timeout || (!timeout->tv_sec && !timeout->tv_nsec)) {
+        return sigwaitinfo(set, info);
+    } else {
+        errno = ENOSYS;
+        return -1;
+    }
+}
 
+#define __NR_sys_exit __NR_exit
 static int sys_exit(int ret)
 {
     sched::thread::current()->exit();
@@ -424,9 +441,71 @@ static long sys_set_tid_address(int *tidptr)
     return sched::thread::current()->id();
 }
 
-#ifdef __x86_64__
+#define CLONE_THREAD           0x00010000
+#define CLONE_CHILD_SETTID     0x01000000
+#define CLONE_PARENT_SETTID    0x00100000
+#define CLONE_CHILD_CLEARTID   0x00200000
+
+extern sched::thread *clone_thread(unsigned long flags, void *child_stack, unsigned long newtls);
+
 #define __NR_sys_clone __NR_clone
-extern int sys_clone(unsigned long flags, void *child_stack, int *ptid, int *ctid, unsigned long newtls);
+#ifdef __x86_64__
+int sys_clone(unsigned long flags, void *child_stack, int *ptid, int *ctid, unsigned long newtls)
+#endif
+#ifdef __aarch64__
+int sys_clone(unsigned long flags, void *child_stack, int *ptid, unsigned long newtls, int *ctid)
+#endif
+{   //
+    //We only support "cloning" of threads so fork() would fail but pthread_create() should
+    //succeed
+    if (!(flags & CLONE_THREAD)) {
+       errno = ENOSYS;
+       return -1;
+    }
+    //
+    //Validate we have non-empty stack
+    if (!child_stack) {
+       errno = EINVAL;
+       return -1;
+    }
+    //
+    //Validate ptid and ctid which we would be setting down if requested by these flags
+    if (((flags & CLONE_PARENT_SETTID) && !ptid) ||
+        ((flags & CLONE_CHILD_SETTID) && !ctid) ||
+        ((flags & CLONE_SETTLS) && !newtls)) {
+       errno = EFAULT;
+       return -1;
+    }
+
+    sched::thread *t = clone_thread(flags, child_stack, newtls);
+
+    //
+    //Store the child thread ID at the location pointed to by ptid
+    if ((flags & CLONE_PARENT_SETTID)) {
+       *ptid = t->id();
+    }
+    //
+    //Store the child thread ID at the location pointed to by ctid
+    if ((flags & CLONE_CHILD_SETTID)) {
+       *ctid = t->id();
+    }
+    //
+    //Clear (zero) the child thread ID at the location pointed to by child_tid
+    //in child memory when the child exits, and do a wakeup on the futex at that address
+    //See thread::complete()
+    if ((flags & CLONE_CHILD_CLEARTID)) {
+       t->set_clear_id(ctid);
+    }
+    t->start();
+
+    //
+    //The manual of sigprocmask has this to say about clone:
+    //"Each of the threads in a process has its own signal mask.
+    // A child created via fork(2) inherits a copy of its parent's
+    // signal mask; the signal mask is preserved across execve(2)."
+    //TODO: Does it mean new thread should inherit signal mask of the parent?
+    return t->id();
+}
 
 struct clone_args {
      u64 flags;
@@ -446,10 +525,15 @@ static int sys_clone3(struct clone_args *args, size_t size)
        args->flags,
        reinterpret_cast<void*>(args->stack) + args->stack_size,
        reinterpret_cast<int*>(args->parent_tid),
+#ifdef __x86_64__
        reinterpret_cast<int*>(args->child_tid),
        args->tls);
-}
 #endif
+#ifdef __aarch64__
+       args->tls,
+       reinterpret_cast<int*>(args->child_tid));
+#endif
+}
 
 #define __NR_sys_ioctl __NR_ioctl
 //
@@ -568,11 +652,14 @@ static long sys_brk(void *addr)
     }
 }
 
+#define __NR_utimensat4 __NR_utimensat
+extern int utimensat4(int dirfd, const char *pathname, const struct timespec times[2], int flags);
+
 #ifdef SYS_open
 TRACEPOINT(trace_syscall_open, "%d <= \"%s\" 0x%x", int, const char *, int);
 #endif
 TRACEPOINT(trace_syscall_read, "0x%x <= %d %p 0x%x", ssize_t, int, char *, size_t);
-TRACEPOINT(trace_syscall_uname, "%d <= ", int, struct utsname *);
+TRACEPOINT(trace_syscall_uname, "%d <= %p", int, struct utsname *);
 TRACEPOINT(trace_syscall_write, "0x%x <= %d %p 0x%x", ssize_t, int, const void *, size_t);
 TRACEPOINT(trace_syscall_gettid, "%d <=", pid_t);
 TRACEPOINT(trace_syscall_clock_gettime, "%d <= %d %p", int, clockid_t, struct timespec *);
@@ -634,7 +721,7 @@ TRACEPOINT(trace_syscall_nanosleep, "%d <= %p %p", int, const struct timespec*, 
 TRACEPOINT(trace_syscall_fstatat, "%d <= %d \"%s\" %p 0%0o", int, int, const char *, struct stat *, int);
 TRACEPOINT(trace_syscall_sys_exit_group, "%d <= %d", int, int);
 TRACEPOINT(trace_syscall_sys_getcwd, "%ld <= 0%0o %lu", long, char *, unsigned long);
-TRACEPOINT(trace_syscall_readlinkat, "%lu <= %d 0%0o 0x%x %lu", ssize_t, int, const char *, char *, size_t);
+TRACEPOINT(trace_syscall_readlinkat, "%lu <= %d %s 0x%x %lu", ssize_t, int, const char *, char *, size_t);
 TRACEPOINT(trace_syscall_getpid, "%d <=", pid_t);
 TRACEPOINT(trace_syscall_set_mempolicy, "%ld <= %d %p %lu", long, int, unsigned long *, unsigned long);
 TRACEPOINT(trace_syscall_sys_sched_setaffinity, "%d <= %d %u %p", int, pid_t, unsigned, unsigned long *);
@@ -657,53 +744,72 @@ TRACEPOINT(trace_syscall_mknodat, "%d <= %d \"%s\" %d %d", int, int, const char 
 TRACEPOINT(trace_syscall_statx, "%d <= %d \"%s\" %d %u %p", int, int, const char *, int, unsigned int, struct statx *);
 TRACEPOINT(trace_syscall_sys_getcpu, "%ld <= %p %p 0x%x", long, unsigned int *, unsigned int *, void *);
 TRACEPOINT(trace_syscall_dup, "%d <= %d", int, int);
+#ifdef __x86_64__
 TRACEPOINT(trace_syscall_dup2, "%d <= %d %d", int, int, int);
-TRACEPOINT(trace_syscall_mprotect, "%d <= 0x%x %lu %d", int, void *, size_t, int);
 TRACEPOINT(trace_syscall_access, "%d <= \"%s\" %d", int, const char *, int);
-TRACEPOINT(trace_syscall_writev, "%lu <= %d %p %d", ssize_t, int, const struct iovec *, int);
 TRACEPOINT(trace_syscall_readlink, "%lu <= \"%s\" 0x%x %lu", ssize_t, const char *, char *, size_t);
+TRACEPOINT(trace_syscall_poll, "%d <= %p %ld %d", int, struct pollfd *, nfds_t, int);
+TRACEPOINT(trace_syscall_epoll_create, "%d <= %d", int, int);
+TRACEPOINT(trace_syscall_time, "%ld <= %p", time_t, time_t *);
+TRACEPOINT(trace_syscall_unlink, "%d <= \"%s\"", int, const char *);
+TRACEPOINT(trace_syscall_pipe, "%d <= %p", int, int*);
+TRACEPOINT(trace_syscall_alarm, "%d <= %u", int, unsigned int);
+TRACEPOINT(trace_syscall_symlink, "%d <= \"%s\" \"%s\"", int, const char *, const char *);
+TRACEPOINT(trace_syscall_rmdir, "%d <= \"%s\"", int, const char *);
+TRACEPOINT(trace_syscall_creat, "%d <= \"%s\" %d", int, const char *, mode_t);
+TRACEPOINT(trace_syscall_chmod, "%d <= \"%s\" %d", int, const char *, mode_t);
+TRACEPOINT(trace_syscall_rename, "%d <= %s %s", int, const char *, const char *);
+#endif
+TRACEPOINT(trace_syscall_mprotect, "%d <= 0x%x %lu %d", int, void *, size_t, int);
+TRACEPOINT(trace_syscall_writev, "%lu <= %d %p %d", ssize_t, int, const struct iovec *, int);
 TRACEPOINT(trace_syscall_geteuid, "%d <=", uid_t);
 TRACEPOINT(trace_syscall_getegid, "%d <=", gid_t);
 TRACEPOINT(trace_syscall_gettimeofday, "%d <= %p %p", int, struct timeval *, struct timezone *);
-TRACEPOINT(trace_syscall_poll, "%d <= %p %ld %d", int, struct pollfd *, nfds_t, int);
 TRACEPOINT(trace_syscall_getppid, "%d <=", pid_t);
-TRACEPOINT(trace_syscall_epoll_create, "%d <= %d", int, int);
 TRACEPOINT(trace_syscall_sysinfo, "%d <= %p", int, struct sysinfo *);
-TRACEPOINT(trace_syscall_time, "%ld <= %p", time_t, time_t *);
 TRACEPOINT(trace_syscall_sendfile, "%lu <= %d %d %p %lu", ssize_t, int, int, off_t *, size_t);
 TRACEPOINT(trace_syscall_socketpair, "%d <= %d %d %d %p", int, int, int, int, int *);
 TRACEPOINT(trace_syscall_shutdown, "%d <= %d %d", int, int, int);
-TRACEPOINT(trace_syscall_unlink, "%d <= \"%s\"", int, const char *);
 TRACEPOINT(trace_syscall_readv, "%lu <= %lu %p %lu", ssize_t, unsigned long, const struct iovec *, unsigned long);
 TRACEPOINT(trace_syscall_getrusage, "%d <= %d %p", int, int, struct rusage *);
 TRACEPOINT(trace_syscall_accept, "%d <= %d %p %p", int, int, struct sockaddr *, socklen_t *);
 TRACEPOINT(trace_syscall_fchdir, "%d <= %u", int, unsigned int);
-TRACEPOINT(trace_syscall_pipe, "%d <= %p", int, int*);
 TRACEPOINT(trace_syscall_fstatfs, "%d <= %u %p", int, unsigned int, struct statfs *);
 TRACEPOINT(trace_syscall_umask, "%d <= %d", mode_t, mode_t);
 TRACEPOINT(trace_syscall_prctl, "%d <= %d %lu %lu %lu %lu", int, int, unsigned long, unsigned long, unsigned long, unsigned long);
 TRACEPOINT(trace_syscall_chdir, "%d <= \"%s\"", int, const char *);
 TRACEPOINT(trace_syscall_faccessat, "%d <= %d \"%s\" %d %d", int, int, const char *, int, int);
 TRACEPOINT(trace_syscall_kill, "%d <= %d %d", int, pid_t, int);
-TRACEPOINT(trace_syscall_alarm, "%d <= %u", int, unsigned int);
-TRACEPOINT(trace_syscall_utimensat, "%d <= %d \"%s\" %p %d", int, int, const char *, const struct timespec*, int);
-TRACEPOINT(trace_syscall_symlink, "%d <= \"%s\" \"%s\"", int, const char *, const char *);
-TRACEPOINT(trace_syscall_rmdir, "%d <= \"%s\"", int, const char *);
+TRACEPOINT(trace_syscall_utimensat4, "%d <= %d \"%s\" %p %d", int, int, const char *, const struct timespec*, int);
 TRACEPOINT(trace_syscall_sethostname, "%d <= \"%s\" %d", int, const char *, int);
-TRACEPOINT(trace_syscall_creat, "%d <= \"%s\" %d", int, const char *, mode_t);
 TRACEPOINT(trace_syscall_timerfd_create, "%d <= %d %d", int, int, int);
 TRACEPOINT(trace_syscall_timerfd_settime, "%d <= %d %d %p %p", int, int, int, const struct itimerspec *, struct itimerspec *);
 TRACEPOINT(trace_syscall_timerfd_gettime, "%d <= %d %p", int, int, struct itimerspec*);
-TRACEPOINT(trace_syscall_chmod, "%d <= \"%s\" %d", int, const char *, mode_t);
 TRACEPOINT(trace_syscall_fchmod, "%d <= %d %d", int, int, mode_t);
+#ifdef __x86_64__
 TRACEPOINT(trace_syscall_arch_prctl, "0x%x <= %d 0x%x", long, int, unsigned long);
+#endif
 TRACEPOINT(trace_syscall_sys_set_robust_list, "%d <= %p %lu", long, struct robust_list_head *, size_t);
 TRACEPOINT(trace_syscall_sys_set_tid_address, "%d <= %p", long, int *);
 #ifdef __x86_64__
 TRACEPOINT(trace_syscall_sys_clone, "%d <= 0x%x 0x%x %p %p %lu", int, unsigned long, void *, int *, int *, unsigned long);
-TRACEPOINT(trace_syscall_sys_clone3, "%d <= %p %lu", int, struct clone_args *, size_t);
 #endif
+#ifdef __aarch64__
+TRACEPOINT(trace_syscall_sys_clone, "%d <= 0x%x 0x%x %p %p %lu", int, unsigned long, void *, int *, unsigned long, int *);
+#endif
+TRACEPOINT(trace_syscall_sys_clone3, "%d <= %p %lu", int, struct clone_args *, size_t);
 TRACEPOINT(trace_syscall_prlimit64, "%d <= %u %d %p %p", int, pid_t, int, const struct rlimit *, struct rlimit *);
+TRACEPOINT(trace_syscall_msync, "%d <= 0x%x %lu %d", int, void *, size_t, int);
+TRACEPOINT(trace_syscall_truncate, "%d <= %s %ld", int, const char *, off_t);
+TRACEPOINT(trace_syscall_long_shmat, "0x%x <= %d 0x%x %d", long, int, const void *, int);
+TRACEPOINT(trace_syscall_shmctl, "%d <= %d %d %p", int, int, int, struct shmid_ds *);
+TRACEPOINT(trace_syscall_shmdt, "%d <= 0x%x", int, const void *)
+TRACEPOINT(trace_syscall_shmget, "%d <= %d %lu %d", int, key_t, size_t, int);
+TRACEPOINT(trace_syscall_rt_sigtimedwait, "%d <= %p %p %p %lu", int, const sigset_t *, siginfo_t *, const struct timespec *, size_t);
+TRACEPOINT(trace_syscall_getrlimit, "%d <= %d %p", int, int, struct rlimit *);
+TRACEPOINT(trace_syscall_getpriority, "%d <= %d %d", int, int, int);
+TRACEPOINT(trace_syscall_setpriority, "%d <= %d %d %d", int, int, int, int);
+TRACEPOINT(trace_syscall_ppoll, "%d <= %p %ld %p %p", int, struct pollfd *, nfds_t, const struct timespec *, const sigset_t *);
 
 OSV_LIBC_API long syscall(long number, ...)
 {
@@ -801,44 +907,47 @@ OSV_LIBC_API long syscall(long number, ...)
     SYSCALL5(statx, int, const char *, int, unsigned int, struct statx *);
     SYSCALL3(sys_getcpu, unsigned int *, unsigned int *, void *);
     SYSCALL1(dup, int);
+#ifdef __x86_64__
     SYSCALL2(dup2, int, int);
-    SYSCALL3(mprotect, void *, size_t, int);
     SYSCALL2(access, const char *, int);
-    SYSCALL3(writev, int, const struct iovec *, int);
     SYSCALL3(readlink, const char *, char *, size_t);
+    SYSCALL3(poll, struct pollfd *, nfds_t, int);
+    SYSCALL1(epoll_create, int);
+    SYSCALL1(time, time_t *);
+    SYSCALL1(unlink, const char *);
+    SYSCALL1(pipe, int*);
+    SYSCALL1(alarm, unsigned int);
+    SYSCALL2(symlink, const char *, const char *);
+    SYSCALL1(rmdir, const char *);
+    SYSCALL2(creat, const char *, mode_t);
+    SYSCALL2(chmod, const char *, mode_t);
+    SYSCALL2(rename, const char *, const char *);
+#endif
+    SYSCALL3(mprotect, void *, size_t, int);
+    SYSCALL3(writev, int, const struct iovec *, int);
     SYSCALL0(geteuid);
     SYSCALL0(getegid);
     SYSCALL2(gettimeofday, struct timeval *, struct timezone *);
-    SYSCALL3(poll, struct pollfd *, nfds_t, int);
     SYSCALL0(getppid);
-    SYSCALL1(epoll_create, int);
     SYSCALL1(sysinfo, struct sysinfo *);
-    SYSCALL1(time, time_t *);
     SYSCALL4(sendfile, int, int, off_t *, size_t);
     SYSCALL4(socketpair, int, int, int, int *);
     SYSCALL2(shutdown, int, int);
-    SYSCALL1(unlink, const char *);
     SYSCALL3(readv, unsigned long, const struct iovec *, unsigned long);
     SYSCALL2(getrusage, int, struct rusage *);
     SYSCALL3(accept, int, struct sockaddr *, socklen_t *);
     SYSCALL1(fchdir, unsigned int);
-    SYSCALL1(pipe, int*);
     SYSCALL2(fstatfs, unsigned int, struct statfs *);
     SYSCALL1(umask, mode_t);
     SYSCALL5(prctl, int, unsigned long, unsigned long, unsigned long, unsigned long);
     SYSCALL1(chdir, const char *);
     SYSCALL4(faccessat, int, const char *, int, int);
     SYSCALL2(kill, pid_t, int);
-    SYSCALL1(alarm, unsigned int);
-    SYSCALL4(utimensat, int, const char *, const struct timespec*, int);
-    SYSCALL2(symlink, const char *, const char *);
-    SYSCALL1(rmdir, const char *);
+    SYSCALL4(utimensat4, int, const char *, const struct timespec*, int);
     SYSCALL2(sethostname, const char *, int);
-    SYSCALL2(creat, const char *, mode_t);
     SYSCALL2(timerfd_create, int, int);
     SYSCALL4(timerfd_settime, int, int, const struct itimerspec *, struct itimerspec *);
     SYSCALL2(timerfd_gettime, int, struct itimerspec*);
-    SYSCALL2(chmod, const char *, mode_t);
     SYSCALL2(fchmod, int, mode_t);
 #ifdef __x86_64__
     SYSCALL2(arch_prctl, int, unsigned long);
@@ -847,9 +956,23 @@ OSV_LIBC_API long syscall(long number, ...)
     SYSCALL1(sys_set_tid_address, int *);
 #ifdef __x86_64__
     SYSCALL5(sys_clone, unsigned long, void *, int *, int *, unsigned long);
-    SYSCALL2(sys_clone3, struct clone_args *, size_t);
 #endif
+#ifdef __aarch64__
+    SYSCALL5(sys_clone, unsigned long, void *, int *, unsigned long, int *);
+#endif
+    SYSCALL2(sys_clone3, struct clone_args *, size_t);
     SYSCALL4(prlimit64, pid_t, int, const struct rlimit *, struct rlimit *);
+    SYSCALL3(msync, void *, size_t, int);
+    SYSCALL2(truncate, const char *, off_t);
+    SYSCALL3(long_shmat, int, const void *, int);
+    SYSCALL3(shmctl, int, int, struct shmid_ds *);
+    SYSCALL1(shmdt, const void *);
+    SYSCALL3(shmget, key_t, size_t, int);
+    SYSCALL4(rt_sigtimedwait, const sigset_t *, siginfo_t *, const struct timespec *, size_t);
+    SYSCALL2(getrlimit, int, struct rlimit *);
+    SYSCALL2(getpriority, int, int);
+    SYSCALL3(setpriority, int, int, int);
+    SYSCALL4(ppoll, struct pollfd *, nfds_t, const struct timespec *, const sigset_t *);
     }
 
     debug_always("syscall(): unimplemented system call %d\n", number);

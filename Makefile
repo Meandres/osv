@@ -593,6 +593,7 @@ bsd += bsd/sys/kern/uipc_sockbuf.o
 bsd += bsd/sys/kern/uipc_socket.o
 bsd += bsd/sys/kern/uipc_syscalls.o
 bsd += bsd/sys/kern/uipc_syscalls_wrap.o
+bsd += bsd/sys/kern/subr_bufring.o
 bsd += bsd/sys/kern/subr_sbuf.o
 bsd += bsd/sys/kern/subr_eventhandler.o
 bsd += bsd/sys/kern/subr_hash.o
@@ -681,6 +682,13 @@ bsd += bsd/sys/dev/xen/blkfront/blkfront.o
 endif
 ifeq ($(conf_drivers_hyperv),1)
 bsd += bsd/sys/dev/hyperv/vmbus/hyperv.o
+endif
+ifeq ($(conf_drivers_ena),1)
+bsd += bsd/sys/contrib/ena_com/ena_eth_com.o
+bsd += bsd/sys/contrib/ena_com/ena_com.o
+bsd += bsd/sys/dev/ena/ena_datapath.o
+bsd += bsd/sys/dev/ena/ena.o
+$(out)/bsd/sys/dev/ena/%.o: CXXFLAGS += -Ibsd/sys/contrib
 endif
 endif
 
@@ -946,6 +954,9 @@ drivers += drivers/xenclock.o
 drivers += drivers/xenfront.o drivers/xenfront-xenbus.o drivers/xenfront-blk.o
 drivers += drivers/xenplatform-pci.o
 endif
+ifeq ($(conf_drivers_ena),1)
+drivers += drivers/ena.o
+endif
 endif # x64
 
 ifeq ($(arch),aarch64)
@@ -991,6 +1002,7 @@ objects += arch/$(arch)/cpuid.o
 objects += arch/$(arch)/firmware.o
 objects += arch/$(arch)/hypervisor.o
 objects += arch/$(arch)/interrupt.o
+objects += arch/$(arch)/clone.o
 ifeq ($(conf_drivers_pci),1)
 objects += arch/$(arch)/pci.o
 objects += arch/$(arch)/msi.o
@@ -1006,7 +1018,9 @@ $(out)/arch/x64/string-ssse3.o: CXXFLAGS += -mssse3
 ifeq ($(arch),aarch64)
 objects += arch/$(arch)/psci.o
 objects += arch/$(arch)/arm-clock.o
-objects += arch/$(arch)/gic.o
+objects += arch/$(arch)/gic-common.o
+objects += arch/$(arch)/gic-v2.o
+objects += arch/$(arch)/gic-v3.o
 objects += arch/$(arch)/arch-dtb.o
 objects += arch/$(arch)/hypercall.o
 objects += arch/$(arch)/memset.o
@@ -1027,7 +1041,6 @@ objects += arch/x64/apic.o
 objects += arch/x64/apic-clock.o
 objects += arch/x64/entry-xen.o
 objects += arch/x64/prctl.o
-objects += arch/x64/clone.o
 objects += arch/x64/vmlinux.o
 objects += arch/x64/vmlinux-boot64.o
 objects += arch/x64/pvh-boot.o
@@ -1738,7 +1751,9 @@ $(out)/libc/stdlib/qsort_r.o: COMMON += -Wno-dangling-pointer
 libc += stdlib/strtol.o
 libc += stdlib/strtod.o
 libc += stdlib/wcstol.o
+ifeq ($(arch),x64)
 libc += stdlib/unimplemented.o
+endif
 
 libc += string/__memcpy_chk.o
 libc += string/explicit_bzero.o
@@ -2152,6 +2167,9 @@ $(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/bootfs.o $(ou
 	@# rule because that caused bug #545.
 	@readelf --dyn-syms --wide $(out)/loader.elf > $(out)/osv.syms
 	@scripts/libosv.py $(out)/osv.syms $(out)/libosv.ld `scripts/osv-version.sh` | $(CC) -c -o $(out)/osv.o -x assembler -
+	@echo '0000000000000000 T _text' > $(out)/osv.kallsyms
+	@echo '0000000000000000 T _stext' >> $(out)/osv.kallsyms
+	@grep ': 0000' $(out)/osv.syms | grep -v 'NOTYPE' | awk '{ print $$2 " T " $$8 }' | c++filt >> $(out)/osv.kallsyms
 	$(call quiet, $(CC) $(out)/osv.o -nostdlib -shared -o $(out)/libosv.so -T $(out)/libosv.ld, LIBOSV.SO)
 
 $(out)/zfs_builder.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/zfs_builder_bootfs.o $(out)/libvdso-content.o $(loader_options_dep) $(version_script_file)
