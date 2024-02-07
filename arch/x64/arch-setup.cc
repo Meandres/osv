@@ -372,13 +372,11 @@ void arch_init_drivers()
 #if CONF_drivers_ide
     drvman->register_driver(ide::ide_drive::probe);
 #endif
-<<<<<<< HEAD
 #if CONF_drivers_nvme
     drvman->register_driver(nvme::probe);
-=======
+#endif
 #if CONF_drivers_ena
     drvman->register_driver(aws::ena::probe);
->>>>>>> cb7d1803d5e531d75454d62e235b3537abb9f061
 #endif
     boot_time.event("drivers probe");
     drvman->load_all();
