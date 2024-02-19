@@ -187,7 +187,7 @@ struct ResidentPageSet {
    bool remove(u64 pid);
    template<class Fn> void iterateClockBatch(u64 batch, Fn fn);
 };
-
+/*
 struct OSvAIOInterface {
    static const u64 maxIOs = 256;
    
@@ -222,7 +222,7 @@ struct OSvAIOInterface {
                 assert(ret==0);
         }
    }
-};
+};*/
 
 extern __thread uint16_t wtid;
 
@@ -234,6 +234,7 @@ struct BufferManager {
    u64 virtCount;
    u64 physCount;
    int n_threads;
+   YmapBundle *ymapBundle;
    //std::vector<OSvAIOInterface*> osvaioInterfaces;
    unvme_iod_t io_desc_array[maxWorkerThreads][maxIOs];
 

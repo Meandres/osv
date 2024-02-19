@@ -1,8 +1,7 @@
 #include "drivers/ymap.hh"
 
-u64 YmapRegionStartAddr=0;
-u64 YmapRegionSize=0;
-std::vector<Ymap*>ymapInterfaces;
+//u64 YmapRegionStartAddr=0;
+//u64 YmapRegionSize=0;
 
 Ymap::Ymap(u64 count, int tid, void* virt) {
 	//mmap_and_pmap(count);
@@ -39,109 +38,90 @@ void Ymap::setPhysAddr(void* virt, u64 phys){
 }
 
 u64 Ymap::clearPhysAddr(void* virt){
-	//memset(virt, 0, pageSize);
 	std::atomic<u64>* ptePtr = walkRef(virt);
 	u64 phys = PTE(ptePtr->load()).phys;
-	//std::cout << std::bitset<64>(ptePtr->load()) << std::endl;
 	assert(phys!=0ull);
 	ptePtr->store(0ull);
-	//invalidateTLBEntry(virt);
-	//std::vector<void*> addresses = { virt };
-	//mmu::invlpg_tlb_all(addresses);
 	return phys;
 }
 
-bool Ymap::stealPages(){
-	int target = (interfaceId+1)%ymapInterfaces.size();
-	int toSteal = nbPagesToSteal;
-	//std::cout << "Stealing" << std::endl;
+YmapBundle::YmapBundle(u64 pageCount, int n_threads){
+	void* virt = mmap(NULL, pageCount * pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	madvise(virt, pageCount * pageSize, MADV_NOHUGEPAGE);
+	u64 pagesPerThread = pageCount / n_threads;
+	for(int i=0;i<n_threads;i++){
+		ymapInterfaces.push_back(new Ymap(pagesPerThread, i, virt + i*pagesPerThread*pageSize));
+	}
+}
+
+bool YmapBundle::stealPages(int tid){
+	int target = (ymapInterfaces[tid]->interfaceId+1)%ymapInterfaces.size();
+	int toSteal = ymapInterfaces[tid]->nbPagesToSteal;
 	u64 phys;
-	while (toSteal > 0 && target != interfaceId){
+	while (toSteal > 0 && target != ymapInterfaces[tid]->interfaceId){
 		if(ymapInterfaces[target]->currentlyStealing.load() == true){
 			target = (target+1)%ymapInterfaces.size();
-			//std::cout << "Skipping interface already stealing" << std::endl;
 			continue;
 		}
 		do{
-			phys = ymapInterfaces[target]->getPage(false);
+			phys = getPage(target, false);
 			if(phys != 0){
-				list.push_back(phys);
+				ymapInterfaces[tid]->list.push_back(phys);
 				toSteal--;
 			}
 		}while(phys!=0 && toSteal>0);
 		target = (target + 1)%ymapInterfaces.size();
 	}
-	//std::cout << "toSteal " <<toSteal << std::endl;
 	if(toSteal==0)
 		return true;
 	return false;
 }
 
-u64 Ymap::getPage(bool canSteal=true){
+u64 YmapBundle::getPage(int tid, bool canSteal=true){
 	u64 phys;
-	lock();
-	/*if(mappingCount > 0){
-		mappingCount--;
-		phys = walk(initialMapping++).phys;
-		this->unlock();
-		return phys;
-	}*/
-	if(list.size() == 0){
+	ymapInterfaces[tid]->lock();
+	if(ymapInterfaces[tid]->list.size() == 0){
 		if(!canSteal){ // fast exit
-			unlock();
+			ymapInterfaces[tid]->unlock();
 			return 0;
 		}else{
-			assert(!currentlyStealing.exchange(true, std::memory_order_acquire));
-			int ret = stealPages();
+			assert(!ymapInterfaces[tid]->currentlyStealing.exchange(true, std::memory_order_acquire));
+			int ret = stealPages(tid);
 			assert(ret);
-			assert(currentlyStealing.exchange(false, std::memory_order_release));
+			assert(ymapInterfaces[tid]->currentlyStealing.exchange(false, std::memory_order_release));
 		}
 	}
-	phys = list.back();
-	list.pop_back();
-	unlock();
+	phys = ymapInterfaces[tid]->list.back();
+	ymapInterfaces[tid]->list.pop_back();
+	ymapInterfaces[tid]->unlock();
 	return phys;
 }
 
-void Ymap::putPage(u64 phys){
-	list.push_back(phys);
+void YmapBundle::putPage(int tid, u64 phys){
+	ymapInterfaces[tid]->list.push_back(phys);
 }
 
 // get free page, return physical address
-void Ymap::mapPhysPage(void* virtAddr){
-	u64 phys = getPage();
+void YmapBundle::mapPhysPage(int tid, void* virtAddr){
+	u64 phys = getPage(tid);
 	assert(phys!=0);
-	lock();
-	setPhysAddr(virtAddr, phys);
-	unlock();
-	//std::cout << "Mapped phys" << std::endl;
+	ymapInterfaces[tid]->lock();
+	ymapInterfaces[tid]->setPhysAddr(virtAddr, phys);
+	ymapInterfaces[tid]->unlock();
 }
 
-void Ymap::unmapPhysPage(void* virtAddr){
-	lock();
-	u64 physAddr = clearPhysAddr(virtAddr);
-	putPage(physAddr);
-	unlock();
+void YmapBundle::unmapPhysPage(int tid, void* virtAddr){
+	ymapInterfaces[tid]->lock();
+	u64 physAddr = ymapInterfaces[tid]->clearPhysAddr(virtAddr);
+	putPage(tid, physAddr);
+	ymapInterfaces[tid]->unlock();
 }
 
-void Ymap::unmapBatch(void* virtMem, std::vector<PID> toEvict){
+void YmapBundle::unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict){
 	for(auto pid: toEvict){
-		unmapPhysPage(virtMem + pid);
+		unmapPhysPage(tid, virtMem + pid);
 	}
 	//mmu::flush_tlb_all();
 }
 
-void createYmapInterfaces(u64 pageCount, int n_threads){
-	void* virt = mmap(NULL, pageCount * pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	madvise(virt, pageCount * pageSize, MADV_NOHUGEPAGE);
-	u64 pagesPerThread = pageCount / n_threads;
-	//std::cout << pagesPerThread << std::endl;
-	//printf("%lX - %lX\n", virt+3*pagesPerThread*pageSize, virt+2*pagesPerThread*pageSize);
-	for(int i=0;i<n_threads;i++){
-		ymapInterfaces.push_back(new Ymap(pagesPerThread, i, virt + i*pagesPerThread*pageSize));
-	}
-	/*for(int i=1; i<n_threads; i++){
-		assert(ymapInterfaces[i]->list.front()> ymapInterfaces[i-1]->list.back());
-	}*/
-	//std::cout << ymapInterfaces[0]->list.front() << " -- " << ymapInterfaces[ymapInterfaces.size()-1]->list.back() << std::endl;
-}
+

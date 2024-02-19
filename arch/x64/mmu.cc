@@ -15,6 +15,9 @@
 #include <osv/prio.hh>
 #include <osv/elf.hh>
 #include "exceptions.hh"
+#ifndef VMCACHE
+#include <osv/cache.hh>
+#endif
 
 void page_fault(exception_frame *ef)
 {
@@ -39,7 +42,13 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
-        mmu::vm_fault(addr, ef);
+    #ifndef VMCACHE
+    CacheManager* mmr = get_mmr((void*)addr);
+	if(mmr != NULL)
+		cache_handle_page_fault(mmr, (void*)addr);
+	else
+    #endif
+        	mmu::vm_fault(addr, ef);
     }
 }
 

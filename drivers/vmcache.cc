@@ -194,7 +194,7 @@ void BufferManager::init(){
 
    // Initialise phys mappers
 #ifdef VMCACHE_YMAP
-	createYmapInterfaces(physCount, n_threads);
+	ymapBundle = new YmapBundle(physCount, n_threads);
 #endif //VMCACHE_YMAP
 
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
@@ -216,13 +216,9 @@ void BufferManager::init(){
    if (virtMem == MAP_FAILED)
       cerr << "mmap failed" << endl;
    for(u64 i=0; i<virtCount; i++){
-	//if(i%512 == 0){
-   	//	madvise(virtMem+1, pageSize*512, MADV_NOHUGEPAGE);
-	//}
 	// page fault to create page table levels
 	// do we need this ?
-	bool b = virtMem[i].dirty;
-	assert(!b);
+    memset(virtMem+i, 0, pageSize);
 	
 	madvise(virtMem+i, pageSize, MADV_DONTNEED);
 	// install zeroPages
@@ -263,10 +259,9 @@ Page* BufferManager::allocPage() {
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
 #ifdef VMCACHE_YMAP
-   ymapInterfaces[wtid]->mapPhysPage(virtMem+pid);
+   ymapBundle->mapPhysPage(wtid, virtMem+pid);
 #endif
    residentSet.insert(pid);
-   virtMem[pid].dirty = true;
    
    auto end = osv::clock::uptime::now();
    auto elapsed = end - start;
@@ -280,7 +275,7 @@ void BufferManager::handleFault(PID pid) {
    physUsedCount++;
    ensureFreePages();
 #ifdef VMCACHE_YMAP
-   ymapInterfaces[wtid]->mapPhysPage(virtMem+pid);
+   ymapBundle->mapPhysPage(wtid, virtMem+pid);
 #endif
    readPage(pid);
    residentSet.insert(pid);
@@ -373,7 +368,7 @@ void BufferManager::evict() {
          u64 v = ps.stateAndVersion;
          switch (PageState::getState(v)) {
             case PageState::Marked:
-               if (virtMem[pid].dirty) {
+               if (walk(virtMem+pid).dirty == 1) {
                   if (ps.tryLockS(v))
                      toWrite.push_back(pid);
                } else {
@@ -395,7 +390,11 @@ void BufferManager::evict() {
    assert(toWrite.size() <= maxIOs);
    for (u64 i=0; i<toWrite.size(); i++) {
 	PID pid = toWrite[i];
-	virtMem[pid].dirty = false;
+	// clear dirty bit
+    std::atomic<u64>* ptePtr = walkRef(virtMem+pid);
+    PTE pte = PTE(ptePtr->load());
+    pte.dirty = 0;
+    ptePtr->store(pte.word);
 	io_desc_array[wtid][i] = unvme_awrite(ns, wtid%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
 	assert(io_desc_array[wtid][i]!=NULL);
    }
@@ -429,11 +428,10 @@ void BufferManager::evict() {
    // 4. remove from page table
     for (u64& pid : toEvict){
 #ifdef VMCACHE_YMAP
-	    ymapInterfaces[wtid]->unmapPhysPage(virtMem + pid);
+	    ymapBundle->unmapPhysPage(wtid, virtMem + pid);
 	    toEvictAddresses.push_back(virtMem+pid);
     }
     mmu::invlpg_tlb_all(toEvictAddresses);
-    //ymapInterfaces[wtid]->unmapBatch(virtMem, toEvict);
 #else
 	    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
     }

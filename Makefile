@@ -890,6 +890,9 @@ $(out)/drivers/nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
 endif
 ifeq ($(conf_drivers_vmcache),1)
 drivers += drivers/vmcache.o
+CXXFLAGS += -DVMCACHE
+else
+objects += core/cache.o
 endif
 drivers += drivers/ymap.o
 drivers += drivers/driver.o
@@ -1066,6 +1069,7 @@ objects += core/mempool.o
 objects += core/alloctracker.o
 objects += core/printf.o
 objects += core/sampler.o
+# objects += core/cache.o
 
 objects += linux.o
 objects += core/commands.o

@@ -981,7 +981,6 @@ static int unvme_map_prps(const unvme_ns_t* ns, unvme_queue_t* q, int cid,
 
     *prp1 = addr;
     *prp2 = 0;
-    return 0;
     int numpages = (bufsz + ns->pagesize - 1) >> ns->pageshift;
     if (numpages == 2) {
         *prp2 = addr + ns->pagesize;
