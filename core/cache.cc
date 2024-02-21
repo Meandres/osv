@@ -29,6 +29,11 @@ using namespace std;
 
 std::atomic<u64> pageFaultNumber(0);
 std::atomic<u64> evictCount(0);
+std::mutex thread_mutex;
+__thread elapsed_time parts_time[parts_num] = { };
+__thread uint64_t parts_count[parts_num] = { };
+elapsed_time thread_aggregate_time[parts_num] = { };
+uint64_t thread_aggregate_count[parts_num] = { };
 
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
@@ -154,6 +159,9 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
 		ptePtr->store(0ull);
    	}
    	invalidateTLB();
+    for(u64 i=0; i<virtCount; i++){
+        assert(walk(virtMem+i).word == 0ull);
+    }
    
    	physUsedCount = 0;
    	allocCount = 1; // pid 0 reserved for meta data
@@ -166,13 +174,15 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
     handlers.push_back(&default_allocate);
     handlers.push_back(&default_evict);
 
-    cout << "MMIO Region initialized with virtmem size :" << virtSize/gb << " GB, physmem size : " << physSize/gb << " GB, max threads : " << n_threads << endl;
+    cout << "MMIO Region initialized at "<< virtMem <<" with virtmem size :" << virtSize/gb << " GB, physmem size : " << physSize/gb << " GB, max threads : " << n_threads << endl;
 }
 
 CacheManager::~CacheManager(){};
 
 void CacheManager::handleFault(PID pid){
+    auto start = getClock();
     handlers[CACHE_OP_PAGEFAULT](this, pid, 0);
+    addTime(start, handlefault);
 }
 
 int CacheManager::allocate(PID* listStart, int size){
@@ -180,7 +190,9 @@ int CacheManager::allocate(PID* listStart, int size){
 }
 
 void CacheManager::evict(){
+    auto start = getClock();
     handlers[CACHE_OP_EVICT](this, 0, 0);
+    addTime(start, evictpage);
 }
 
 void CacheManager::ensureFreePages() {
@@ -190,6 +202,7 @@ void CacheManager::ensureFreePages() {
 
 // allocated new page and fix it
 Page* CacheManager::allocPage() {
+    auto start = osv::clock::uptime::now();
     u64 pid = allocCount++;
     if (pid >= virtCount) {
         cerr << "VIRTGB is too low" << endl;
@@ -201,13 +214,22 @@ Page* CacheManager::allocPage() {
     if(explicit_control){ 
         physUsedCount++;
         ensureFreePages();
-        ymapBundle.mapPhysPage(getTID(), virtMem+pid);
+        int tid = getTID();
+        if(tid == -1){
+            parts_time[mapphys] += ymapBundle.mapPhysPage(0, virtMem+pid);
+            parts_count[mapphys]++;
+        }else{
+            parts_time[mapphys] += ymapBundle.mapPhysPage(tid, virtMem+pid);
+            parts_count[mapphys]++;
+        }
         residentSet.insert(pid);
     }
+    addTime(start, allocpage);
     return toPtr(pid);
 }
 
 Page* CacheManager::fixX(PID pid) {
+    auto start = osv::clock::uptime::now();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
@@ -216,12 +238,14 @@ Page* CacheManager::fixX(PID pid) {
                 if (ps.tryLockX(stateAndVersion)) {
                     if(explicit_control)
                         handleFault(pid);
+                    addTime(start, fixx);
                     return virtMem + pid;
                 }
                 break;
             }
             case PageState::Marked: case PageState::Unlocked: {
                 if (ps.tryLockX(stateAndVersion)){
+                    addTime(start, fixx);
                     return virtMem + pid;
                 }
                 break;
@@ -230,26 +254,65 @@ Page* CacheManager::fixX(PID pid) {
         yield(repeatCounter);
     }
 }
+/*
+Page* CacheManager::fixS(PID pid) {
+    auto start = osv::clock::uptime::now();
+    PageState& ps = getPageState(pid);
+    for (u64 repeatCounter=0; ; repeatCounter++) {
+        u64 stateAndVersion = ps.stateAndVersion;
+        if(explicit_control){
+            switch (PageState::getState(stateAndVersion)) {
+                case PageState::Locked: {
+                    break;
+                } case PageState::Evicted: {
+                    if (ps.tryLockX(stateAndVersion)){
+                        handleFault(pid);
+                        ps.unlockX();
+                    }
+                    break;
+                } default: {
+                    if (ps.tryLockS(stateAndVersion)){
+                        addTime(start, fixs);
+                        return virtMem + pid;
+                    }
+                }
+            }
+        }else{
+            switch (PageState::getState(stateAndVersion)) {
+                case PageState::Locked: {
+                    break;
+                } default: {
+                    if (ps.tryLockS(stateAndVersion)){
+                        addTime(start, fixs);
+                        return virtMem + pid;
+                    }
+                }
+            }
+        }
+        yield(repeatCounter);
+    }
+}*/
 
 Page* CacheManager::fixS(PID pid) {
+    auto start = osv::clock::uptime::now();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
         switch (PageState::getState(stateAndVersion)) {
             case PageState::Locked: {
                 break;
-            } 
-            case PageState::Evicted: {
-                if (ps.tryLockX(stateAndVersion)) {
+            } case PageState::Evicted: {
+                if (ps.tryLockX(stateAndVersion)){
                     if(explicit_control)
                         handleFault(pid);
                     ps.unlockX();
                 }
                 break;
-            }
-            default: {
-                if (ps.tryLockS(stateAndVersion))
+            } default: {
+                if (ps.tryLockS(stateAndVersion)){
+                    addTime(start, fixs);
                     return virtMem + pid;
+                }
             }
         }
         yield(repeatCounter);
@@ -265,9 +328,11 @@ void CacheManager::unfixX(PID pid) {
 }
 
 void CacheManager::readPage(PID pid) {
-      int ret = unvme_read(ns, getTID()%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
-      assert(ret==0);
-      readCount++;
+    auto start = osv::clock::uptime::now();
+    int ret = unvme_read(ns, getTID()%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
+    assert(ret==0);
+    readCount++;
+    addTime(start, readpage);
 }
 
 int CacheManager::updateCallback(enum cache_opcode op, cache_op_func_t f){
@@ -291,9 +356,11 @@ int default_handleFault(CacheManager* cm, PID pid, int unused) {
     cm->physUsedCount++;
     cm->ensureFreePages();
     if(cm->getTID() == -1){
-        cm->ymapBundle.mapPhysPage(0, cm->virtMem+pid);
+        parts_time[mapphys] += cm->ymapBundle.mapPhysPage(0, cm->virtMem+pid);
+        parts_count[mapphys]++;
     }else{
-        cm->ymapBundle.mapPhysPage(cm->getTID(), cm->virtMem+pid);
+        parts_time[mapphys] += cm->ymapBundle.mapPhysPage(cm->getTID(), cm->virtMem+pid);
+        parts_count[mapphys]++;
     }
     cm->readPage(pid);
     cm->residentSet.insert(pid);
@@ -379,7 +446,8 @@ int default_evict(CacheManager* cm, u64 unused_u64, int unused_int) {
    
    // 4. remove from page table
     for (u64& pid : toEvict){
-	    cm->ymapBundle.unmapPhysPage(tid, cm->virtMem + pid);
+	    parts_time[unmapphys] += cm->ymapBundle.unmapPhysPage(tid, cm->virtMem + pid);
+        parts_count[unmapphys] ++;
         toEvictAddresses.push_back(cm->virtMem+pid);
     }
     mmu::invlpg_tlb_all(toEvictAddresses);

@@ -215,28 +215,29 @@ void BufferManager::init(){
    //std::cout << "virtMem "<< virtMem << " - " << virtMem+virtCount << std::endl;
    if (virtMem == MAP_FAILED)
       cerr << "mmap failed" << endl;
-   for(u64 i=0; i<virtCount; i++){
-	// page fault to create page table levels
-	// do we need this ?
-    memset(virtMem+i, 0, pageSize);
-	
-	madvise(virtMem+i, pageSize, MADV_DONTNEED);
-	// install zeroPages
-	atomic<u64>* ptePtr = walkRef(virtMem+i);
-	ptePtr->store(0ull);
-   }
-   invalidateTLB();
-   
-   //u64 phys = PTE(*walkRef(virtMem+512)).phys;
-      
-   batch = envOr("BATCH", 64);
-   physUsedCount = 0;
-   allocCount = 1; // pid 0 reserved for meta data
-   readCount = 0;
-   writeCount = 0;
+    for(u64 i=0; i<virtCount; i++){
+	    // page fault to create page table levels
+	    // do we need this ?
+        //memset(virtMem+i, 0, pageSize);
 
-   cerr << "vmcache " << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
-   initialized=true;
+	
+	    madvise(virtMem+i, pageSize, MADV_DONTNEED);
+	    // install zeroPages
+	    atomic<u64>* ptePtr = walkRef(virtMem+i);
+	    ptePtr->store(0ull);
+    }
+    invalidateTLB();
+   
+    //u64 phys = PTE(*walkRef(virtMem+512)).phys;
+      
+    batch = envOr("BATCH", 64);
+    physUsedCount = 0;
+    allocCount = 1; // pid 0 reserved for meta data
+    readCount = 0;
+    writeCount = 0;
+
+    cerr << "vmcache " << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
+    initialized=true;
 }
 
 void BufferManager::ensureFreePages() {

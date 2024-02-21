@@ -46,7 +46,7 @@ void page_fault(exception_frame *ef)
     CacheManager* mmr = get_mmr((void*)addr);
 	if(mmr != NULL)
 		cache_handle_page_fault(mmr, (void*)addr);
-	else
+    else
     #endif
         	mmu::vm_fault(addr, ef);
     }

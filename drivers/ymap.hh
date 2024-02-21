@@ -16,6 +16,8 @@ struct alignas(4096) Page {
 	//bool dirty;
 };
 
+const bool debugTime = true;
+
 constexpr uintptr_t get_mem_area_base(u64 area)
 {
     return 0x400000000000 | uintptr_t(area) << 44;
@@ -144,6 +146,9 @@ inline void print_PP(PhysicalPage *phys){
 static u64 constexpr pageSize = 4096;
 extern u64 YmapRegionStartAddr;
 extern u64 YmapRegionSize;
+
+typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
+
 struct Ymap {
 	PhysicalPage *freeList; // free physical pages
 	
@@ -170,8 +175,8 @@ struct YmapBundle{
     u64 getPage(int tid, bool stealing);
 	bool stealPages(int tid);
 	void putPage(int tid, u64 phys);
-	void mapPhysPage(int tid, void* virtAddr);
-	void unmapPhysPage(int tid, void* virtAddr);
+	elapsed_time mapPhysPage(int tid, void* virtAddr);
+	elapsed_time unmapPhysPage(int tid, void* virtAddr);
 	void unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict);
 
 };

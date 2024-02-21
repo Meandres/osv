@@ -56,6 +56,61 @@ void* allocHuge(size_t size);
 // use when lock is not free
 void yield(u64 counter);
 
+//typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
+enum parts{
+    allocpage,
+    readpage,
+    handlefault,
+    evictpage,
+    mapphys,
+    unmapphys,
+    fixx,
+    fixs,
+    guardO,
+    guardX,
+    guardS
+};
+
+
+static const char* partsStrings[] = { "allocPage", "readPage", "handleFault", "evict", "mapPhys", "unmapPhys", "fixX", "fixS", "guardO", "guardX", "guardS" };
+const unsigned parts_num = 11;
+
+extern std::mutex thread_mutex;
+extern __thread elapsed_time parts_time[parts_num];
+extern __thread uint64_t parts_count[parts_num];
+extern elapsed_time thread_aggregate_time[parts_num];
+extern uint64_t thread_aggregate_count[parts_num];
+
+inline void add_thread_results(){
+    const std::lock_guard<std::mutex> lock(thread_mutex);
+    for(unsigned i=0; i<parts_num; i++){
+        thread_aggregate_time[i] += parts_time[i];
+        thread_aggregate_count[i] += parts_count[i];
+    }
+}
+
+inline void print_aggregate_avg(){
+    std::cout << "Results of the profiling :"<<std::endl;
+	for(unsigned i=0; i<parts_num; i++){
+		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+	}
+}
+
+inline osv::clock::uptime::time_point getClock(){
+    if(debugTime)
+        return osv::clock::uptime::now();
+    else
+        return std::chrono::time_point<osv::clock::uptime>();
+}
+
+inline void addTime(osv::clock::uptime::time_point start, enum parts part){
+    if(debugTime){
+        auto elapsed = osv::clock::uptime::now() - start;
+        parts_time[part] += elapsed;
+        parts_count[part]++;
+    }
+}
+
 struct PageState {
    std::atomic<u64> stateAndVersion;
 

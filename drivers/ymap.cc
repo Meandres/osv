@@ -101,20 +101,38 @@ void YmapBundle::putPage(int tid, u64 phys){
 	ymapInterfaces[tid]->list.push_back(phys);
 }
 
-// get free page, return physical address
-void YmapBundle::mapPhysPage(int tid, void* virtAddr){
+elapsed_time YmapBundle::mapPhysPage(int tid, void* virtAddr){
+    std::chrono::time_point<osv::clock::uptime> start;
+    if(debugTime){
+        start = osv::clock::uptime::now();
+    }
 	u64 phys = getPage(tid);
 	assert(phys!=0);
 	ymapInterfaces[tid]->lock();
 	ymapInterfaces[tid]->setPhysAddr(virtAddr, phys);
 	ymapInterfaces[tid]->unlock();
+    if(debugTime){
+        return osv::clock::uptime::now() - start;
+    }
+
+    return std::chrono::duration<int64_t, std::ratio<1, 1000000000>>();
 }
 
-void YmapBundle::unmapPhysPage(int tid, void* virtAddr){
+elapsed_time YmapBundle::unmapPhysPage(int tid, void* virtAddr){
+    std::chrono::time_point<osv::clock::uptime> start;
+    if(debugTime){
+        start = osv::clock::uptime::now();
+    }
 	ymapInterfaces[tid]->lock();
 	u64 physAddr = ymapInterfaces[tid]->clearPhysAddr(virtAddr);
 	putPage(tid, physAddr);
+    assert(walk(virtAddr).word == 0ull);
 	ymapInterfaces[tid]->unlock();
+    if(debugTime){
+        return osv::clock::uptime::now() - start;
+    }
+
+    return std::chrono::duration<int64_t, std::ratio<1, 1000000000>>();
 }
 
 void YmapBundle::unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict){
