@@ -1225,7 +1225,7 @@ unvme_ns_t* unvme_do_open(int nsid, int qcount, int qsize)
         dev = xses->dev;
     } else {
         // setup controller namespace
-       dev = (unvme_device_t*)zalloc(sizeof(unvme_device_t));
+        dev = (unvme_device_t*)zalloc(sizeof(unvme_device_t));
         nvme_create(&dev->nvmedev);
         unvme_adminq_create(dev, 64);
 
