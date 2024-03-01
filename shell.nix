@@ -1,8 +1,13 @@
 { pkgs ? import <nixpkgs> {} }:
-    pkgs.mkShell {
-        nativeBuildInputs = with pkgs.buildPackages; [ gnumake unzip readline docker pax-utils pkg-config lua53Packages.lua ];
-        buildInputs = with pkgs.buildPackages; [ (boost.override { enableStatic = true; enableShared = false; }) readline libaio openssl.out openssl.dev openssl ];
-	boost_base = pkgs.boost;
+let 
+  osv-boost = pkgs.boost175.override{ enableStatic=true; enableShared = false;};
+in
+  pkgs.stdenv.mkDerivation {
+        name="osv-dev-env";
+        nativeBuildInputs = with pkgs.buildPackages; [ gnumake unzip readline docker pax-utils pkg-config lua53Packages.lua qemu_full ];
+        #buildInputs = with pkgs.buildPackages; [ (boost.override { enableStatic = true; enableShared = false; }) readline libaio openssl.out openssl.dev openssl ];
+        buildInputs = with pkgs.buildPackages; [ osv-boost readline libaio openssl.out openssl.dev openssl ];
+	boost_base = osv-boost;
 	shellHook = ''
 		export LD_LIBRARY_PATH=$(nix eval --raw nixpkgs#readline)/lib
 
