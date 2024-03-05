@@ -6,6 +6,7 @@
         },
     "repositories": [
         "${OSV_BASE}/apps",
+        "${OSV_BASE}/benchs",
         "${OSV_BASE}/modules"
     ]
    },
