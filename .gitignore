@@ -53,3 +53,6 @@ compile_commands.json
 downloaded_packages
 
 nvme.img
+benchs/*/*.d
+benchs/DBmockup/DBmockup
+benchs/mm_test/mm_test
