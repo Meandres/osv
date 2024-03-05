@@ -16,6 +16,16 @@
 #include <osv/initialize.hh>
 #include "sse.hh"
 #include <x86intrin.h>
+#include "drivers/rdtsc.h"
+
+unsigned long long cycles_memcpy_small = 0;
+unsigned long long nb_memcpy_small = 0;
+unsigned long long cycles_memcpy_ssse3 = 0;
+unsigned long long nb_memcpy_ssse3 = 0;
+unsigned long long cycles_memcpy_ssse3_unal = 0;
+unsigned long long nb_memcpy_ssse3_unal = 0;
+unsigned long long cycles_memcpy_repmovsb = 0;
+unsigned long long nb_memcpy_repmovsb = 0;
 
 extern "C"
 void *memcpy_base(void *__restrict dest, const void *__restrict src, size_t n);
@@ -258,13 +268,26 @@ extern "C"
 [[gnu::optimize("omit-frame-pointer")]]
 void *memcpy_repmov(void *__restrict dest, const void *__restrict src, size_t n)
 {
-    if (n < small_memcpy_lim) {
+    /*if (n < small_memcpy_lim) {
         return small_memcpy(dest, src, n);
     } else if (n < 1024) {
         return sse_memcpy(dest, src, n);
     } else {
         auto ret = dest;
         repmovsb(dest, src, n);
+        return ret;
+    }*/
+    unsigned long long start = rdtsc();
+    if (n < small_memcpy_lim) {
+        void* res = small_memcpy(dest, src, n);
+        cycles_memcpy_small += rdtsc_elapse(start);
+        nb_memcpy_small++;
+        return res;
+    } else {
+        auto ret = dest;
+        repmovsb(dest, src, n);
+        cycles_memcpy_repmovsb += rdtsc_elapse(start);
+        nb_memcpy_repmovsb++;
         return ret;
     }
 }
@@ -296,7 +319,7 @@ extern "C"
 [[gnu::optimize("omit-frame-pointer")]]
 void *memcpy_repmov_ssse3(void *__restrict dest, const void *__restrict src, size_t n)
 {
-    if (n < small_memcpy_lim) {
+    /*if (n < small_memcpy_lim) {
         return small_memcpy(dest, src, n);
     } else if (n < 1024) {
         return sse_memcpy(dest, src, n);
@@ -306,6 +329,29 @@ void *memcpy_repmov_ssse3(void *__restrict dest, const void *__restrict src, siz
     } else {
         auto ret = dest;
         repmovsb(dest, src, n);
+        return ret;
+    }*/
+    unsigned long long start = rdtsc();
+    if (n < small_memcpy_lim) {
+        void* res = small_memcpy(dest, src, n);
+        cycles_memcpy_small += rdtsc_elapse(start);
+        nb_memcpy_small++;
+        return res;
+    } else if (n < 1024) {
+        void* res = sse_memcpy(dest, src, n);
+        cycles_memcpy_ssse3 += rdtsc_elapse(start);
+        nb_memcpy_ssse3++;
+        return res;
+    } else if (n < 65536 && !both_aligned(dest, src, 16)) {
+        ssse3_unaligned_copy(dest, src, n);
+        cycles_memcpy_ssse3_unal += rdtsc_elapse(start);
+        nb_memcpy_ssse3_unal++;
+        return dest;
+    } else {
+        auto ret = dest;
+        repmovsb(dest, src, n);
+        cycles_memcpy_repmovsb += rdtsc_elapse(start);
+        nb_memcpy_repmovsb++;
         return ret;
     }
 }

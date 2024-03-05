@@ -55,6 +55,7 @@ void page_fault(exception_frame *ef)
 namespace mmu {
 
 uint8_t phys_bits = max_phys_bits, virt_bits = 52;
+uint8_t old_phys_bits = phys_bits;
 
 void invlpg_tlb_entry(void* addr){
 	asm volatile("invlpg (%0)" :: "r" (addr) : "memory");

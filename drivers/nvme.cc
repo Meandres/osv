@@ -1730,7 +1730,6 @@ nvme::nvme(pci::device &dev)
    dev.set_command(command);
 
     const unvme_ns_t* ns = unvme_open();
-    printf("nvme\n");
     if (!ns) exit(1);
     printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
     printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);

@@ -137,6 +137,10 @@ void arch_setup_free_memory()
         c = processor::cpuid(0x80000008);
         mmu::phys_bits = c.a & 0xff;
         mmu::virt_bits = (c.a >> 8) & 0xff;
+        if(mmu::phys_bits > mmu::max_phys_bits){
+            mmu::old_phys_bits = mmu::phys_bits;
+            mmu::phys_bits = mmu::max_phys_bits;
+        }
         assert(mmu::phys_bits <= mmu::max_phys_bits);
     }
 
@@ -214,6 +218,7 @@ void arch_setup_free_memory()
         }
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
+    printf("phys_bits: %i, old_phys_bits: %i\n", mmu::phys_bits, mmu::old_phys_bits);
 }
 
 void arch_setup_tls(void *tls, const elf::tls_data& info)

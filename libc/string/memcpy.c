@@ -1,6 +1,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#include "drivers/rdtsc.h"
 
 #define SS (sizeof(size_t))
 #define ALIGN (sizeof(size_t)-1)

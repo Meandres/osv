@@ -18,6 +18,15 @@ extern "C" {
 
 #include <bits/alltypes.h>
 
+extern unsigned long long cycles_memcpy_small;
+extern unsigned long long nb_memcpy_small;
+extern unsigned long long cycles_memcpy_ssse3;
+extern unsigned long long nb_memcpy_ssse3;
+extern unsigned long long cycles_memcpy_ssse3_unal;
+extern unsigned long long nb_memcpy_ssse3_unal;
+extern unsigned long long cycles_memcpy_repmovsb;
+extern unsigned long long nb_memcpy_repmovsb;
+
 void *memcpy (void *__restrict, const void *__restrict, size_t);
 void *memmove (void *, const void *, size_t);
 void *memset (void *, int, size_t);
