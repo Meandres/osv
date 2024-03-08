@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <experimental/random>
 #include <ctime>
+#include <sys/mman.h>
 
 using namespace std;
 
@@ -25,78 +26,48 @@ int main(int argc, char** argv){
         return 1;
     }
     const uint64_t nb_copies = 100000000;
+    const uint64_t nb_lookups = 1000000000;
     const int repetitions = 5;
+    const int size = 16777216;
     char system[50];
     strcpy(system, argv[1]);
     srand(time(nullptr));
-    char array_null[4096] = {};
-    char *array_1 = (char*) malloc(1*sizeof(char));
-    char *array_8 = (char*) malloc(8*sizeof(char));
-    char *array_512 = (char*) malloc(512*sizeof(char));
-    char *array_4096 = (char*) malloc(4096*sizeof(char));
-    char *dest_1 = (char*) malloc(1*sizeof(char));
-    char *dest_8 = (char*) malloc(8*sizeof(char));
-    char *dest_512 = (char*) malloc(512*sizeof(char));
-    char *dest_4096 = (char*) malloc(4096*sizeof(char));
+    void* mem = mmap(NULL, size*sizeof(char), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    char* charMem = (char*) mem;
+    char *dest = (char*) malloc(4096*sizeof(char));
 
     // load random values
-    for(int i = 0; i<4096; i++){
+    for(int i = 0; i<size; i++){
         char rnd_val = experimental::randint(0, 255);
-        if(i<1){
-           array_1[i] = rnd_val; 
-        }
-        if(i<8){
-           array_8[i] = rnd_val; 
-        }
-        if(i<512){
-           array_512[i] = rnd_val; 
-        }
-        array_4096[i] = rnd_val;
+        charMem[i] = rnd_val;
+        if(i<4096)
+            dest[i] = 0;
     }
-
-    for(int i=0; i<repetitions; i++){
-        uint64_t start = rdtsc();
-        for(uint64_t j = 0; j<nb_copies; j++){
-            array_1[0] = (array_1[0] + j)%255;
-            memcpy(dest_1, array_1, 1);
+    /*int pos;
+    for(int cpySize=1; cpySize <= 4096; cpySize*=8){
+        for(int i=0; i<repetitions; i++){
+            uint64_t start = rdtsc();
+            for(uint64_t j = 0; j<nb_copies; j++){
+                pos = experimental::randint(0, size-cpySize)%(size-cpySize);
+                memcpy(dest, charMem+pos, cpySize);
+            }
+            uint64_t end = rdtsc();
+            cout << cpySize << "," << system << "," << (double)(end-start)/nb_copies << endl;
         }
-        uint64_t end = rdtsc();
-        cout << "1," << system << "," << (double)(end-start)/nb_copies << endl;
+    }*/
+    int pos;
+    uint64_t acc = 0;
+    uint64_t start = rdtsc();
+    for(uint64_t i=0; i<nb_lookups; i++){
+        pos = experimental::randint(0, size);
+        acc += (uint64_t)charMem[pos];
     }
+    uint64_t end = rdtsc();
+    cout << system << "," << (double)(end-start)/nb_lookups << endl;
     
-    for(int i=0; i<repetitions; i++){
-        uint64_t start = rdtsc();
-        for(uint64_t j = 0; j<nb_copies; j++){
-            array_8[j%8] = (array_8[j%8] + j)%255;
-            memcpy(dest_8, array_8, 8);
-        }
-        uint64_t end = rdtsc();
-        cout << "8," << system << "," << (double)(end-start)/nb_copies << endl;
-    }
-
-    for(int i=0; i<repetitions; i++){
-        uint64_t start = rdtsc();
-        for(uint64_t j = 0; j<nb_copies; j++){
-            array_512[j%512] = (array_512[j%512] + j)%255;
-            memcpy(dest_512, array_512, 512);
-        }
-        uint64_t end = rdtsc();
-        cout << "512," << system << "," << (double)(end-start)/nb_copies << endl;
-    }
-
-    for(int i=0; i<repetitions; i++){
-        uint64_t start = rdtsc();
-        for(uint64_t j = 0; j<nb_copies; j++){
-            array_4096[j%4096] = (array_4096[j%4096] + j)%255;
-            memcpy(dest_4096, array_4096, 4096);
-        }
-        uint64_t end = rdtsc();
-        cout << "4096," << system << "," << (double)(end-start)/nb_copies << endl;
-    }
     /*cout << "Average cycles for memcpy_small " << ((double)cycles_memcpy_small)/nb_memcpy_small << ", count: " << nb_memcpy_small << endl;
     cout << "Average cycles for memcpy_ssse3 " << ((double)cycles_memcpy_ssse3)/nb_memcpy_ssse3 << ", count: " << nb_memcpy_ssse3 << endl;
     cout << "Average cycles for memcpy_ssse3_unal " << ((double)cycles_memcpy_ssse3_unal)/nb_memcpy_ssse3_unal << ", count: " << nb_memcpy_ssse3_unal << endl;
     cout << "Average cycles for memcpy_repmovsb " << ((double)cycles_memcpy_repmovsb)/nb_memcpy_repmovsb << ", count: " << nb_memcpy_repmovsb << endl;*/
-
     return 0;
 }

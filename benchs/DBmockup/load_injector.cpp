@@ -193,13 +193,13 @@ int main(int argc, char** argv) {
    };
 
    if (isRndread) {
-      BTree bt(envOr("VIRTGB", 16ull), envOr("PHYSGB", 4ull), envOr("THREADS", 1));
-      bt.splitOrdered = false;
+      BTree bt(envOr("VIRTGB", 4ull), envOr("PHYSGB", 1ull), envOr("THREADS", 1));
 
       {
          // insert
          parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
          workerThreadId = worker;
+        cache->registerThread();
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
@@ -207,6 +207,7 @@ int main(int argc, char** argv) {
                memcpy(payload.data(), k1, sizeof(u64));
                bt.insert({k1, sizeof(KeyType)}, payload);
             }
+	        cache->forgetThread();
          });
       }
       cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -215,35 +216,37 @@ int main(int argc, char** argv) {
       cache->writeCount = 0;
       thread statThread(statFn);
 
-      parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         workerThreadId = worker;
-         u64 cnt = 0;
-         u64 start = rdtsc();
-         while (keepRunning.load()) {
-            union { u64 v1; u8 k1[sizeof(u64)]; };
-            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+        parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            workerThreadId = worker;
+            cache->registerThread();
+            u64 cnt = 0;
+            u64 start = rdtsc();
+            while (keepRunning.load()) {
+                union { u64 v1; u8 k1[sizeof(u64)]; };
+                v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
 
-            array<u8, 120> payload; 
-            bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-		memcpy(payload.data(), p.data(), p.size());
-            });
-            assert(succ);
-            assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+                array<u8, 120> payload; 
+                bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
+		        memcpy(payload.data(), p.data(), p.size());
+                });
+                assert(succ);
+                assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
-            cnt++;
-            u64 stop = rdtsc();
-            if ((stop-start) > statDiff) {
-               txProgress += cnt;
-               start = stop;
-               cnt = 0;
+                cnt++;
+                u64 stop = rdtsc();
+                if ((stop-start) > statDiff) {
+                    txProgress += cnt;
+                    start = stop;
+                    cnt = 0;
+                }
             }
-         }
-         txProgress += cnt;
-      });
+            txProgress += cnt;
+	        cache->forgetThread();
+        });
 
-      statThread.join();
-      return 0;
-   }
+        statThread.join();
+        return 0;
+    }
 
    // TPC-C
    Integer warehouseCount = n;
@@ -293,6 +296,8 @@ int main(int argc, char** argv) {
    cerr << "allocCount: " << cache->allocCount.load() << ", number of page faults: " << pageFaultNumber.load() << ", evictCount: " << evictCount.load() << endl;
    cache->readCount = 0;
    cache->writeCount = 0;
+   print_intervals();
+   return 0;
    pageFaultNumber = 0;
    thread statThread(statFn);
 

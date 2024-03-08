@@ -54,5 +54,9 @@ downloaded_packages
 
 nvme.img
 benchs/*/*.d
-benchs/DBmockup/DBmockup
+benchs/*/*.o
+benchs/DBmockup/dbmockup_ex
+benchs/DBmockup/dbmockup_mod
 benchs/mm_test/mm_test
+benchs/tinymembench/tinymembench
+benchs/ram_bench/list_traversal

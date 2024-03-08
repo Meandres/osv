@@ -30,8 +30,13 @@
 #define BTREE_HPP
 
 static unsigned btreeslotcounter = 0;
+static uint64_t i1=0, i2=0, i3=0, i4=0, nb_insert=0;  
 extern CacheManager* cache;
 using namespace std;
+
+inline void print_intervals(){
+    printf("Cycles: i1 %f, i2 %f, i3 %f, i4 %f, nb %lu\n", (double)i1/nb_insert, (double)i2/nb_insert, (double)i3/nb_insert, (double)i4/nb_insert, nb_insert);
+}
 
 template<class T>
 struct GuardO {
@@ -514,18 +519,26 @@ struct BTreeNode : public BTreeNodeHeader {
    }
 
    // insert key/value pair
-   void insertInPage(span<u8> key, span<u8> payload)
-   {
-      unsigned needed = spaceNeeded(key.size(), payload.size());
-      if (needed > freeSpace()) {
-         assert(needed <= freeSpaceAfterCompaction());
-         compactify();
-      }
-      unsigned slotId = lowerBound(key);
-      memmove(slot + slotId + 1, slot + slotId, sizeof(Slot) * (count - slotId));
-      storeKeyValue(slotId, key, payload);
-      count++;
-      updateHint(slotId);
+    void insertInPage(span<u8> key, span<u8> payload){
+        uint64_t s1 = rdtsc();
+        unsigned needed = spaceNeeded(key.size(), payload.size());
+        if (needed > freeSpace()) {
+            assert(needed <= freeSpaceAfterCompaction());
+            compactify();
+        }
+        unsigned slotId = lowerBound(key);
+        uint64_t s2 = rdtsc();
+        memmove(slot + slotId + 1, slot + slotId, sizeof(Slot) * (count - slotId));
+        uint64_t s3 = rdtsc();
+        storeKeyValue(slotId, key, payload);
+        count++;
+        updateHint(slotId);
+        uint64_t s4 = rdtsc();
+        i1 += s2 - s1;
+        i2 += s3 - s2;
+        i3 += s4 - s3;
+        i4 += s4 - s1;
+        nb_insert++;
    }
 
    bool removeSlot(unsigned slotId)
@@ -989,8 +1002,6 @@ struct BTree {
 
 	void insert(span<u8> key, span<u8> payload)
 	{
-        //std::cout << "";
-        std::this_thread::sleep_for(1us);
    		assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    		for (u64 repeatCounter=0; ; repeatCounter++) {

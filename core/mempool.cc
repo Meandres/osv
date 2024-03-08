@@ -1858,7 +1858,7 @@ static inline void* std_malloc(size_t size, size_t alignment)
                                        memory::alloc_page());
         trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
-        ret = memory::malloc_large(size, alignment, true, false);
+        ret = memory::malloc_large(size, alignment, true, true);
     }
     memory::tracker_remember(ret, size);
     return ret;
