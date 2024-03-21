@@ -30,13 +30,8 @@
 #define BTREE_HPP
 
 static unsigned btreeslotcounter = 0;
-static uint64_t i1=0, i2=0, i3=0, i4=0, nb_insert=0;  
 extern CacheManager* cache;
 using namespace std;
-
-inline void print_intervals(){
-    printf("Cycles: i1 %f, i2 %f, i3 %f, i4 %f, nb %lu\n", (double)i1/nb_insert, (double)i2/nb_insert, (double)i3/nb_insert, (double)i4/nb_insert, nb_insert);
-}
 
 template<class T>
 struct GuardO {
@@ -69,7 +64,7 @@ struct GuardO {
         version = other.version;
         addTime(start, guardO);
     }
-
+    
    void init() {
       assert(pid != moved);
       PageState& ps = cache->getPageState(pid);
@@ -88,8 +83,8 @@ struct GuardO {
                break;
             case PageState::Evicted:
                if (ps.tryLockX(v)) {
-                  cache->handleFault(pid);
-                  cache->unfixX(pid);
+                    cache->handleFault(pid);
+                    cache->unfixX(pid);
                }
                break;
             default:
@@ -156,23 +151,20 @@ struct GuardO {
 
 template<class T>
 struct GuardX {
-   PID pid;
-   T* ptr;
-   static const u64 moved = ~0ull;
+    PID pid;
+    T* ptr;
+    static const u64 moved = ~0ull;
 
    // constructor
-   GuardX(): pid(moved), ptr(nullptr) {}
+    GuardX(): pid(moved), ptr(nullptr) {}
 
    // constructor
     explicit GuardX(u64 pid) : pid(pid) {
-        auto start = getClock();
         ptr = reinterpret_cast<T*>(cache->fixX(pid));
         ptr->dirty = true;
-        addTime(start, guardX);
     }
 
     explicit GuardX(GuardO<T>&& other) {
-        auto start = getClock();
         assert(other.pid != moved);
         for (u64 repeatCounter=0; ; repeatCounter++) {
             PageState& ps = cache->getPageState(other.pid);
@@ -187,7 +179,6 @@ struct GuardX {
                     ptr->dirty = true;
                     other.pid = moved;
                     other.ptr = nullptr;
-                    addTime(start, guardX);
                     return;
                 }
             }
@@ -199,24 +190,25 @@ struct GuardX {
    GuardX& operator=(const GuardX&) = delete;
 
    // move assignment operator
-   GuardX& operator=(GuardX&& other) {
-      if (pid != moved) {
-         cache->unfixX(pid);
-      }
-      pid = other.pid;
-      ptr = other.ptr;
-      other.pid = moved;
-      other.ptr = nullptr;
-      return *this;
-   }
+    GuardX& operator=(GuardX&& other) {
+        if (pid != moved) {
+            cache->unfixX(pid);
+        }
+        pid = other.pid;
+        ptr = other.ptr;
+        other.pid = moved;
+        other.ptr = nullptr;
+        return *this;
+    }
 
    // copy constructor
    GuardX(const GuardX&) = delete;
 
    // destructor
-   ~GuardX() {
-      if (pid != moved)
-         cache->unfixX(pid);
+    ~GuardX() {
+        if (pid != moved){
+            cache->unfixX(pid);
+        }
    }
 
    T* operator->() {
@@ -520,25 +512,16 @@ struct BTreeNode : public BTreeNodeHeader {
 
    // insert key/value pair
     void insertInPage(span<u8> key, span<u8> payload){
-        uint64_t s1 = rdtsc();
         unsigned needed = spaceNeeded(key.size(), payload.size());
         if (needed > freeSpace()) {
             assert(needed <= freeSpaceAfterCompaction());
             compactify();
         }
         unsigned slotId = lowerBound(key);
-        uint64_t s2 = rdtsc();
         memmove(slot + slotId + 1, slot + slotId, sizeof(Slot) * (count - slotId));
-        uint64_t s3 = rdtsc();
         storeKeyValue(slotId, key, payload);
         count++;
         updateHint(slotId);
-        uint64_t s4 = rdtsc();
-        i1 += s2 - s1;
-        i2 += s3 - s2;
-        i3 += s4 - s3;
-        i4 += s4 - s1;
-        nb_insert++;
    }
 
    bool removeSlot(unsigned slotId)
@@ -835,17 +818,20 @@ struct BTree {
 
    template<class Fn>
    bool lookup(span<u8> key, Fn fn) {
+       auto start = getClock();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
+                addTime(start, lookupKV);
                return false;
 	    }
 
             // key found
             fn(node->getPayload(pos));
+                addTime(start, lookupKV);
             return true;
          } catch(const OLCRestartException&) {}
       }
@@ -853,62 +839,72 @@ struct BTree {
 
    template<class Fn>
    bool updateInPlace(span<u8> key, Fn fn) {
+       auto start = getClock();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
+                addTime(start, updateinplace);
                return false;
 	    }
 
             {
                GuardX<BTreeNode> nodeLocked(move(node));
                fn(nodeLocked->getPayload(pos));
+                addTime(start, updateinplace);
                return true;
             }
          } catch(const OLCRestartException&) {}
       }
    }
 
-   GuardS<BTreeNode> findLeafS(span<u8> key) {
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         try {
-            GuardO<MetaDataPage> meta(metadataPageId);
-            GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
-            meta.release();
+    GuardS<BTreeNode> findLeafS(span<u8> key) {
+        //auto start = getClock();
+        for (u64 repeatCounter=0; ; repeatCounter++) {
+            try {
+                GuardO<MetaDataPage> meta(metadataPageId);
+                GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
+                meta.release();
 
-            while (node->isInner())
-               node = GuardO<BTreeNode>(node->lookupInner(key), node);
+                while (node->isInner()){
+                    node = GuardO<BTreeNode>(node->lookupInner(key), node);
+                }
 
-            return GuardS<BTreeNode>(move(node));
-         } catch(const OLCRestartException&) {}
-      }
-   }
+                //addTime(start, findleafs);
+                return GuardS<BTreeNode>(move(node));
+            } catch(const OLCRestartException&) {}
+        }
+    }
 
-   template<class Fn>
-   void scanAsc(span<u8> key, Fn fn) {
-      GuardS<BTreeNode> node = findLeafS(key);
-      bool found;
-      unsigned pos = node->lowerBound(key, found);
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         if (pos<node->count) {
-            if (!fn(*node.ptr, pos)){
-               return;
-	    }
-            pos++;
-         } else {
-            if (!node->hasRightNeighbour()){
-               return;
-	    }
-            pos = 0;
-            node = GuardS<BTreeNode>(node->nextLeafNode);
-         }
-      }
-   }
+    template<class Fn>
+    void scanAsc(span<u8> key, Fn fn) {
+        auto start = getClock();
+        GuardS<BTreeNode> node = findLeafS(key);
+        bool found;
+        unsigned pos = node->lowerBound(key, found);
+        for (u64 repeatCounter=0; ; repeatCounter++) {
+            if (pos<node->count) {
+                if (!fn(*node.ptr, pos)){
+                    addTime(start, scanasc);
+                    return;
+	            }
+                pos++;
+            } else {
+                if (!node->hasRightNeighbour()){
+                    addTime(start, scanasc);
+                    return;
+	            }
+                pos = 0;
+                node = GuardS<BTreeNode>(node->nextLeafNode);
+            }
+        }
+    }
 
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn) {
+       auto start = getClock();
       GuardS<BTreeNode> node = findLeafS(key);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
@@ -919,11 +915,13 @@ struct BTree {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          while (pos>=0) {
             if (!fn(*node.ptr, pos, exactMatch)){
+                addTime(start, scandesc);
                return;
 	    }
             pos--;
          }
          if (!node->hasLowerFence()){
+                addTime(start, scandesc);
             return;
 	 }
          node = findLeafS(node->getLowerFence());
@@ -1002,6 +1000,7 @@ struct BTree {
 
 	void insert(span<u8> key, span<u8> payload)
 	{
+        auto start = getClock();
    		assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    		for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -1019,6 +1018,7 @@ struct BTree {
             		GuardX<BTreeNode> nodeLocked(move(node));
             		parent.release();
             		nodeLocked->insertInPage(key, payload);
+                    addTime(start, insertKV);
             		return; // success
          		}
 
@@ -1033,6 +1033,7 @@ struct BTree {
 
 	bool remove(span<u8> key)
 	{
+        auto start = getClock();
    		for (u64 repeatCounter=0; ; repeatCounter++) {
       		try {
          		GuardO<BTreeNode> parent(metadataPageId);
@@ -1049,6 +1050,7 @@ struct BTree {
          		bool found;
          		unsigned slotId = node->lowerBound(key, found);
          		if (!found){
+                    addTime(start, removeKV);
             		return false;
 	 			}
 
@@ -1067,6 +1069,7 @@ struct BTree {
             		parent.release();
             		nodeLocked->removeSlot(slotId);
          		}
+                addTime(start, removeKV);
          		return true;
       		} catch(const OLCRestartException&) {}
    		}

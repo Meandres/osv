@@ -2,10 +2,12 @@
     description = "DevShell to build OSv";
 
     inputs = {
-        nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
+        nixpkgs-unstable.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     };
 
-    outputs = { self, nixpkgs }: {
+    outputs = { self, nixpkgs-unstable }: {
+        devShells = {
+
         let {
             pkgs = import nixpkgs { system = "x86_64-linux"; };
             osv-boost = pkgs.boost175.override{ enableStatic=true; enableShared = false;};

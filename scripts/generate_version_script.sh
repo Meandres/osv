@@ -1,4 +1,4 @@
-#!/bin/bash
+#! /usr/bin/env bash
 
 MACHINE=$(uname -m)
 if [ "${MACHINE}" == "x86_64" ]; then

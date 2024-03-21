@@ -10,11 +10,14 @@
 #include <sys/mman.h>
 #include <cstring>
 #include <bitset>
+#include "drivers/rdtsc.h"
 
 typedef u64 PID;
 struct alignas(4096) Page {
 	//bool dirty;
 };
+extern __thread u64 pageStolen_parts;
+extern u64 pageStolen_aggregate;
 
 const bool debugTime = true;
 
@@ -148,6 +151,7 @@ extern u64 YmapRegionStartAddr;
 extern u64 YmapRegionSize;
 
 typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
+//typedef u64 elapsed_time;
 
 struct Ymap {
 	PhysicalPage *freeList; // free physical pages

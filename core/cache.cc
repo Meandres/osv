@@ -80,14 +80,17 @@ u64 ResidentPageSet::hash(u64 k) {
     return h;
 }
 
-void ResidentPageSet::insert(u64 pid) {
+bool ResidentPageSet::insert(u64 pid) {
       u64 pos = hash(pid) & mask;
       while (true) {
          u64 curr = ht[pos].pid.load();
+         if(curr == pid){
+             return false;
+         }
          assert(curr != pid);
          if ((curr == empty) || (curr == tombstone))
             if (ht[pos].pid.compare_exchange_strong(curr, pid))
-               return;
+               return true;
 
          pos = (pos + 1) & mask;
       }
@@ -126,6 +129,7 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
    	assert(n_threads<=maxWorkerThreads);
 	if(n_threads > maxQueues){
 		std::cout << "Beware you are using more threads than nvme queues. This might go horribly wrong !" << std::endl;
+        abort(0);
 	}
    	
    	residentSet.init(physCount);
@@ -136,7 +140,7 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
    	for (u64 i=0; i<virtCount; i++)
     	pageState[i].init();
 
-   	ns = unvme_open();
+   	ns = unvme_openq(n_threads, maxQueueSize);
 	io_descriptors.reserve(n_threads*ns->qsize);
 	for(int i=0; i<n_threads; i++){
         for(int j=0; j<(int)ns->qsize; j++){
@@ -196,13 +200,15 @@ void CacheManager::evict(){
 }
 
 void CacheManager::ensureFreePages() {
-   if (physUsedCount >= physCount*0.95)
+    if (physUsedCount >= physCount*0.95)
       evict();
 }
 
 // allocated new page and fix it
 Page* CacheManager::allocPage() {
-    auto start = osv::clock::uptime::now();
+    auto start = getClock();
+    if(explicit_control){ 
+    }
     u64 pid = allocCount++;
     if (pid >= virtCount) {
         cerr << "VIRTGB is too low" << endl;
@@ -229,7 +235,7 @@ Page* CacheManager::allocPage() {
 }
 
 Page* CacheManager::fixX(PID pid) {
-    auto start = osv::clock::uptime::now();
+    auto start = getClock();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
@@ -294,7 +300,7 @@ Page* CacheManager::fixS(PID pid) {
 }*/
 
 Page* CacheManager::fixS(PID pid) {
-    auto start = osv::clock::uptime::now();
+    auto start = getClock();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
@@ -303,9 +309,14 @@ Page* CacheManager::fixS(PID pid) {
                 break;
             } case PageState::Evicted: {
                 if (ps.tryLockX(stateAndVersion)){
-                    if(explicit_control)
+                    if(explicit_control){
                         handleFault(pid);
+                    }
                     ps.unlockX();
+                }
+                if(ps.tryLockS(stateAndVersion)){
+                   addTime(start, fixs);
+                   return virtMem + pid;
                 }
                 break;
             } default: {
@@ -328,7 +339,7 @@ void CacheManager::unfixX(PID pid) {
 }
 
 void CacheManager::readPage(PID pid) {
-    auto start = osv::clock::uptime::now();
+    auto start = getClock();
     int ret = unvme_read(ns, getTID()%maxQueues, virtMem+pid, pid*(pageSize/blockSize), pageSize/blockSize);
     assert(ret==0);
     readCount++;
@@ -353,6 +364,14 @@ int default_handleFault(CacheManager* cm, PID pid, int unused) {
     if(PageState::getState(stateAndVersion) == PageState::Evicted){
         ps.tryValidate(stateAndVersion);
     }
+
+    if(!cm->explicit_control){
+        bool insertion_successful = cm->residentSet.insert(pid);
+        if(!insertion_successful){ // if another thread already resolved the fault
+            while(!walk(cm->virtMem+pid).present){} // loop until the page is in mem
+            return 0;
+        }
+    }
     cm->physUsedCount++;
     cm->ensureFreePages();
     if(cm->getTID() == -1){
@@ -363,7 +382,8 @@ int default_handleFault(CacheManager* cm, PID pid, int unused) {
         parts_count[mapphys]++;
     }
     cm->readPage(pid);
-    cm->residentSet.insert(pid);
+    if(cm->explicit_control)
+        cm->residentSet.insert(pid);
     return 0;
 }
 

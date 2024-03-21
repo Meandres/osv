@@ -1233,6 +1233,8 @@ def setup_libstdcxx():
     # But because OSv is statically linked, we miss that auto-loading, so we
     #  need to look for, and run, this script explicitly.
     gcc_python_dirs = glob('/usr/share/gcc-*/python')
+    if len(gcc_python_dirs) == 0:
+        gcc_python_dirs = glob('/nix/store/9r8z1qr5jhv90fl2457qqml7qgk88fd6-gcc-13.2.0-lib/')
     if len(gcc_python_dirs) == 0: #If the above does not work try different place
         gcc_python_dirs = glob('/usr/share/gcc/python')
     if len(gcc_python_dirs) == 0:

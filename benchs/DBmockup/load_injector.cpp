@@ -147,6 +147,15 @@ struct vmcacheAdapter
    }
 };
 
+int stick_this_thread_to_core(int core_id) {
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();    
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
+
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    std::vector<std::thread> threads;
@@ -156,6 +165,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    uint64_t perThread = n/nthreads;
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
+            stick_this_thread_to_core(i);
          uint64_t b = (perThread*i) + begin;
          uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
          fn(i, b, e);
@@ -208,6 +218,7 @@ int main(int argc, char** argv) {
                bt.insert({k1, sizeof(KeyType)}, payload);
             }
 	        cache->forgetThread();
+            add_thread_results();
          });
       }
       cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -242,11 +253,14 @@ int main(int argc, char** argv) {
             }
             txProgress += cnt;
 	        cache->forgetThread();
+            add_thread_results();
         });
 
         statThread.join();
+        print_aggregate_avg();
         return 0;
     }
+
 
    // TPC-C
    Integer warehouseCount = n;
@@ -281,11 +295,9 @@ int main(int argc, char** argv) {
             for (Integer w_id=begin; w_id<end; w_id++) {
                 tpcc.loadStock(w_id);
                 tpcc.loadDistrinct(w_id);
-                cout << "loading "<< w_id <<endl;
                 for (Integer d_id = 1; d_id <= 10; d_id++) {
                     tpcc.loadCustomer(w_id, d_id);
                     tpcc.loadOrders(w_id, d_id);
-		            cout << "\t"<< d_id <<endl;
                 }
             }
 	        cache->forgetThread();
@@ -296,38 +308,32 @@ int main(int argc, char** argv) {
    cerr << "allocCount: " << cache->allocCount.load() << ", number of page faults: " << pageFaultNumber.load() << ", evictCount: " << evictCount.load() << endl;
    cache->readCount = 0;
    cache->writeCount = 0;
-   print_intervals();
-   return 0;
    pageFaultNumber = 0;
    thread statThread(statFn);
 
-   parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         workerThreadId = worker;
-      cache->registerThread();
-      u64 cnt = 0;
-      u64 start = rdtsc();
-      while (keepRunning.load()) {
-         int w_id = tpcc.urand(1, warehouseCount); // wh crossing
-         tpcc.tx(w_id);
-         cnt++;
-         u64 stop = rdtsc();
-         if ((stop-start) > statDiff) {
-            txProgress += cnt;
-            start = stop;
-            cnt = 0;
-         }
-      }
-      txProgress += cnt;
-      cache->forgetThread();
-      add_thread_results();
-   });
+    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+        workerThreadId = worker;
+        cache->registerThread();
+        u64 cnt = 0;
+        u64 start = rdtsc();
+        while (keepRunning.load()) {
+            int w_id = tpcc.urand(1, warehouseCount); // wh crossing
+            tpcc.tx(w_id);
+            cnt++;
+            u64 stop = rdtsc();
+            if ((stop-start) > statDiff) {
+                txProgress += cnt;
+                start = stop;
+                cnt = 0;
+            }
+        }
+        txProgress += cnt;
+        cache->forgetThread();
+        add_thread_results();
+    });
 
    statThread.join();
    cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-    cout << "Average cycles for memcpy_small " << ((double)cycles_memcpy_small)/nb_memcpy_small << ", count: " << nb_memcpy_small << endl;
-    cout << "Average cycles for memcpy_ssse3 " << ((double)cycles_memcpy_ssse3)/nb_memcpy_ssse3 << ", count: " << nb_memcpy_ssse3 << endl;
-    cout << "Average cycles for memcpy_ssse3_unal " << ((double)cycles_memcpy_ssse3_unal)/nb_memcpy_ssse3_unal << ", count: " << nb_memcpy_ssse3_unal << endl;
-    cout << "Average cycles for memcpy_repmovsb " << ((double)cycles_memcpy_repmovsb)/nb_memcpy_repmovsb << ", count: " << nb_memcpy_repmovsb << endl;
    print_aggregate_avg();
 
    return 0;

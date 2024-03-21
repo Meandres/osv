@@ -635,6 +635,8 @@ nvlist_xdup(nvlist_t *nvl, nvlist_t **nvlp, nv_alloc_t *nva)
 /*
  * Remove all with matching name
  */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overread"
 OSV_LIB_SOLARIS_API int
 nvlist_remove_all(nvlist_t *nvl, const char *name)
 {
@@ -693,7 +695,7 @@ nvlist_remove(nvlist_t *nvl, const char *name, data_type_t type)
 
 	return (ENOENT);
 }
-
+#pragma GCC diagnostic pop
 int
 nvlist_remove_nvpair(nvlist_t *nvl, nvpair_t *nvp)
 {
@@ -1319,6 +1321,8 @@ nvpair_value_common(nvpair_t *nvp, data_type_t type, uint_t *nelem, void *data)
 	return (0);
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overread"
 static int
 nvlist_lookup_common(nvlist_t *nvl, const char *name, data_type_t type,
     uint_t *nelem, void *data)
@@ -1343,6 +1347,7 @@ nvlist_lookup_common(nvlist_t *nvl, const char *name, data_type_t type,
 
 	return (ENOENT);
 }
+#pragma GCC diagnostic pop
 
 int
 nvlist_lookup_boolean(nvlist_t *nvl, const char *name)
@@ -1786,6 +1791,8 @@ int nvlist_lookup_nvpair_embedded_index(nvlist_t *nvl,
 	return (nvlist_lookup_nvpair_ei_sep(nvl, name, '.', ret, ip, ep));
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overread"
 OSV_LIB_SOLARIS_API boolean_t
 nvlist_exists(nvlist_t *nvl, const char *name)
 {
@@ -1806,6 +1813,7 @@ nvlist_exists(nvlist_t *nvl, const char *name)
 
 	return (B_FALSE);
 }
+#pragma GCC diagnostic pop
 
 int
 nvpair_value_boolean_value(nvpair_t *nvp, boolean_t *val)

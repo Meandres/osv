@@ -45,8 +45,8 @@ const u64 mb = 1024ull * 1024;
 const u64 gb = 1024ull * 1024 * 1024;
 
 static const int16_t maxWorkerThreads = 64;
-static const int16_t maxQueues = 32;
-static const int16_t maxQueueSize = 8192;
+static const int16_t maxQueues = 63;
+static const int16_t maxQueueSize = 512;
 static const int16_t blockSize=512;
 static const u64 maxIOs = 256;
 
@@ -68,12 +68,18 @@ enum parts{
     fixs,
     guardO,
     guardX,
-    guardS
+    guardS,
+    scanasc,
+    scandesc,
+    updateinplace,
+    lookupKV,
+    insertKV,
+    removeKV
 };
 
 
-static const char* partsStrings[] = { "allocPage", "readPage", "handleFault", "evict", "mapPhys", "unmapPhys", "fixX", "fixS", "guardO", "guardX", "guardS" };
-const unsigned parts_num = 11;
+static const char* partsStrings[] = { "allocPage", "readPage", "handleFault", "evict", "mapPhys", "unmapPhys", "fixX", "fixS", "guardO", "guardX", "guardS", "scanAsc", "scanDesc", "updateInPlace", "lookup", "insert", "remove" };
+const unsigned parts_num = 17;
 
 extern std::mutex thread_mutex;
 extern __thread elapsed_time parts_time[parts_num];
@@ -83,16 +89,21 @@ extern uint64_t thread_aggregate_count[parts_num];
 
 inline void add_thread_results(){
     const std::lock_guard<std::mutex> lock(thread_mutex);
+    pageStolen_aggregate += pageStolen_parts;
     for(unsigned i=0; i<parts_num; i++){
         thread_aggregate_time[i] += parts_time[i];
+        parts_time[i] = std::chrono::duration<int64_t, std::ratio<1, 1000000000>>();
         thread_aggregate_count[i] += parts_count[i];
+        parts_count[i] = 0;
     }
 }
 
 inline void print_aggregate_avg(){
+    std::cout << "Page stolen " << pageStolen_aggregate << std::endl;
     std::cout << "Results of the profiling :"<<std::endl;
 	for(unsigned i=0; i<parts_num; i++){
 		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+		//std::cout <<"\t" << partsStrings[i] << " : " << double(thread_aggregate_time[i])/thread_aggregate_count[i] << " cycles on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
 	}
 }
 
@@ -103,13 +114,23 @@ inline osv::clock::uptime::time_point getClock(){
         return std::chrono::time_point<osv::clock::uptime>();
 }
 
-inline void addTime(osv::clock::uptime::time_point start, enum parts part){
+/*inline u64 getClock(){
+    if(debugTime)
+        return rdtsc();
+    else
+        return 0ull;
+}*/
+
+//inline void addTime(u64 start, enum parts part){
+inline void addTime(std::chrono::time_point<osv::clock::uptime> start, enum parts part){
     if(debugTime){
+        //auto elapsed = rdtsc() - start;
         auto elapsed = osv::clock::uptime::now() - start;
         parts_time[part] += elapsed;
         parts_count[part]++;
     }
 }
+
 
 struct PageState {
    std::atomic<u64> stateAndVersion;
@@ -126,9 +147,9 @@ struct PageState {
    static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
    static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
 
-   bool tryLockX(u64 oldStateAndVersion) {
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
-   }
+    bool tryLockX(u64 oldStateAndVersion) {
+        return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
+    }
 
    void unlockX() {
       assert(getState() == Locked);
@@ -200,7 +221,7 @@ struct ResidentPageSet {
    u64 next_pow2(u64 x);
    u64 hash(u64 k);
    
-   void insert(u64 pid);
+   bool insert(u64 pid);
    bool remove(u64 pid);
    template<class Fn> void iterateClockBatch(u64 batch, Fn fn);
 };

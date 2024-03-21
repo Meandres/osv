@@ -10,7 +10,6 @@
 
 namespace mmu {
 extern uint8_t phys_bits, virt_bits;
-extern uint8_t old_phys_bits;
 constexpr uint8_t rsvd_bits_used = 1;
 constexpr uint8_t max_phys_bits = 52 - rsvd_bits_used;
 

@@ -218,7 +218,7 @@ void BufferManager::init(){
     for(u64 i=0; i<virtCount; i++){
 	    // page fault to create page table levels
 	    // do we need this ?
-        //memset(virtMem+i, 0, pageSize);
+        memset(virtMem+i, 0, pageSize);
 
 	
 	    madvise(virtMem+i, pageSize, MADV_DONTNEED);
