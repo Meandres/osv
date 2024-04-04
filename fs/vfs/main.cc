@@ -249,6 +249,26 @@ int __open64_2(const char *file, int flags)
     return open64(file, flags);
 }
 
+// Same missing-mode protection for openat(). Note that this is NOT the
+// same as openat2()!
+extern "C" OSV_LIBC_API
+int __openat_2(int dirfd, const char *pathname, int flags)
+{
+    if (flags & O_CREAT) {
+        abort("__openat_2 called for open mode 0%o with O_CREAT", flags);
+    }
+    return openat(dirfd, pathname, flags, 0);
+}
+
+extern "C" OSV_LIBC_API
+int __openat64_2(int dirfd, const char *pathname, int flags)
+{
+    if (flags & O_CREAT) {
+        abort("__openat64_2 called for open mode 0%o with O_CREAT", flags);
+    }
+    return openat64(dirfd, pathname, flags, 0);
+}
+
 OSV_LIBC_API
 int creat(const char *pathname, mode_t mode)
 {
@@ -1076,7 +1096,7 @@ int renameat(int olddirfd, const char *oldpath,
     } else {
         char absolute_newpath[PATH_MAX];
         auto error = vfs_fun_at(newdirfd, newpath, [&absolute_newpath](const char *absolute_path) {
-            strcpy(absolute_newpath, absolute_path);
+            strlcpy(absolute_newpath, absolute_path, PATH_MAX);
             return 0;
         });
 
@@ -1088,6 +1108,17 @@ int renameat(int olddirfd, const char *oldpath,
             });
         }
     }
+}
+
+extern "C" OSV_LIBC_API
+int renameat2(int olddirfd, const char *oldpath,
+              int newdirfd, const char *newpath, unsigned int flags)
+{
+    if (flags) {
+        errno = EINVAL;
+        return -1;
+    }
+    return renameat(olddirfd, oldpath, newdirfd, newpath);
 }
 
 TRACEPOINT(trace_vfs_chdir, "\"%s\"", const char*);
@@ -1214,6 +1245,40 @@ int link(const char *oldpath, const char *newpath)
     return -1;
 }
 
+OSV_LIBC_API
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags)
+{
+    if (flags & AT_SYMLINK_FOLLOW) {
+        WARN_ONCE("linkat() does not support AT_SYMLINK_FOLLOW\n");
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!oldpath || !newpath) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (newpath[0] == '/' || newdirfd == AT_FDCWD) {
+        return vfs_fun_at2(olddirfd, oldpath, [newpath](const char *path) {
+            return link(path, newpath);
+        });
+    } else {
+        char absolute_newpath[PATH_MAX];
+        auto error = vfs_fun_at(newdirfd, newpath, [&absolute_newpath](const char *absolute_path) {
+            strlcpy(absolute_newpath, absolute_path, PATH_MAX);
+            return 0;
+        });
+
+        if (error) {
+            return error;
+        } else {
+            return vfs_fun_at2(olddirfd, oldpath, [absolute_newpath](const char *path) {
+                return link(path, absolute_newpath);
+            });
+        }
+    }
+}
 
 TRACEPOINT(trace_vfs_symlink, "oldpath=%s, newpath=%s", const char*, const char*);
 TRACEPOINT(trace_vfs_symlink_ret, "");
@@ -2314,6 +2379,27 @@ ssize_t sendfile(int out_fd, int in_fd, off_t *_offset, size_t count)
 #undef sendfile64
 LFS64(sendfile);
 
+extern "C" OSV_LIBC_API
+ssize_t copy_file_range(int fd_in, off_t *off_in,
+                        int fd_out, off_t *off_out,
+                        size_t len, unsigned int flags)
+{
+    //Non-zero flags are rejected according to the manual
+    if (flags != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    //We do not support writing to a file at specified offset because
+    //we delegate to sendfile() which assumes current position of the output
+    //file
+    if (off_out) {
+        WARN("copy_file_range() does not support non-zero off_out\n");
+        errno = EINVAL;
+        return -1;
+    }
+    return sendfile(fd_out, fd_in, off_in, len);
+}
+
 NO_SYS(OSV_LIBC_API int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags));
 
 OSV_LIBC_API
@@ -2730,6 +2816,10 @@ void vfs_exit(void)
 {
     /* Free up main_task (stores cwd data) resources */
     replace_cwd(main_task, nullptr, []() { return 0; });
+    /* Unmount file systems mounted with '--mount-fs=...' boot option */
+    for (auto m: opt_mount_fs) {
+        sys_umount(m.mnt_dir);
+    }
     /* Unmount all file systems */
     unmount_rootfs();
     /* Finish with the bio layer */
