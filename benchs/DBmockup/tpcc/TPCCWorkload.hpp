@@ -561,7 +561,7 @@ struct TPCCWorkload
       }
    }
    // -------------------------------------------------------------------------------------
-   void paymentById(Integer w_id, Integer d_id, Integer c_w_id, Integer c_d_id, Integer c_id, Timestamp h_date, Numeric h_amount, Timestamp datetime)
+   void paymentById(Integer w_id, Integer d_id, Integer c_w_id, Integer c_d_id, Integer c_id, Timestamp h_date, Numeric h_amount, Timestamp datetime, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
    {
       Varchar<10> w_name;
       Varchar<20> w_street_1;
@@ -645,7 +645,7 @@ struct TPCCWorkload
 
       Varchar<24> h_new_data = Varchar<24>(w_name) || Varchar<24>("    ") || d_name;
       Integer t_id = (Integer)workerThreadId;
-      Integer h_id = (Integer)tpcchistorycounter++;
+      Integer h_id = (Integer)(*tpcchistorycounter)++;
       history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data});
    }
    // -------------------------------------------------------------------------------------
@@ -656,7 +656,10 @@ struct TPCCWorkload
                       Varchar<16> c_last,
                       Timestamp h_date,
                       Numeric h_amount,
-                      Timestamp datetime)
+                      Timestamp datetime,
+                      uint16_t workerThreadId,
+                      uint32_t *tpcchistorycounter)
+
    {
       Varchar<10> w_name;
       Varchar<20> w_street_1;
@@ -761,11 +764,11 @@ struct TPCCWorkload
 
       Varchar<24> h_new_data = Varchar<24>(w_name) || Varchar<24>("    ") || d_name;
       Integer t_id = (Integer)workerThreadId;
-      Integer h_id = (Integer)tpcchistorycounter++;
+      Integer h_id = (Integer)(*tpcchistorycounter)++;
       history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data});
    }
    // -------------------------------------------------------------------------------------
-   void paymentRnd(Integer w_id)
+   void paymentRnd(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
    {
       Integer d_id = urand(1, 10);
       Integer c_w_id = w_id;
@@ -778,9 +781,9 @@ struct TPCCWorkload
       Timestamp h_date = currentTimestamp();
 
       if (urand(1, 100) <= 60) {
-         paymentByName(w_id, d_id, c_w_id, c_d_id, genName(getNonUniformRandomLastNameForRun()), h_date, h_amount, currentTimestamp());
+         paymentByName(w_id, d_id, c_w_id, c_d_id, genName(getNonUniformRandomLastNameForRun()), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter);
       } else {
-         paymentById(w_id, d_id, c_w_id, c_d_id, getCustomerID(), h_date, h_amount, currentTimestamp());
+         paymentById(w_id, d_id, c_w_id, c_d_id, getCustomerID(), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter);
       }
    }
    // -------------------------------------------------------------------------------------
@@ -849,7 +852,7 @@ struct TPCCWorkload
       }
    }
    // -------------------------------------------------------------------------------------
-   void loadCustomer(Integer w_id, Integer d_id)
+   void loadCustomer(Integer w_id, Integer d_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
    {
       Timestamp now = currentTimestamp();
       for (Integer i = 0; i < 3000; i++) {
@@ -865,7 +868,7 @@ struct TPCCWorkload
                                                randomNumeric(0.0000, 0.5000), -10.00, 1, 0, 0, randomastring<500>(300, 500)});
          customerwdl.insert({w_id, d_id, c_last, c_first}, {i + 1});
          Integer t_id = (Integer)workerThreadId;
-         Integer h_id = (Integer)tpcchistorycounter++;
+         Integer h_id = (Integer)(*tpcchistorycounter)++;
          history.insert({t_id, h_id}, {i + 1, d_id, w_id, d_id, w_id, now, 10.00, randomastring<24>(12, 24)});
       }
    }
@@ -922,12 +925,12 @@ struct TPCCWorkload
       }
    }
    // -------------------------------------------------------------------------------------
-   int tx(Integer w_id)
+   int tx(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
    {
       // micro-optimized version of weighted distribution
       u64 rnd = RandomGenerator::getRand(0, 10000);
       if (rnd < 4300) {
-         paymentRnd(w_id);
+         paymentRnd(w_id, workerThreadId, tpcchistorycounter);
          return 0;
       }
       rnd -= 4300;

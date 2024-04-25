@@ -158,11 +158,11 @@ void ensure_log_initialized()
         }
 
         // Ensure we're using power of two sizes * trace_page_size, so round num cpus to ^2
-        const size_t ncpu = 1 << size_t(ilog2_roundup(sched::cpus.size()));
+        //const size_t ncpu = 1 << size_t(ilog2_roundup(sched::cpus.size()));
         // TODO: examine these defaults. I'm guessing less than 256*mt sized buffers
         // will be subpar, so even if it bloats us on >4 vcpu lets do this for now.
-        const size_t size = trace_page_size * std::max(size_t(256), 1024 / ncpu);
-        //const size_t size = trace_page_size * 32768;
+        //const size_t size = trace_page_size * std::max(size_t(256), 1024 / ncpu);
+        const size_t size = trace_page_size * 32768;
         for (auto c : sched::cpus) {
             auto * tbp = percpu_trace_buffer.for_cpu(c);
             *tbp = trace_buf(size);

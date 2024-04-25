@@ -23,13 +23,14 @@
 #include <immintrin.h>
 
 #include <cstring>
-#include "tpcc/TPCCWorkload.hpp"
 #include <osv/cache.hh>
 
 #ifndef BTREE_HPP
 #define BTREE_HPP
 
 static unsigned btreeslotcounter = 0;
+static __thread u64 retry_parts = 0;
+static std::atomic<u64> retry_aggregate = 0;
 extern CacheManager* cache;
 using namespace std;
 
@@ -42,27 +43,27 @@ struct GuardO {
 
     // constructor
     explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(cache->toPtr(pid))) {
-        //auto start = getClock();
+        auto start = getClock();
         init();
-        //addTime(start, guardO);
+        addTime(start, guardO);
     }
 
     template<class T2>
     GuardO(u64 pid, GuardO<T2>& parent)  {
-        //auto start = getClock();
+        auto start = getClock();
         parent.checkVersionAndRestart();
         this->pid = pid;
         ptr = reinterpret_cast<T*>(cache->toPtr(pid));
         init();
-        //addTime(start, guardO);
+        addTime(start, guardO);
     }
 
     GuardO(GuardO&& other) {
-        //auto start = getClock();
+        auto start = getClock();
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
-        //addTime(start, guardO);
+        addTime(start, guardO);
     }
     
    void init() {
@@ -82,7 +83,7 @@ struct GuardO {
             case PageState::Locked:
                break;
             case PageState::Evicted:
-               if (ps.tryLockX(v)) {
+               if (ps.tryLockX(v, guardOinit)) {
                     cache->handleFault(pid);
                     cache->unfixX(pid);
                }
@@ -161,10 +162,10 @@ struct GuardX {
    // constructor
     explicit GuardX(u64 pid) : pid(pid) {
         ptr = reinterpret_cast<T*>(cache->fixX(pid));
-        ptr->dirty = true;
+        //ptr->dirty = true;
     }
 
-    explicit GuardX(GuardO<T>&& other) {
+    explicit GuardX(GuardO<T>&& other, enum reasons_lock newReason) {
         assert(other.pid != moved);
         for (u64 repeatCounter=0; ; repeatCounter++) {
             PageState& ps = cache->getPageState(other.pid);
@@ -173,10 +174,10 @@ struct GuardX {
                 throw OLCRestartException();
             u64 state = PageState::getState(stateAndVersion);
             if ((state == PageState::Unlocked) || (state == PageState::Marked)) {
-                if (ps.tryLockX(stateAndVersion)) {
+                if (ps.tryLockX(stateAndVersion, newReason)) {
                     pid = other.pid;
                     ptr = other.ptr;
-                    ptr->dirty = true;
+                    //ptr->dirty = true;
                     other.pid = moved;
                     other.ptr = nullptr;
                     return;
@@ -242,13 +243,13 @@ struct GuardS {
 
    // constructor
     explicit GuardS(u64 pid) : pid(pid) {
-        //auto start = getClock();
+        auto start = getClock();
         ptr = reinterpret_cast<T*>(cache->fixS(pid));
-        //addTime(start, guardS);
+        addTime(start, guardS);
     }
 
     GuardS(GuardO<T>&& other) {
-        //auto start = getClock();
+        auto start = getClock();
         assert(other.pid != moved);
         if (cache->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
             pid = other.pid;
@@ -258,18 +259,18 @@ struct GuardS {
         } else {
             throw OLCRestartException();
         }
-        //addTime(start, guardS);
+        addTime(start, guardS);
     }
 
     GuardS(GuardS&& other) {
-        //auto start = getClock();
+        auto start = getClock();
         if (pid != moved)
             cache->unfixS(pid);
         pid = other.pid;
         ptr = other.ptr;
         other.pid = moved;
         other.ptr = nullptr;
-        //addTime(start, guardS);
+        addTime(start, guardS);
     }
 
    // assignment operator
@@ -818,20 +819,20 @@ struct BTree {
 
    template<class Fn>
    bool lookup(span<u8> key, Fn fn) {
-       //auto start = getClock();
+       auto start = getClock();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
-                //addTime(start, lookupKV);
+                addTime(start, lookupKV);
                return false;
 	    }
 
             // key found
             fn(node->getPayload(pos));
-                //addTime(start, lookupKV);
+                addTime(start, lookupKV);
             return true;
          } catch(const OLCRestartException&) {}
       }
@@ -839,21 +840,21 @@ struct BTree {
 
    template<class Fn>
    bool updateInPlace(span<u8> key, Fn fn) {
-       //auto start = getClock();
+       auto start = getClock();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
-                //addTime(start, updateinplace);
+                addTime(start, updateinplace);
                return false;
 	    }
 
             {
-               GuardX<BTreeNode> nodeLocked(move(node));
+               GuardX<BTreeNode> nodeLocked(move(node), updateinplaceNode);
                fn(nodeLocked->getPayload(pos));
-                //addTime(start, updateinplace);
+                addTime(start, updateinplace);
                return true;
             }
          } catch(const OLCRestartException&) {}
@@ -873,6 +874,7 @@ struct BTree {
                 }
 
                 //addTime(start, findleafs);
+                //retry_parts+=repeatCounter;
                 return GuardS<BTreeNode>(move(node));
             } catch(const OLCRestartException&) {}
         }
@@ -880,20 +882,23 @@ struct BTree {
 
     template<class Fn>
     void scanAsc(span<u8> key, Fn fn) {
-        //auto start = getClock();
+        auto start = getClock();
         GuardS<BTreeNode> node = findLeafS(key);
+        addTime(start, findleafsinscanasc);
         bool found;
         unsigned pos = node->lowerBound(key, found);
         for (u64 repeatCounter=0; ; repeatCounter++) {
             if (pos<node->count) {
                 if (!fn(*node.ptr, pos)){
-                    //addTime(start, scanasc);
+                    //retry_parts+=repeatCounter;
+                    addTime(start, scanasc);
                     return;
 	            }
                 pos++;
             } else {
                 if (!node->hasRightNeighbour()){
-                    //addTime(start, scanasc);
+                    //retry_parts+=repeatCounter;
+                    addTime(start, scanasc);
                     return;
 	            }
                 pos = 0;
@@ -904,8 +909,9 @@ struct BTree {
 
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn) {
-        //auto start = getClock();
+       auto start = getClock();
       GuardS<BTreeNode> node = findLeafS(key);
+        addTime(start, findleafsinscandesc);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
       if (pos == node->count) {
@@ -915,16 +921,18 @@ struct BTree {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          while (pos>=0) {
             if (!fn(*node.ptr, pos, exactMatch)){
-                //addTime(start, scandesc);
+                addTime(start, scandesc);
                return;
 	    }
             pos--;
          }
          if (!node->hasLowerFence()){
-                //addTime(start, scandesc);
+                addTime(start, scandesc);
             return;
 	 }
+        auto secondstart = getClock();
          node = findLeafS(node->getLowerFence());
+        addTime(secondstart, findleafsinscandesc);
          pos = node->count-1;
       }
    	}
@@ -989,8 +997,8 @@ struct BTree {
          		if (node.ptr == toSplit) {
             		if (node->hasSpaceFor(key.size(), payloadLen))
                			return; // someone else did split concurrently
-            		GuardX<BTreeNode> parentLocked(move(parent));
-            		GuardX<BTreeNode> nodeLocked(move(node));
+            		GuardX<BTreeNode> parentLocked(move(parent), ensurespaceNode);
+            		GuardX<BTreeNode> nodeLocked(move(node), ensurespaceNode);
             		trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
          		}
          		return;
@@ -1000,7 +1008,7 @@ struct BTree {
 
 	void insert(span<u8> key, span<u8> payload)
 	{
-        //auto start = getClock();
+        auto start = getClock();
    		assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    		for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -1015,16 +1023,16 @@ struct BTree {
 
          		if (node->hasSpaceFor(key.size(), payload.size())) {
             		// only lock leaf
-            		GuardX<BTreeNode> nodeLocked(move(node));
+            		GuardX<BTreeNode> nodeLocked(move(node), insertNode);
             		parent.release();
             		nodeLocked->insertInPage(key, payload);
-                    //addTime(start, insertKV);
+                    addTime(start, insertKV);
             		return; // success
          		}
 
          		// lock parent and leaf
-         		GuardX<BTreeNode> parentLocked(move(parent));
-         		GuardX<BTreeNode> nodeLocked(move(node));
+         		GuardX<BTreeNode> parentLocked(move(parent), insertNodesplit);
+         		GuardX<BTreeNode> nodeLocked(move(node), insertNodesplit);
          		trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          		// insert hasn't happened, restart from root
       		} catch(const OLCRestartException&) {}
@@ -1033,7 +1041,7 @@ struct BTree {
 
 	bool remove(span<u8> key)
 	{
-        //auto start = getClock();
+        auto start = getClock();
    		for (u64 repeatCounter=0; ; repeatCounter++) {
       		try {
          		GuardO<BTreeNode> parent(metadataPageId);
@@ -1050,26 +1058,26 @@ struct BTree {
          		bool found;
          		unsigned slotId = node->lowerBound(key, found);
          		if (!found){
-                    //addTime(start, removeKV);
+                    addTime(start, removeKV);
             		return false;
 	 			}
 
          		unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
          		if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
             		// underfull
-            		GuardX<BTreeNode> parentLocked(move(parent));
-            		GuardX<BTreeNode> nodeLocked(move(node));
+            		GuardX<BTreeNode> parentLocked(move(parent), removeNode);
+            		GuardX<BTreeNode> nodeLocked(move(node), removeNode);
             		GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             		nodeLocked->removeSlot(slotId);
             		if (rightLocked->freeSpaceAfterCompaction() >= BTreeNodeHeader::underFullSize) {
                			if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {}
             		}
          		} else {
-            		GuardX<BTreeNode> nodeLocked(move(node));
+            		GuardX<BTreeNode> nodeLocked(move(node), removeNode);
             		parent.release();
             		nodeLocked->removeSlot(slotId);
          		}
-                //addTime(start, removeKV);
+                addTime(start, removeKV);
          		return true;
       		} catch(const OLCRestartException&) {}
    		}

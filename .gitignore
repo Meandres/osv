@@ -58,5 +58,9 @@ benchs/*/*.o
 benchs/DBmockup/dbmockup_ex
 benchs/DBmockup/dbmockup_mod
 benchs/mm_test/mm_test
-benchs/tinymembench/tinymembench
-benchs/ram_bench/list_traversal
+benchs/cache_example/cache_example
+benchs/pf_test/pf_test
+benchs/tls_bench/tls_bench_pic
+benchs/tls_bench/tls_bench_pie
+benchs/idle_test/idle_test
+

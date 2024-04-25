@@ -25,8 +25,8 @@
 #include <immintrin.h>
 
 #include <cstring>
-#include "drivers/nvme.hh"
-#include "drivers/ymap.hh"
+#include <drivers/nvme.hh>
+#include <drivers/ymap.hh>
 #include <osv/mmu.hh>
 
 #include <chrono>
@@ -34,103 +34,22 @@
 
 #ifndef VMCACHE
 typedef u64 PID; // page id type
-/*struct alignas(4096) Page{
-	bool dirty;
-}*/
-
-extern std::atomic<u64> pageFaultNumber;
 extern std::atomic<u64> evictCount;
 
 const u64 mb = 1024ull * 1024;
 const u64 gb = 1024ull * 1024 * 1024;
 
-static const int16_t maxWorkerThreads = 64;
-static const int16_t maxQueues = 63;
-static const int16_t maxQueueSize = 512;
-static const int16_t blockSize=512;
-static const u64 maxIOs = 256;
+static const int16_t maxWorkerThreads = 128;
+static const int16_t maxQueues = 128;
+static const int16_t maxQueueSize = 256;
+static const int16_t blockSize = 512;
+static const u64 maxIOs = 4096;
 
 // allocate memory using huge pages
 void* allocHuge(size_t size);
 
 // use when lock is not free
 void yield(u64 counter);
-
-//typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
-enum parts{
-    allocpage,
-    readpage,
-    handlefault,
-    evictpage,
-    mapphys,
-    unmapphys,
-    fixx,
-    fixs,
-    guardO,
-    guardX,
-    guardS,
-    scanasc,
-    scandesc,
-    updateinplace,
-    lookupKV,
-    insertKV,
-    removeKV
-};
-
-
-static const char* partsStrings[] = { "allocPage", "readPage", "handleFault", "evict", "mapPhys", "unmapPhys", "fixX", "fixS", "guardO", "guardX", "guardS", "scanAsc", "scanDesc", "updateInPlace", "lookup", "insert", "remove" };
-const unsigned parts_num = 17;
-
-extern std::mutex thread_mutex;
-extern __thread elapsed_time parts_time[parts_num];
-extern __thread uint64_t parts_count[parts_num];
-extern elapsed_time thread_aggregate_time[parts_num];
-extern uint64_t thread_aggregate_count[parts_num];
-
-inline void add_thread_results(){
-    const std::lock_guard<std::mutex> lock(thread_mutex);
-    pageStolen_aggregate += pageStolen_parts;
-    for(unsigned i=0; i<parts_num; i++){
-        thread_aggregate_time[i] += parts_time[i];
-        parts_time[i] = std::chrono::duration<int64_t, std::ratio<1, 1000000000>>();
-        thread_aggregate_count[i] += parts_count[i];
-        parts_count[i] = 0;
-    }
-}
-
-inline void print_aggregate_avg(){
-    std::cout << "Page stolen " << pageStolen_aggregate << std::endl;
-    std::cout << "Results of the profiling :"<<std::endl;
-	for(unsigned i=0; i<parts_num; i++){
-		std::cout <<"\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
-		//std::cout <<"\t" << partsStrings[i] << " : " << double(thread_aggregate_time[i])/thread_aggregate_count[i] << " cycles on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
-	}
-}
-
-inline osv::clock::uptime::time_point getClock(){
-    if(debugTime)
-        return osv::clock::uptime::now();
-    else
-        return std::chrono::time_point<osv::clock::uptime>();
-}
-
-/*inline u64 getClock(){
-    if(debugTime)
-        return rdtsc();
-    else
-        return 0ull;
-}*/
-
-//inline void addTime(u64 start, enum parts part){
-inline void addTime(std::chrono::time_point<osv::clock::uptime> start, enum parts part){
-    if(debugTime){
-        //auto elapsed = rdtsc() - start;
-        auto elapsed = osv::clock::uptime::now() - start;
-        parts_time[part] += elapsed;
-        parts_count[part]++;
-    }
-}
-
 
 struct PageState {
    std::atomic<u64> stateAndVersion;
@@ -244,6 +163,7 @@ class CacheManager {
 	u64 virtSize;
    	u64 physSize;
    	int n_threads;
+    int nb_queues_used;
   
 	// accessory
 	u64 virtCount;
@@ -302,6 +222,10 @@ class CacheManager {
         }
         assert(freeIDList.size()>=0);
 		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+        if(freeIDList.empty()){
+            printf("Overcommitment of threads. Failing\n");
+            assert(false);
+        }
         int id = freeIDList.back();
         threadMap.insert({tid, id}); 
         freeIDList.pop_back();
@@ -340,6 +264,7 @@ extern std::vector<CacheManager*> mmio_regions;
 inline CacheManager* get_mmr(void* addr){
 	for(CacheManager* mmr: mmio_regions){
 		if(mmr->isValidPtr(addr)){
+            assert(mmr->explicit_control!=true);
 			return mmr;
 		}
 	}
@@ -347,7 +272,6 @@ inline CacheManager* get_mmr(void* addr){
 }
 
 inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
-    pageFaultNumber++;
 	mmr->handleFault(mmr->toPID(addr));
 }
 
@@ -355,6 +279,7 @@ inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
 // for now we just create one region
 // int createMMAPRegion(void* start, size_t size, void* file, size_t size);
 CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int nb_threads, int batch, bool ex_cont);
+void destroyMMIORegion(CacheManager* cache);
 
 /*
 // Base-level primitives

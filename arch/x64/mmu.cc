@@ -21,10 +21,18 @@
 
 void page_fault(exception_frame *ef)
 {
+    #ifndef VMCACHE
+    auto addr = processor::read_cr2();
+    CacheManager* mmr = get_mmr((void*)addr);
+	if(mmr != NULL){
+		cache_handle_page_fault(mmr, (void*)addr);
+        return;
+    }
+    #endif
     sched::fpu_lock fpu;
     SCOPE_LOCK(fpu);
     sched::exception_guard g;
-    auto addr = processor::read_cr2();
+    //auto addr = processor::read_cr2();
     if (fixup_fault(ef)) {
         return;
     }
@@ -35,6 +43,7 @@ void page_fault(exception_frame *ef)
     if (reinterpret_cast<void*>(addr & ~(mmu::page_size - 1)) == elf::missing_symbols_page_addr) {
         abort("trying to execute or access missing symbol");
     }
+    
     // The following code may sleep. So let's verify the fault did not happen
     // when preemption was disabled, or interrupts were disabled.
     assert(sched::preemptable());
@@ -42,13 +51,7 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
-    #ifndef VMCACHE
-    CacheManager* mmr = get_mmr((void*)addr);
-	if(mmr != NULL)
-		cache_handle_page_fault(mmr, (void*)addr);
-    else
-    #endif
-        	mmu::vm_fault(addr, ef);
+        mmu::vm_fault(addr, ef);
     }
 }
 

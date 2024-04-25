@@ -1,5 +1,5 @@
 #ifndef LOAD_INJECTOR_HPP
 #define LOAD_INJECTOR_HPP
-__thread uint16_t workerThreadId = 0;
-__thread int32_t tpcchistorycounter = 0;
+uint16_t global_workerThreadId = 0;
+int32_t global_tpcchistorycounter = 0;
 #endif

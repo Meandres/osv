@@ -27,9 +27,6 @@
 #include <cstring>
 
 #include "BTree.hpp"
-#ifdef MMAP
-#include "BTree_mmaped.hpp"
-#endif
 
 #include "load_injector.hpp"
 #include "tpcc/TPCCWorkload.hpp"
@@ -152,30 +149,28 @@ int stick_this_thread_to_core(int core_id) {
    CPU_ZERO(&cpuset);
    CPU_SET(core_id, &cpuset);
 
-   pthread_t current_thread = pthread_self();    
+   pthread_t current_thread = pthread_self();
    return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
 }
 
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
-   std::vector<std::thread> threads;
-   uint64_t n = end-begin;
-   if (n<nthreads)
-      nthreads = n;
-   uint64_t perThread = n/nthreads;
-   for (unsigned i=0; i<nthreads; i++) {
-      threads.emplace_back([&,i]() {
+    std::vector<std::thread> threads;
+    uint64_t n = end-begin;
+    if (n<nthreads)
+        nthreads = n;
+    uint64_t perThread = n/nthreads;
+    for (unsigned i=0; i<nthreads; i++) {
+        threads.emplace_back([&,i]() {
             stick_this_thread_to_core(i);
-         uint64_t b = (perThread*i) + begin;
-         uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
-         fn(i, b, e);
-      });
-   }
+            uint64_t b = (perThread*i) + begin;
+            uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+            fn(i, b, e);
+        });
+    }
    for (auto& t : threads)
       t.join();
 }
-
-__thread u64 loadCount = 0;
 
 int main(int argc, char** argv) {
    unsigned nthreads = envOr("THREADS", 1);
@@ -189,15 +184,16 @@ int main(int argc, char** argv) {
    auto systemName = "osv";
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,pageFaults,system,threads,datasize,workload,batch" << endl;
+      //cout << "ts,tx,rmb,wmb,pageFaults,system,threads,datasize,workload,batch" << endl;
+      printf("ts,tx,rmb,wmb,system,threads,datasize,workload,batch\n");
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (cache->readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (cache->writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         u64 pfCount = pageFaultNumber.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  "," << pfCount << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << cache->batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << cache->batch << endl;
+         //printf("%lu,%lu,%lF%lF,%s,%u,%lu,%s,%lu\n", cnt++, prog, rmb, wmb, systemName, nthreads, n, (isRndread?"rndread":"tpcc"),cache->batch);
       }
       keepRunning = false;
    };
@@ -208,7 +204,7 @@ int main(int argc, char** argv) {
       {
          // insert
          parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         workerThreadId = worker;
+         //workerThreadId = worker;
         cache->registerThread();
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
@@ -218,7 +214,7 @@ int main(int argc, char** argv) {
                bt.insert({k1, sizeof(KeyType)}, payload);
             }
 	        cache->forgetThread();
-            add_thread_results();
+            //add_thread_results();
          });
       }
       cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -228,7 +224,7 @@ int main(int argc, char** argv) {
       thread statThread(statFn);
 
         parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
+            //workerThreadId = worker;
             cache->registerThread();
             u64 cnt = 0;
             u64 start = rdtsc();
@@ -253,11 +249,11 @@ int main(int argc, char** argv) {
             }
             txProgress += cnt;
 	        cache->forgetThread();
-            add_thread_results();
+            //add_thread_results();
         });
 
         statThread.join();
-        print_aggregate_avg();
+        //print_aggregate_avg();
         return 0;
     }
 
@@ -290,35 +286,36 @@ int main(int argc, char** argv) {
         tpcc.loadWarehouse();
         cache->forgetThread();
         parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
+            uint32_t tpcchistorycounter=0;
+            //workerThreadId = worker;
 	        cache->registerThread();
             for (Integer w_id=begin; w_id<end; w_id++) {
                 tpcc.loadStock(w_id);
                 tpcc.loadDistrinct(w_id);
                 for (Integer d_id = 1; d_id <= 10; d_id++) {
-                    tpcc.loadCustomer(w_id, d_id);
+                    tpcc.loadCustomer(w_id, d_id, worker, &tpcchistorycounter);
                     tpcc.loadOrders(w_id, d_id);
                 }
             }
 	        cache->forgetThread();
-            add_thread_results();
+            //add_thread_results();
         });
     }
-   cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-   cerr << "allocCount: " << cache->allocCount.load() << ", number of page faults: " << pageFaultNumber.load() << ", evictCount: " << evictCount.load() << endl;
+    cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
+    cerr << "allocCount: " << cache->allocCount.load() << ", evictCount: " << evictCount.load() << endl;
    cache->readCount = 0;
    cache->writeCount = 0;
-   pageFaultNumber = 0;
    thread statThread(statFn);
 
     parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-        workerThreadId = worker;
+        //workerThreadId = worker;
+        uint32_t tpcchistorycounter=0;
         cache->registerThread();
         u64 cnt = 0;
         u64 start = rdtsc();
         while (keepRunning.load()) {
             int w_id = tpcc.urand(1, warehouseCount); // wh crossing
-            tpcc.tx(w_id);
+            tpcc.tx(w_id, worker, &tpcchistorycounter);
             cnt++;
             u64 stop = rdtsc();
             if ((stop-start) > statDiff) {
@@ -329,12 +326,12 @@ int main(int argc, char** argv) {
         }
         txProgress += cnt;
         cache->forgetThread();
-        add_thread_results();
+        //add_thread_results();
     });
 
    statThread.join();
    cerr << "space: " << (cache->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-   print_aggregate_avg();
+   //print_aggregate_avg();
 
    return 0;
 }

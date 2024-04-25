@@ -135,6 +135,7 @@ class Manifest(object):
         try:
             _manifest = read_manifest(mm_path)
             self.guest_to_host_map = list(expand(_manifest))
+            self.guest_to_host_map.append(('/usr/lib/fs/libsolaris.so', 'libsolaris.so'))
             self.guest_to_host_map = [(x, unsymlink(y % defines)) for (x, y) in self.guest_to_host_map]
         except IOError:
             self.guest_to_host_map = []
@@ -1234,7 +1235,7 @@ def setup_libstdcxx():
     #  need to look for, and run, this script explicitly.
     gcc_python_dirs = glob('/usr/share/gcc-*/python')
     if len(gcc_python_dirs) == 0:
-        gcc_python_dirs = glob('/nix/store/9r8z1qr5jhv90fl2457qqml7qgk88fd6-gcc-13.2.0-lib/')
+        gcc_python_dirs = glob('/nix/store/pp0jsd045xvfsz60kpbkfxbs9pbpk8z5-gcc-13.2.0-lib/')
     if len(gcc_python_dirs) == 0: #If the above does not work try different place
         gcc_python_dirs = glob('/usr/share/gcc/python')
     if len(gcc_python_dirs) == 0:

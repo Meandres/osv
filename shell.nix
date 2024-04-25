@@ -67,9 +67,9 @@ let
 in
   pkgs.stdenv.mkDerivation {
         name="osv-dev-env";
-        nativeBuildInputs = with pkgs.buildPackages; [ gnumake unzip readline docker pax-utils pkg-config lua53Packages.lua qemu_full gdb ack bash python3 flamegraph python311Packages.requests ];
+        nativeBuildInputs = with pkgs.buildPackages; [ gnumake unzip readline docker pax-utils pkg-config lua53Packages.lua qemu_full gdb ack bash python3 flamegraph python311Packages.requests zulu8 p11-kit];
         #buildInputs = with pkgs.buildPackages; [ (boost.override { enableStatic = true; enableShared = false; }) readline libaio openssl.out openssl.dev openssl ];
-        buildInputs = with pkgs.buildPackages; [ osv-boost readline libaio openssl.out openssl.dev openssl ];
+        buildInputs = with pkgs.buildPackages; [ osv-boost readline libaio openssl.out openssl.dev openssl];
 	boost_base = osv-boost;
 	shellHook = ''
 		export LD_LIBRARY_PATH=$(nix eval --raw nixpkgs#readline)/lib

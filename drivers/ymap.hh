@@ -16,10 +16,8 @@ typedef u64 PID;
 struct alignas(4096) Page {
 	//bool dirty;
 };
-extern __thread u64 pageStolen_parts;
-extern u64 pageStolen_aggregate;
 
-const bool debugTime = true;
+const bool debugTime = false;
 
 constexpr uintptr_t get_mem_area_base(u64 area)
 {
@@ -141,6 +139,10 @@ struct PhysicalPage{
 	PhysicalPage *nextFree;
 };
 
+inline bool get_stored_bit(void *virt){
+    return walk(virt).user;
+}
+
 inline void print_PP(PhysicalPage *phys){
 	std::cout << "PhysicalPage{" << std::bitset<40>(phys->addr);
 	printf(", %p}\n", phys->nextFree);
@@ -160,6 +162,7 @@ struct Ymap {
 	Page* initialMapping;
 	std::vector<u64>list; // for now we implement this simply
 	int interfaceId;
+    u64 pageStolen;
 	u64 mappingCount;
 	u64 nbPagesToSteal;
 	std::atomic<bool> currentlyStealing = {false}; // the two atomic variables are far from each other
@@ -179,8 +182,10 @@ struct YmapBundle{
     u64 getPage(int tid, bool stealing);
 	bool stealPages(int tid);
 	void putPage(int tid, u64 phys);
-	elapsed_time mapPhysPage(int tid, void* virtAddr);
-	elapsed_time unmapPhysPage(int tid, void* virtAddr);
+	//elapsed_time mapPhysPage(int tid, void* virtAddr);
+	//elapsed_time unmapPhysPage(int tid, void* virtAddr);
+	void mapPhysPage(int tid, void* virtAddr);
+	void unmapPhysPage(int tid, void* virtAddr);
 	void unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict);
 
 };

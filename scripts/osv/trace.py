@@ -39,7 +39,7 @@ class BacktraceFormatter:
         if self.multiline:
             return '\n  ' + '\n  '.join(map(self.formatter, frames)) + '\n'
         else:
-            return '   [' + ', '.join(map(self.formatter, frames)) + ']'
+            return '   [' + '; '.join(map(self.formatter, frames)) + ']'
 
 def simple_symbol_formatter(src_addr):
     return '0x%x' % src_addr.addr

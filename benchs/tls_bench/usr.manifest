@@ -1,0 +1,2 @@
+/tls_bench_pie: ${MODULE_DIR}/tls_bench_pie
+/tls_bench_pic: ${MODULE_DIR}/tls_bench_pic
