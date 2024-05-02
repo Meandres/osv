@@ -311,7 +311,7 @@ struct GuardS {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = pageSize / 4;  // merge nodes below this size
+   static const unsigned underFullSize = (pageSize/2) + (pageSize/ 4);  // merge nodes below this size
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
@@ -812,7 +812,7 @@ struct BTree {
             // key found, copy payload
             memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
             return node->slot[pos].payloadLen;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) {yield(repeatCounter);}
       }
    }
 
@@ -833,7 +833,7 @@ struct BTree {
             fn(node->getPayload(pos));
                 //addTime(start, lookupKV);
             return true;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) {yield(repeatCounter);}
       }
    }
 
@@ -856,7 +856,7 @@ struct BTree {
                 //addTime(start, updateinplace);
                return true;
             }
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) {yield(repeatCounter);}
       }
    }
 
@@ -874,7 +874,7 @@ struct BTree {
 
                 //addTime(start, findleafs);
                 return GuardS<BTreeNode>(move(node));
-            } catch(const OLCRestartException&) {}
+            } catch(const OLCRestartException&) {yield(repeatCounter);}
         }
     }
 
@@ -994,7 +994,7 @@ struct BTree {
             		trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
          		}
          		return;
-      		} catch(const OLCRestartException&) {}
+      		} catch(const OLCRestartException&) {yield(repeatCounter);}
    		}
 	}
 
@@ -1027,7 +1027,7 @@ struct BTree {
          		GuardX<BTreeNode> nodeLocked(move(node));
          		trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          		// insert hasn't happened, restart from root
-      		} catch(const OLCRestartException&) {}
+      		} catch(const OLCRestartException&) {yield(repeatCounter);}
    		}
 	}
 
@@ -1061,7 +1061,7 @@ struct BTree {
             		GuardX<BTreeNode> nodeLocked(move(node));
             		GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             		nodeLocked->removeSlot(slotId);
-            		if (rightLocked->freeSpaceAfterCompaction() >= BTreeNodeHeader::underFullSize) {
+            		if (rightLocked->freeSpaceAfterCompaction() >= (pageSize - BTreeNodeHeader::underFullSize)) {
                			if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {}
             		}
          		} else {
@@ -1071,7 +1071,7 @@ struct BTree {
          		}
                 //addTime(start, removeKV);
          		return true;
-      		} catch(const OLCRestartException&) {}
+      		} catch(const OLCRestartException&) {yield(repeatCounter);}
    		}
 	}
 };

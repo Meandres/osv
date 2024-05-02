@@ -1,5 +1,4 @@
 #pragma once
-#include "load_injector.hpp"
 #include "Schema.hpp"
 // -------------------------------------------------------------------------------------
 #include "RandomGenerator.hpp"
@@ -145,10 +144,11 @@ struct TPCCWorkload
                  const vector<Integer>& supwares,
                  const vector<Integer>& itemids,
                  const vector<Integer>& qtys,
-                 Timestamp timestamp)
+                 Timestamp timestamp,
+                 int tid)
    {
-      Numeric w_tax = warehouse.lookupField({w_id}, &warehouse_t::w_tax);
-      Numeric c_discount = customer.lookupField({w_id, d_id, c_id}, &customer_t::c_discount);
+      Numeric w_tax = warehouse.lookupField({w_id}, &warehouse_t::w_tax, tid);
+      Numeric c_discount = customer.lookupField({w_id, d_id, c_id}, &customer_t::c_discount, tid);
       Numeric d_tax;
       Integer o_id;
 
@@ -157,7 +157,7 @@ struct TPCCWorkload
           [&](district_t& rec) {
              d_tax = rec.d_tax;
              o_id = rec.d_next_o_id++;
-          });
+          }, tid);
 
       Numeric all_local = 1;
       for (Integer sw : supwares)
@@ -165,11 +165,11 @@ struct TPCCWorkload
             all_local = 0;
       Numeric cnt = lineNumbers.size();
       Integer carrier_id = 0; /*null*/
-      order.insert({w_id, d_id, o_id}, {c_id, timestamp, carrier_id, cnt, all_local});
+      order.insert({w_id, d_id, o_id}, {c_id, timestamp, carrier_id, cnt, all_local}, tid);
       if (order_wdc_index) {
-         order_wdc.insert({w_id, d_id, c_id, o_id}, {});
+         order_wdc.insert({w_id, d_id, c_id, o_id}, {}, tid);
       }
-      neworder.insert({w_id, d_id, o_id}, {});
+      neworder.insert({w_id, d_id, o_id}, {}, tid);
 
       for (unsigned i = 0; i < lineNumbers.size(); i++) {
          Integer qty = qtys[i];
@@ -181,7 +181,7 @@ struct TPCCWorkload
                 rec.s_remote_cnt += (supwares[i] != w_id);
                 rec.s_order_cnt++;
                 rec.s_ytd += qty;
-             });
+             }, tid);
       }
 
       for (unsigned i = 0; i < lineNumbers.size(); i++) {
@@ -190,7 +190,7 @@ struct TPCCWorkload
          Integer itemid = itemids[i];
          Numeric qty = qtys[i];
 
-         Numeric i_price = item.lookupField({itemid}, &item_t::i_price);  // TODO: rollback on miss
+         Numeric i_price = item.lookupField({itemid}, &item_t::i_price, tid);  // TODO: rollback on miss
          Varchar<24> s_dist;
          stock.lookup1({w_id, itemid}, [&](const stock_t& rec) {
             switch (d_id) {
@@ -228,15 +228,15 @@ struct TPCCWorkload
                   exit(1);
                   throw;
             }
-         });
+         }, tid);
          Numeric ol_amount = qty * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
          Timestamp ol_delivery_d = 0;  // NULL
-         orderline.insert({w_id, d_id, o_id, lineNumber}, {itemid, supware, ol_delivery_d, qty, ol_amount, s_dist});
+         orderline.insert({w_id, d_id, o_id, lineNumber}, {itemid, supware, ol_delivery_d, qty, ol_amount, s_dist}, tid);
          // TODO: i_data, s_data
       }
    }
    // -------------------------------------------------------------------------------------
-   void newOrderRnd(Integer w_id)
+   void newOrderRnd(Integer w_id, int tid)
    {
       Integer d_id = urand(1, 10);
       Integer c_id = getCustomerID();
@@ -262,10 +262,10 @@ struct TPCCWorkload
          itemids.push_back(itemid);
          qtys.push_back(urand(1, 10));
       }
-      newOrder(w_id, d_id, c_id, lineNumbers, supwares, itemids, qtys, currentTimestamp());
+      newOrder(w_id, d_id, c_id, lineNumbers, supwares, itemids, qtys, currentTimestamp(), tid);
    }
    // -------------------------------------------------------------------------------------
-   void delivery(Integer w_id, Integer carrier_id, Timestamp datetime)
+   void delivery(Integer w_id, Integer carrier_id, Timestamp datetime, int tid)
    {
       for (Integer d_id = 1; d_id <= 10; d_id++) {
          Integer o_id = minInteger;
@@ -277,7 +277,7 @@ struct TPCCWorkload
                 }
                 return false;
              },
-             [&]() { o_id = minInteger; });
+             [&]() { o_id = minInteger; }, tid);
          // -------------------------------------------------------------------------------------
          if (o_id == minInteger) {  // Should rarely happen
             cout << "WARNING: delivery tx skipped for warehouse = " << w_id << ", district = " << d_id << endl;
@@ -285,7 +285,7 @@ struct TPCCWorkload
          }
          // -------------------------------------------------------------------------------------
          if (tpcc_remove) {
-            const auto ret = neworder.erase({w_id, d_id, o_id});
+            const auto ret = neworder.erase({w_id, d_id, o_id}, tid);
             assert(ret || manually_handle_isolation_anomalies);
          }
          // -------------------------------------------------------------------------------------
@@ -298,14 +298,14 @@ struct TPCCWorkload
                    c_id = rec.o_c_id;
                    return false;
                 },
-                [&]() {});
+                [&]() {}, tid);
             if (ol_cnt == minInteger)
                continue;
          } else {
             order.lookup1({w_id, d_id, o_id}, [&](const order_t& rec) {
                ol_cnt = rec.o_ol_cnt;
                c_id = rec.o_c_id;
-            });
+            }, tid);
          }
          // -------------------------------------------------------------------------------------
          if (manually_handle_isolation_anomalies) {
@@ -322,13 +322,13 @@ struct TPCCWorkload
                    }
                    return false;
                 },
-                [&]() { is_safe_to_continue = false; });
+                [&]() { is_safe_to_continue = false; }, tid);
             if (!is_safe_to_continue)
                continue;
          }
          // -------------------------------------------------------------------------------------
          order.update1(
-             {w_id, d_id, o_id}, [&](order_t& rec) { rec.o_carrier_id = carrier_id; });
+             {w_id, d_id, o_id}, [&](order_t& rec) { rec.o_carrier_id = carrier_id; }, tid);
          // -------------------------------------------------------------------------------------
          if (manually_handle_isolation_anomalies) {
             // First check if all orderlines have been inserted, a hack because of the missing transaction and concurrency control
@@ -343,7 +343,7 @@ struct TPCCWorkload
                    }
                    return false;
                 },
-                [&]() { is_safe_to_continue = false; });
+                [&]() { is_safe_to_continue = false; }, tid);
             if (!is_safe_to_continue) {
                continue;
             }
@@ -356,26 +356,26 @@ struct TPCCWorkload
                 [&](orderline_t& rec) {
                    ol_total += rec.ol_amount;
                    rec.ol_delivery_d = datetime;
-                });
+                }, tid);
          }
          customer.update1(
              {w_id, d_id, c_id},
              [&](customer_t& rec) {
                 rec.c_balance += ol_total;
                 rec.c_delivery_cnt++;
-             });
+             }, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void deliveryRnd(Integer w_id)
+   void deliveryRnd(Integer w_id, int tid)
    {
       Integer carrier_id = urand(1, 10);
-      delivery(w_id, carrier_id, currentTimestamp());
+      delivery(w_id, carrier_id, currentTimestamp(), tid);
    }
    // -------------------------------------------------------------------------------------
-   void stockLevel(Integer w_id, Integer d_id, Integer threshold)
+   void stockLevel(Integer w_id, Integer d_id, Integer threshold, int tid)
    {
-      Integer o_id = district.lookupField({w_id, d_id}, &district_t::d_next_o_id);
+      Integer o_id = district.lookupField({w_id, d_id}, &district_t::d_next_o_id, tid);
 
       //"SELECT COUNT(DISTINCT (S_I_ID)) AS STOCK_COUNT FROM orderline, stock WHERE OL_W_ID = ? AND OL_D_ID = ? AND OL_O_ID < ? AND OL_O_ID >= ? AND
       // S_W_ID = ? AND S_I_ID = OL_I_ID AND S_QUANTITY < ?"
@@ -401,20 +401,20 @@ struct TPCCWorkload
              }
              return false;
           },
-          [&]() { items.clear(); });
+          [&]() { items.clear(); }, tid);
       std::sort(items.begin(), items.end());
       auto last = std::unique(items.begin(), items.end());
       items.erase(last, items.end());
       unsigned count = 0;
       for (Integer i_id : items) {
-         auto res_s_quantity = stock.lookupField({w_id, i_id}, &stock_t::s_quantity);
+         auto res_s_quantity = stock.lookupField({w_id, i_id}, &stock_t::s_quantity, tid);
          count += res_s_quantity < threshold;
       }
    }
    // -------------------------------------------------------------------------------------
-   void stockLevelRnd(Integer w_id) { stockLevel(w_id, urand(1, 10), urand(10, 20)); }
+   void stockLevelRnd(Integer w_id, int tid) { stockLevel(w_id, urand(1, 10), urand(10, 20), tid); }
    // -------------------------------------------------------------------------------------
-   void orderStatusId(Integer w_id, Integer d_id, Integer c_id)
+   void orderStatusId(Integer w_id, Integer d_id, Integer c_id, int tid)
    {
       Varchar<16> c_first;
       Varchar<2> c_middle;
@@ -425,7 +425,7 @@ struct TPCCWorkload
          c_middle = rec.c_middle;
          c_last = rec.c_last;
          c_balance = rec.c_balance;
-      });
+      }, tid);
 
       Integer o_id = -1;
       // -------------------------------------------------------------------------------------
@@ -440,7 +440,7 @@ struct TPCCWorkload
                 o_id = key.o_id;
                 return false;
              },
-             [] {});
+             [] {}, tid);
       } else {
          order.scanDesc(
              {w_id, d_id, std::numeric_limits<Integer>::max()},
@@ -451,9 +451,10 @@ struct TPCCWorkload
                 }
                 return true;
              },
-             [&]() {});
+             [&]() {}, tid);
       }
-      assert(o_id > -1);
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp o_entry_d;
       Integer o_carrier_id;
@@ -461,7 +462,7 @@ struct TPCCWorkload
       order.lookup1({w_id, d_id, o_id}, [&](const order_t& rec) {
          o_entry_d = rec.o_entry_d;
          o_carrier_id = rec.o_carrier_id;
-      });
+      }, tid);
       Integer ol_i_id;
       Integer ol_supply_w_id;
       Timestamp ol_delivery_d;
@@ -484,11 +485,11 @@ struct TPCCWorkload
              },
              [&]() {
                 // NOTHING
-             });
+             }, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void orderStatusName(Integer w_id, Integer d_id, Varchar<16> c_last)
+   void orderStatusName(Integer w_id, Integer d_id, Varchar<16> c_last, int tid)
    {
       vector<Integer> ids;
       customerwdl.scan(
@@ -500,7 +501,7 @@ struct TPCCWorkload
              }
              return false;
           },
-          [&]() { ids.clear(); });
+          [&]() { ids.clear(); }, tid);
       unsigned c_count = ids.size();
       if (c_count == 0)
          return;  // TODO: rollback
@@ -515,26 +516,23 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
-                o_id = key.o_id;
+                if (key.o_w_id == w_id && key.o_d_id == d_id && key.o_c_id == c_id)
+                   o_id = key.o_id;
                 return false;
              },
-             [] {});
+             [] {}, tid);
       } else {
          order.scanDesc(
              {w_id, d_id, std::numeric_limits<Integer>::max()},
              [&](const order_t::Key& key, const order_t& rec) {
-                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id) {
+                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id)
                    o_id = key.o_id;
-                   return false;
-                }
-                return true;
+                return false;
              },
-             [&]() {});
-         assert(o_id > -1);
+             [&]() {}, tid);
       }
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp ol_delivery_d;
       orderline.scan(
@@ -548,21 +546,21 @@ struct TPCCWorkload
           },
           []() {
              // NOTHING
-          });
+          }, tid);
    }
    // -------------------------------------------------------------------------------------
 
-   void orderStatusRnd(Integer w_id)
+   void orderStatusRnd(Integer w_id, int tid)
    {
       Integer d_id = urand(1, 10);
       if (urand(1, 100) <= 40) {
-         orderStatusId(w_id, d_id, getCustomerID());
+         orderStatusId(w_id, d_id, getCustomerID(), tid);
       } else {
-         orderStatusName(w_id, d_id, genName(getNonUniformRandomLastNameForRun()));
+         orderStatusName(w_id, d_id, genName(getNonUniformRandomLastNameForRun()), tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void paymentById(Integer w_id, Integer d_id, Integer c_w_id, Integer c_d_id, Integer c_id, Timestamp h_date, Numeric h_amount, Timestamp datetime, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
+   void paymentById(Integer w_id, Integer d_id, Integer c_w_id, Integer c_d_id, Integer c_id, Timestamp h_date, Numeric h_amount, Timestamp datetime, uint16_t workerThreadId, uint32_t *tpcchistorycounter, int tid)
    {
       Varchar<10> w_name;
       Varchar<20> w_street_1;
@@ -579,10 +577,10 @@ struct TPCCWorkload
          w_state = rec.w_state;
          w_zip = rec.w_zip;
          w_ytd = rec.w_ytd;
-      });
+      }, tid);
       // -------------------------------------------------------------------------------------
       warehouse.update1(
-          {w_id}, [&](warehouse_t& rec) { rec.w_ytd += h_amount; });
+          {w_id}, [&](warehouse_t& rec) { rec.w_ytd += h_amount; }, tid);
       Varchar<10> d_name;
       Varchar<20> d_street_1;
       Varchar<20> d_street_2;
@@ -598,9 +596,9 @@ struct TPCCWorkload
          d_state = rec.d_state;
          d_zip = rec.d_zip;
          d_ytd = rec.d_ytd;
-      });
+      }, tid);
       district.update1(
-          {w_id, d_id}, [&](district_t& rec) { rec.d_ytd += h_amount; });
+          {w_id, d_id}, [&](district_t& rec) { rec.d_ytd += h_amount; }, tid);
 
       Varchar<500> c_data;
       Varchar<2> c_credit;
@@ -613,7 +611,7 @@ struct TPCCWorkload
          c_balance = rec.c_balance;
          c_ytd_payment = rec.c_ytd_payment;
          c_payment_cnt = rec.c_payment_cnt;
-      });
+      }, tid);
       Numeric c_new_balance = c_balance - h_amount;
       Numeric c_new_ytd_payment = c_ytd_payment + h_amount;
       Numeric c_new_payment_cnt = c_payment_cnt + 1;
@@ -633,7 +631,7 @@ struct TPCCWorkload
                 rec.c_balance = c_new_balance;
                 rec.c_ytd_payment = c_new_ytd_payment;
                 rec.c_payment_cnt = c_new_payment_cnt;
-             });
+             }, tid);
       } else {
          customer.update1(
              {c_w_id, c_d_id, c_id},
@@ -641,13 +639,13 @@ struct TPCCWorkload
                 rec.c_balance = c_new_balance;
                 rec.c_ytd_payment = c_new_ytd_payment;
                 rec.c_payment_cnt = c_new_payment_cnt;
-             });
+             }, tid);
       }
 
       Varchar<24> h_new_data = Varchar<24>(w_name) || Varchar<24>("    ") || d_name;
       Integer t_id = (Integer)workerThreadId;
       Integer h_id = (Integer)(*tpcchistorycounter)++;
-      history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data});
+      history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data}, tid);
    }
    // -------------------------------------------------------------------------------------
    void paymentByName(Integer w_id,
@@ -659,8 +657,8 @@ struct TPCCWorkload
                       Numeric h_amount,
                       Timestamp datetime,
                       uint16_t workerThreadId,
-                      uint32_t *tpcchistorycounter)
-
+                      uint32_t *tpcchistorycounter,
+                      int tid)
    {
       Varchar<10> w_name;
       Varchar<20> w_street_1;
@@ -677,10 +675,10 @@ struct TPCCWorkload
          w_state = rec.w_state;
          w_zip = rec.w_zip;
          w_ytd = rec.w_ytd;
-      });
+      }, tid);
       // -------------------------------------------------------------------------------------
       warehouse.update1(
-          {w_id}, [&](warehouse_t& rec) { rec.w_ytd += h_amount; });
+          {w_id}, [&](warehouse_t& rec) { rec.w_ytd += h_amount; }, tid);
       // -------------------------------------------------------------------------------------
       Varchar<10> d_name;
       Varchar<20> d_street_1;
@@ -697,9 +695,9 @@ struct TPCCWorkload
          d_state = rec.d_state;
          d_zip = rec.d_zip;
          d_ytd = rec.d_ytd;
-      });
+      }, tid);
       district.update1(
-          {w_id, d_id}, [&](district_t& rec) { rec.d_ytd += h_amount; });
+          {w_id, d_id}, [&](district_t& rec) { rec.d_ytd += h_amount; }, tid);
 
       // Get customer id by name
       vector<Integer> ids;
@@ -712,7 +710,7 @@ struct TPCCWorkload
              }
              return false;
           },
-          [&]() { ids.clear(); });
+          [&]() { ids.clear(); }, tid);
       unsigned c_count = ids.size();
       if (c_count == 0)
          return;  // TODO: rollback
@@ -732,7 +730,7 @@ struct TPCCWorkload
          c_balance = rec.c_balance;
          c_ytd_payment = rec.c_ytd_payment;
          c_payment_cnt = rec.c_payment_cnt;
-      });
+      }, tid);
       Numeric c_new_balance = c_balance - h_amount;
       Numeric c_new_ytd_payment = c_ytd_payment + h_amount;
       Numeric c_new_payment_cnt = c_payment_cnt + 1;
@@ -752,7 +750,7 @@ struct TPCCWorkload
                 rec.c_balance = c_new_balance;
                 rec.c_ytd_payment = c_new_ytd_payment;
                 rec.c_payment_cnt = c_new_payment_cnt;
-             });
+             }, tid);
       } else {
          customer.update1(
              {c_w_id, c_d_id, c_id},
@@ -760,16 +758,16 @@ struct TPCCWorkload
                 rec.c_balance = c_new_balance;
                 rec.c_ytd_payment = c_new_ytd_payment;
                 rec.c_payment_cnt = c_new_payment_cnt;
-             });
+             }, tid);
       }
 
       Varchar<24> h_new_data = Varchar<24>(w_name) || Varchar<24>("    ") || d_name;
       Integer t_id = (Integer)workerThreadId;
       Integer h_id = (Integer)(*tpcchistorycounter)++;
-      history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data});
+      history.insert({t_id, h_id}, {c_id, c_d_id, c_w_id, d_id, w_id, datetime, h_amount, h_new_data}, tid);
    }
    // -------------------------------------------------------------------------------------
-   void paymentRnd(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
+   void paymentRnd(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter, int tid)
    {
       Integer d_id = urand(1, 10);
       Integer c_w_id = w_id;
@@ -782,9 +780,9 @@ struct TPCCWorkload
       Timestamp h_date = currentTimestamp();
 
       if (urand(1, 100) <= 60) {
-         paymentByName(w_id, d_id, c_w_id, c_d_id, genName(getNonUniformRandomLastNameForRun()), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter);
+         paymentByName(w_id, d_id, c_w_id, c_d_id, genName(getNonUniformRandomLastNameForRun()), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter, tid);
       } else {
-         paymentById(w_id, d_id, c_w_id, c_d_id, getCustomerID(), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter);
+         paymentById(w_id, d_id, c_w_id, c_d_id, getCustomerID(), h_date, h_amount, currentTimestamp(), workerThreadId, tpcchistorycounter, tid);
       }
    }
    // -------------------------------------------------------------------------------------
@@ -831,7 +829,7 @@ struct TPCCWorkload
    // [low, high]
    Integer urand(Integer low, Integer high) { return rnd(high - low + 1) + low; }
    // -------------------------------------------------------------------------------------
-   void loadStock(Integer w_id)
+   void loadStock(Integer w_id, int tid)
    {
       for (Integer i = 0; i < ITEMS_NO; i++) {
          Varchar<50> s_data = randomastring<50>(25, 50);
@@ -841,19 +839,19 @@ struct TPCCWorkload
          }
          stock.insert({w_id, i + 1}, {randomNumeric(10, 100), randomastring<24>(24, 24), randomastring<24>(24, 24), randomastring<24>(24, 24),
                                       randomastring<24>(24, 24), randomastring<24>(24, 24), randomastring<24>(24, 24), randomastring<24>(24, 24),
-                                      randomastring<24>(24, 24), randomastring<24>(24, 24), randomastring<24>(24, 24), 0, 0, 0, s_data});
+                                      randomastring<24>(24, 24), randomastring<24>(24, 24), randomastring<24>(24, 24), 0, 0, 0, s_data}, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void loadDistrinct(Integer w_id)
+   void loadDistrinct(Integer w_id, int tid)
    {
       for (Integer i = 1; i < 11; i++) {
          district.insert({w_id, i}, {randomastring<10>(6, 10), randomastring<20>(10, 20), randomastring<20>(10, 20), randomastring<20>(10, 20),
-                                     randomastring<2>(2, 2), randomzip(), randomNumeric(0.0000, 0.2000), 3000000, 3001});
+                                     randomastring<2>(2, 2), randomzip(), randomNumeric(0.0000, 0.2000), 3000000, 3001}, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void loadCustomer(Integer w_id, Integer d_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
+   void loadCustomer(Integer w_id, Integer d_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter, int tid)
    {
       Timestamp now = currentTimestamp();
       for (Integer i = 0; i < 3000; i++) {
@@ -866,15 +864,15 @@ struct TPCCWorkload
          Varchar<2> c_credit(rnd(10) ? "GC" : "BC");
          customer.insert({w_id, d_id, i + 1}, {c_first, "OE", c_last, randomastring<20>(10, 20), randomastring<20>(10, 20), randomastring<20>(10, 20),
                                                randomastring<2>(2, 2), randomzip(), randomnstring(16, 16), now, c_credit, 50000.00,
-                                               randomNumeric(0.0000, 0.5000), -10.00, 1, 0, 0, randomastring<500>(300, 500)});
-         customerwdl.insert({w_id, d_id, c_last, c_first}, {i + 1});
+                                               randomNumeric(0.0000, 0.5000), -10.00, 1, 0, 0, randomastring<500>(300, 500)}, tid);
+         customerwdl.insert({w_id, d_id, c_last, c_first}, {i + 1}, tid);
          Integer t_id = (Integer)workerThreadId;
          Integer h_id = (Integer)(*tpcchistorycounter)++;
-         history.insert({t_id, h_id}, {i + 1, d_id, w_id, d_id, w_id, now, 10.00, randomastring<24>(12, 24)});
+         history.insert({t_id, h_id}, {i + 1, d_id, w_id, d_id, w_id, now, 10.00, randomastring<24>(12, 24)}, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void loadOrders(Integer w_id, Integer d_id)
+   void loadOrders(Integer w_id, Integer d_id, int tid)
    {
       Timestamp now = currentTimestamp();
       vector<Integer> c_ids;
@@ -887,9 +885,9 @@ struct TPCCWorkload
          Integer o_carrier_id = (o_id < 2101) ? rnd(10) + 1 : 0;
          Numeric o_ol_cnt = rnd(10) + 5;
 
-         order.insert({w_id, d_id, o_id}, {o_c_id, now, o_carrier_id, o_ol_cnt, 1});
+         order.insert({w_id, d_id, o_id}, {o_c_id, now, o_carrier_id, o_ol_cnt, 1}, tid);
          if (order_wdc_index) {
-            order_wdc.insert({w_id, d_id, o_c_id, o_id}, {});
+            order_wdc.insert({w_id, d_id, o_c_id, o_id}, {}, tid);
          }
 
          for (Integer ol_number = 1; ol_number <= o_ol_cnt; ol_number++) {
@@ -898,16 +896,16 @@ struct TPCCWorkload
                ol_delivery_d = now;
             Numeric ol_amount = (o_id < 2101) ? 0 : randomNumeric(0.01, 9999.99);
             const Integer ol_i_id = rnd(ITEMS_NO) + 1;
-            orderline.insert({w_id, d_id, o_id, ol_number}, {ol_i_id, w_id, ol_delivery_d, 5, ol_amount, randomastring<24>(24, 24)});
+            orderline.insert({w_id, d_id, o_id, ol_number}, {ol_i_id, w_id, ol_delivery_d, 5, ol_amount, randomastring<24>(24, 24)}, tid);
          }
          o_id++;
       }
 
       for (Integer i = 2100; i <= 3000; i++)
-         neworder.insert({w_id, d_id, i}, {});
+         neworder.insert({w_id, d_id, i}, {}, tid);
    }
    // -------------------------------------------------------------------------------------
-   void loadItem()
+   void loadItem(int tid)
    {
       for (Integer i = 1; i <= ITEMS_NO; i++) {
          Varchar<50> i_data = randomastring<50>(25, 50);
@@ -915,43 +913,43 @@ struct TPCCWorkload
             i_data.length = rnd(i_data.length - 8);
             i_data = i_data || Varchar<10>("ORIGINAL");
          }
-         item.insert({i}, {randomId(1, 10000), randomastring<24>(14, 24), randomNumeric(1.00, 100.00), i_data});
+         item.insert({i}, {randomId(1, 10000), randomastring<24>(14, 24), randomNumeric(1.00, 100.00), i_data}, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   void loadWarehouse()
+   void loadWarehouse(int tid)
    {
       for (Integer i = 0; i < warehouseCount; i++) {
          warehouse.insert({i + 1}, {randomastring<10>(6, 10), randomastring<20>(10, 20), randomastring<20>(10, 20), randomastring<20>(10, 20),
-                                    randomastring<2>(2, 2), randomzip(), randomNumeric(0.1000, 0.2000), 3000000});
+                                    randomastring<2>(2, 2), randomzip(), randomNumeric(0.1000, 0.2000), 3000000}, tid);
       }
    }
    // -------------------------------------------------------------------------------------
-   int tx(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter)
+   int tx(Integer w_id, uint16_t workerThreadId, uint32_t *tpcchistorycounter, int tid)
    {
       // micro-optimized version of weighted distribution
       u64 rnd = RandomGenerator::getRand(0, 10000);
       if (rnd < 4300) {
-         paymentRnd(w_id, workerThreadId, tpcchistorycounter);
+         paymentRnd(w_id, workerThreadId, tpcchistorycounter, tid);
          return 0;
       }
       rnd -= 4300;
       if (rnd < 400) {
-         orderStatusRnd(w_id);
+         orderStatusRnd(w_id, tid);
          return 1;
       }
       rnd -= 400;
       if (rnd < 400) {
-         deliveryRnd(w_id);
+         deliveryRnd(w_id, tid);
          return 2;
       }
       rnd -= 400;
       if (rnd < 400) {
-         stockLevelRnd(w_id);
+         stockLevelRnd(w_id, tid);
          return 3;
       }
       rnd -= 400;
-      newOrderRnd(w_id);
+      newOrderRnd(w_id, tid);
       return 4;
    }
 };

@@ -45,6 +45,7 @@ TRACEPOINT(trace_elf_unload, "%s", const char *);
 TRACEPOINT(trace_elf_lookup, "%s", const char *);
 TRACEPOINT(trace_elf_lookup_next, "%s", const char *);
 TRACEPOINT(trace_elf_lookup_addr, "%p", const void *);
+TRACEPOINT(trace_elf_object_containing_addr, "");
 
 extern void* elf_start;
 extern size_t elf_size;
@@ -1681,15 +1682,16 @@ dladdr_info program::lookup_addr(const void* addr)
 
 object *program::object_containing_addr(const void *addr)
 {
+    trace_elf_object_containing_addr();
     object *ret = nullptr;
-    module_delete_disable();
+    //module_delete_disable();
 #if CONF_lazy_stack_invariant
     assert(sched::preemptable() && arch::irq_enabled());
 #endif
 #if CONF_lazy_stack
     arch::ensure_next_stack_page();
 #endif
-    WITH_LOCK(osv::rcu_read_lock) {
+    //WITH_LOCK(osv::rcu_read_lock) {
          const auto &modules = _modules_rcu.read()->objects;
          for (object *module : modules) {
              if (module->contains_addr(addr)) {
@@ -1697,8 +1699,8 @@ object *program::object_containing_addr(const void *addr)
                  break;
              }
          }
-    }
-    module_delete_enable();
+    //}
+    //module_delete_enable();
     return ret;
 }
 

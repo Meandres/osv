@@ -789,11 +789,20 @@ void thread::unpin()
     helper->join();
 }
 
+void cpu::enable_load_balancing(){
+    this->_load_balance_lock.unlock();
+}
+
+void cpu::disable_load_balancing(){
+    this->_load_balance_lock.lock();
+}
+
 void cpu::load_balance()
 {
     notifier::fire();
     timer tmr(*thread::current());
     while (true) {
+        //std::lock_guard<mutex> guard(_load_balance_lock);
         tmr.set(osv::clock::uptime::now() + 100_ms);
         thread::wait_until([&] { return tmr.expired(); });
         if (runqueue.empty()) {

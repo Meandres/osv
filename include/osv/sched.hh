@@ -1018,6 +1018,9 @@ struct cpu : private timer_base::client {
     void idle_poll_start();
     void idle_poll_end();
     void send_wakeup_ipi();
+    mutex _load_balance_lock; 
+    void disable_load_balancing();
+    void enable_load_balancing();
     void load_balance();
     unsigned load();
     /**

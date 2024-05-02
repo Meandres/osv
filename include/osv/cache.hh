@@ -170,8 +170,8 @@ class CacheManager {
    	u64 physCount;
    	u64 batch;
     std::vector<unvme_iod_t> io_descriptors; // for n_threads * ns->qsize
-	std::unordered_map<int, int> threadMap;
-    std::vector<int> freeIDList;
+	//std::unordered_map<int, int> threadMap;
+    //std::vector<int> freeIDList;
     YmapBundle ymapBundle;
     std::atomic_flag lockFreeIDList = ATOMIC_FLAG_INIT;
 
@@ -199,24 +199,24 @@ class CacheManager {
     	return pageState[pid];
    	}
 
-   	Page* fixX(PID pid);
+   	Page* fixX(PID pid, int tid);
    	void unfixX(PID pid);
-   	Page* fixS(PID pid);
+   	Page* fixS(PID pid, int tid);
    	void unfixS(PID pid);
 
    	bool isValidPtr(void* page) { return (page >= virtMem) && (page < (virtMem + virtSize + 16)); }
    	PID toPID(void* page) { return reinterpret_cast<Page*>(page) - virtMem; }
    	Page* toPtr(PID pid) { return virtMem + pid; }
 
-   	void ensureFreePages();
+   	void ensureFreePages(int tid);
    	void readPage(PID pid);
-   	Page* allocPage();
+   	Page* allocPage(int tid);
     
     int allocate(PID* listStart, int size);
-   	void handleFault(PID pid);
+   	void handleFault(PID pid, int tid);
    	void evict();
 
-    inline void registerThread(){
+    /*inline void registerThread(){
         while(lockFreeIDList.test_and_set(std::memory_order_acquire)){
             _mm_pause();
         }
@@ -251,7 +251,8 @@ class CacheManager {
         if (search != threadMap.end())
             return search->second;
         return -1;
-	}
+	}*/
+    void execute_swipe_in_kernel(u64 nthreads, u64 count, bool expli);
 };
 
 // default op handlers
@@ -272,7 +273,7 @@ inline CacheManager* get_mmr(void* addr){
 }
 
 inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
-	mmr->handleFault(mmr->toPID(addr));
+	mmr->handleFault(mmr->toPID(addr), 0);
 }
 
 // TODO: replace with File when we implement it
@@ -326,8 +327,6 @@ void handleFault(void* vma);
 void evict();
 void ioError();
 */
-struct OLCRestartException{};
-
 //extern CacheManager cache;
 #endif
 #endif

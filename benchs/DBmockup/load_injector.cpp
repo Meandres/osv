@@ -289,6 +289,7 @@ int main(int argc, char** argv) {
             uint32_t tpcchistorycounter=0;
             //workerThreadId = worker;
 	        cache->registerThread();
+            //sched::s_current->set_priority(0.0001);
             for (Integer w_id=begin; w_id<end; w_id++) {
                 tpcc.loadStock(w_id);
                 tpcc.loadDistrinct(w_id);
@@ -311,6 +312,7 @@ int main(int argc, char** argv) {
         //workerThreadId = worker;
         uint32_t tpcchistorycounter=0;
         cache->registerThread();
+        //sched::s_current->set_priority(0.0001);
         u64 cnt = 0;
         u64 start = rdtsc();
         while (keepRunning.load()) {

@@ -1,15 +1,19 @@
+#include <chrono>
 #include <string.h>
 #include <stdint.h>
 #include <iostream>
-#include <cstdlib>
-#include <experimental/random>
-#include <ctime>
-#include <sys/mman.h>
+#include <vector>
+
+#ifdef OSV
+#include <osv/memcmp.h>
+#endif
+
+//extern "C" int fast_memcmp(const void*, const void*, size_t);
 
 using namespace std;
 
 inline uint64_t rdtsc(void){
-    union{
+    union {
         uint64_t val;
         struct {
             uint32_t lo;
@@ -20,54 +24,132 @@ inline uint64_t rdtsc(void){
     return tsc.val;
 }
 
+int sanity_check(const void *vl, const void *vr, size_t n)
+{
+	const unsigned char *l=(const unsigned char*)vl, *r=(const unsigned char*)vr;
+	for (; n && *l == *r; n--, l++, r++);
+	return n ? *l-*r : 0;
+}
+
+void put_things_in_string(char* str, size_t n){
+    for(int i=0; i<n; i++){
+        char c = i%10;
+        str[i] = c;
+    }
+    str[n-1] = '\0';
+}
+
 int main(int argc, char** argv){
     if(argc != 2){
         cerr << "Please provide the system that is running the bench" << endl;
         return 1;
     }
-    const uint64_t nb_copies = 100000000;
-    const uint64_t nb_lookups = 1000000000;
-    const int repetitions = 5;
-    const int size = 16777216;
+
+    const uint64_t nb_op = 1000000000;
+    const int repetitions = 1;
     char system[50];
     strcpy(system, argv[1]);
-    srand(time(nullptr));
-    void* mem = mmap(NULL, size*sizeof(char), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    char* charMem = (char*) mem;
+    char *og = (char*) malloc(4096*sizeof(char));
+    put_things_in_string(og, 4096);
     char *dest = (char*) malloc(4096*sizeof(char));
+    vector<int> sizes_memcpy = {0, 1, 2, 4, 8, 16, 32, 64, 72, 96, 128, 256, 512, 768, 4088};
+    vector<int> sizes_memcmp = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 25, 30, 35, 40, 41};
 
-    // load random values
-    for(int i = 0; i<size; i++){
-        char rnd_val = experimental::randint(0, 255);
-        charMem[i] = rnd_val;
-        if(i<4096)
-            dest[i] = 0;
+    uint64_t acc_time=0;
+    /*for(int cpySize: sizes_memcpy){
+        for(int i=0; i<repetitions; i++){
+            auto start = std::chrono::system_clock::now();
+            for(uint64_t j = 0; j<nb_op; j++){
+                memcpy(dest, og, cpySize);
+            }
+            auto stop = std::chrono::system_clock::now();
+            std::chrono::duration<double> sec = stop - start;
+            acc_time += sec.count();
+        }
+        cout << "memcpy," << cpySize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << endl;
+    }*/
+
+    int acc = 0;
+    /*for(int i=0; i<repetitions; i++){
+        uint64_t start = rdtsc();
+        //auto start = std::chrono::system_clock::now();
+        for(uint64_t j = 0; j<nb_op; j++){
+            acc += og[j%4096];
+        }
+        uint64_t stop = rdtsc();
+        //auto stop = std::chrono::system_clock::now();
+        //std::chrono::duration<double> sec = stop - start;
+        //acc_time += sec.count();
+        acc_time += (stop-start);
     }
-    /*int pos;
-    for(int cpySize=1; cpySize <= 4096; cpySize*=8){
+    //cout << "access," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << endl;
+    cout << "access," << system << "," << ((double)acc_time)/(repetitions*nb_op) << endl;*/
+     
+    // this is the worst case in OSv since it just compares sequentially
+    put_things_in_string(og, 4096);
+    put_things_in_string(dest, 4096);
+    acc_time=0.0;
+    acc = 0;
+    for(int cmpSize: sizes_memcmp){
         for(int i=0; i<repetitions; i++){
             uint64_t start = rdtsc();
-            for(uint64_t j = 0; j<nb_copies; j++){
-                pos = experimental::randint(0, size-cpySize)%(size-cpySize);
-                memcpy(dest, charMem+pos, cpySize);
+            //auto start = chrono::system_clock::now();
+            for(volatile uint64_t j = 0; j<nb_op; j++){
+                acc += memcmp(dest, og, cmpSize);
             }
-            uint64_t end = rdtsc();
-            cout << cpySize << "," << system << "," << (double)(end-start)/nb_copies << endl;
+            //auto stop = chrono::system_clock::now();
+            //chrono::duration<double> sec = stop - start;
+            //acc_time += sec.count();
+            uint64_t stop = rdtsc();
+            acc_time += (stop-start);
         }
-    }*/
-    int pos;
-    uint64_t acc = 0;
-    uint64_t start = rdtsc();
-    for(uint64_t i=0; i<nb_lookups; i++){
-        pos = experimental::randint(0, size);
-        acc += (uint64_t)charMem[pos];
+        //cout << "memcmp," << cmpSize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << ",\t" <<acc << endl;
+        if(strcmp(system, "linux") == 0)
+            cout << "glibc," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc <<endl;
+        else
+            cout << "musl," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc <<endl;
     }
-    uint64_t end = rdtsc();
-    cout << system << "," << (double)(end-start)/nb_lookups << endl;
+   
+    #ifdef LINUX
+    acc_time=0.0;
+    acc = 0;
+    for(int cmpSize: sizes_memcmp){
+        for(int i=0; i<repetitions; i++){
+            uint64_t start = rdtsc();
+            //auto start = chrono::system_clock::now();
+            for(volatile uint64_t j = 0; j<nb_op; j++){
+                acc += sanity_check(dest, og, cmpSize);
+            }
+            //auto stop = chrono::system_clock::now();
+            //chrono::duration<double> sec = stop - start;
+            //acc_time += sec.count();
+            uint64_t stop = rdtsc();
+            acc_time += (stop-start);
+        }
+        //cout << "musl on linux," << cmpSize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << ",\t" <<acc << endl;
+        cout << "musl," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc << endl;
+    }
+    #endif
     
-    /*cout << "Average cycles for memcpy_small " << ((double)cycles_memcpy_small)/nb_memcpy_small << ", count: " << nb_memcpy_small << endl;
-    cout << "Average cycles for memcpy_ssse3 " << ((double)cycles_memcpy_ssse3)/nb_memcpy_ssse3 << ", count: " << nb_memcpy_ssse3 << endl;
-    cout << "Average cycles for memcpy_ssse3_unal " << ((double)cycles_memcpy_ssse3_unal)/nb_memcpy_ssse3_unal << ", count: " << nb_memcpy_ssse3_unal << endl;
-    cout << "Average cycles for memcpy_repmovsb " << ((double)cycles_memcpy_repmovsb)/nb_memcpy_repmovsb << ", count: " << nb_memcpy_repmovsb << endl;*/
+    #ifdef OSV
+    acc_time=0.0;
+    acc = 0;
+    for(int cmpSize: sizes_memcmp){
+        for(int i=0; i<repetitions; i++){
+            uint64_t start = rdtsc();
+            //auto start = chrono::system_clock::now();
+            for(volatile uint64_t j = 0; j<nb_op; j++){
+                acc += fast_memcmp(dest, og, cmpSize);
+            }
+            //auto stop = chrono::system_clock::now();
+            //chrono::duration<double> sec = stop - start;
+            //acc_time += sec.count();
+            uint64_t stop = rdtsc();
+            acc_time += (stop-start);
+        }
+        //cout << "glibc on osv," << cmpSize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << ",\t" <<acc << endl;
+        cout << "glibc," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc << endl;
+    }
+    #endif
     return 0;
 }

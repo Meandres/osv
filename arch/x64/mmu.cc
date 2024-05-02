@@ -21,18 +21,10 @@
 
 void page_fault(exception_frame *ef)
 {
-    #ifndef VMCACHE
-    auto addr = processor::read_cr2();
-    CacheManager* mmr = get_mmr((void*)addr);
-	if(mmr != NULL){
-		cache_handle_page_fault(mmr, (void*)addr);
-        return;
-    }
-    #endif
     sched::fpu_lock fpu;
     SCOPE_LOCK(fpu);
     sched::exception_guard g;
-    //auto addr = processor::read_cr2();
+    auto addr = processor::read_cr2();
     if (fixup_fault(ef)) {
         return;
     }
@@ -51,6 +43,13 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
+    #ifndef VMCACHE
+    CacheManager* mmr = get_mmr((void*)addr);
+	if(mmr != NULL){
+		cache_handle_page_fault(mmr, (void*)addr);
+        return;
+    }
+    #endif
         mmu::vm_fault(addr, ef);
     }
 }

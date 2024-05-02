@@ -1,6 +1,6 @@
 /*{ pkgs ? import <nixpkgs> {} }:
 let
-    staticBoost = pkgs.boost.override { enableShared = false; enabledStatic = true; };
+    staticBoost = pkgs.boost175.override { enableShared = false; enabledStatic = true; };
 in with pkgs; mkShell {
 #    buildInputs = with pkgs; [ staticBoost wget unzip luarocks qemu ];
 #    LIBRARY_PATH = staticBoost + "/lib";
@@ -50,6 +50,8 @@ lua5_3 #            lua-5.3.*
 lua53Packages.luarocks
 zlib
 perl
+ack
+glibc.all
         ];
     ZLIB = zlib;
     OPENSSL_INCDIR = openssl.dev + "/include";
