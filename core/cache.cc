@@ -36,7 +36,6 @@ TRACEPOINT(trace_cache_fixX, "");
 TRACEPOINT(trace_cache_fixX_ret, "");
 TRACEPOINT(trace_cache_fixS, "");
 TRACEPOINT(trace_cache_fixS_ret, "");
-TRACEPOINT(trace_cache_yield, "counter=%lu", u64);
 
 std::atomic<u64> evictCount(0);
 
@@ -131,15 +130,6 @@ template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn) {
       }
    }
 
-int pin_thread_to_core(int core_id) {
-   cpu_set_t cpuset;
-   CPU_ZERO(&cpuset);
-   CPU_SET(core_id, &cpuset);
-
-   pthread_t current_thread = pthread_self();
-   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-}
-
 template<class Fn>
 void execute_in_parallel(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    std::vector<std::thread> threads;
@@ -175,7 +165,7 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
         for(int j=0; j<(int)ns->qsize; j++){
             io_descriptors.push_back(NULL);
         }
-		//freeIDList.push_back(i);
+		freeIDList.push_back(i);
 	}
 
    	// Initialize virtual pages
@@ -184,7 +174,7 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
    	if (virtMem == MAP_FAILED)
     	cerr << "mmap failed" << endl;
     execute_in_parallel(0, virtCount, n_threads, [&](uint64_t worker, uint64_t begin, uint64_t end){
-            //this->registerThread();
+            this->registerThread();
             for(u64 i=begin; i<end; i++){
 		        memset(virtMem+i, 0, pageSize);	
 		        madvise(virtMem+i, pageSize, MADV_DONTNEED);
@@ -192,9 +182,16 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
 		        atomic<u64>* ptePtr = walkRef(virtMem+i);
 		        ptePtr->store(0ull);
    	        }
-            //this->forgetThread();
+            this->forgetThread();
         }); 
    	invalidateTLB();
+    execute_in_parallel(0, virtCount, n_threads, [&](uint64_t worker, uint64_t begin, uint64_t end){
+        this->registerThread();
+        for(u64 i=begin; i<end; i++){
+            assert(walk(virtMem+i).word == 0ull);
+        }
+        this->forgetThread();
+    });
    
    	physUsedCount = 0;
    	allocCount = 1; // pid 0 reserved for meta data
@@ -212,9 +209,9 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
 
 CacheManager::~CacheManager(){};
 
-void CacheManager::handleFault(PID pid, int tid){
+void CacheManager::handleFault(PID pid){
     trace_cache_pf();
-    handlers[CACHE_OP_PAGEFAULT](this, pid, tid);
+    handlers[CACHE_OP_PAGEFAULT](this, pid, 0);
     trace_cache_pf_ret();
 }
 
@@ -223,14 +220,13 @@ int CacheManager::allocate(PID* listStart, int size){
 }
 
 void CacheManager::evict(){
-    assert(false);
     trace_cache_evict();
     handlers[CACHE_OP_EVICT](this, 0, 0);
     trace_cache_evict_ret();
 }
 
-void CacheManager::ensureFreePages(int tid) {
-    //int tid = getTID();
+void CacheManager::ensureFreePages() {
+    int tid = getTID();
     if(tid<nb_queues_used){
         if (physUsedCount >= physCount*0.95)
             evict();
@@ -240,11 +236,11 @@ void CacheManager::ensureFreePages(int tid) {
 }
 
 // allocated new page and fix it
-Page* CacheManager::allocPage(int tid) {
+Page* CacheManager::allocPage() {
     //auto start = getClock();
     if(explicit_control){ 
         physUsedCount++;
-        ensureFreePages(tid);
+        ensureFreePages();
     }
     u64 pid = allocCount++;
     if (pid >= virtCount) {
@@ -255,7 +251,7 @@ Page* CacheManager::allocPage(int tid) {
     bool succ = getPageState(pid).tryLockX(stateAndVersion);
     assert(succ);
     if(explicit_control){ 
-        /*int tid = getTID();
+        int tid = getTID();
         if(tid == -1){
             //parts_time[mapphys] += 
             ymapBundle.mapPhysPage(0, toPtr(pid));
@@ -264,15 +260,14 @@ Page* CacheManager::allocPage(int tid) {
             //parts_time[mapphys] += 
             ymapBundle.mapPhysPage(tid, toPtr(pid));
             //parts_count[mapphys]++;
-        }*/
-        ymapBundle.mapPhysPage(tid, toPtr(pid));
+        }
         residentSet.insert(pid);
     }
     //addTime(start, allocpage);
     return toPtr(pid);
 }
 
-Page* CacheManager::fixX(PID pid, int tid) {
+Page* CacheManager::fixX(PID pid) {
     trace_cache_fixX();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -281,7 +276,7 @@ Page* CacheManager::fixX(PID pid, int tid) {
             case PageState::Evicted: {
                 if (ps.tryLockX(stateAndVersion)) {
                     if(explicit_control)
-                        handleFault(pid, tid);
+                        handleFault(pid);
                     trace_cache_fixX_ret();
                     return virtMem + pid;
                 }
@@ -299,7 +294,7 @@ Page* CacheManager::fixX(PID pid, int tid) {
     }
 }
 
-Page* CacheManager::fixS(PID pid, int tid) {
+Page* CacheManager::fixS(PID pid) {
     trace_cache_fixS();
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -310,7 +305,7 @@ Page* CacheManager::fixS(PID pid, int tid) {
             } case PageState::Evicted: {
                 if (ps.tryLockX(stateAndVersion)){
                     if(explicit_control){
-                        handleFault(pid, tid);
+                        handleFault(pid);
                     }
                     ps.unlockX();
                 }
@@ -340,7 +335,7 @@ void CacheManager::unfixX(PID pid) {
 
 void CacheManager::readPage(PID pid) {
     //auto start = getClock();
-    int ret = unvme_read(ns, 0%maxQueues, toPtr(pid), pid*(pageSize/blockSize), pageSize/blockSize);
+    int ret = unvme_read(ns, getTID()%maxQueues, toPtr(pid), pid*(pageSize/blockSize), pageSize/blockSize);
     assert(ret==0);
     readCount++;
     //addTime(start, readpage);
@@ -358,7 +353,7 @@ int CacheManager::updateCallback(enum cache_opcode op, cache_op_func_t f){
 
 int nb_cache_op = 4;
 
-int default_handleFault(CacheManager* cm, PID pid, int tid) {
+int default_handleFault(CacheManager* cm, PID pid, int unused) {
     PageState& ps = cm->getPageState(pid);
     u64 stateAndVersion = ps.stateAndVersion.load();
     if(PageState::getState(stateAndVersion) == PageState::Evicted){
@@ -373,8 +368,8 @@ int default_handleFault(CacheManager* cm, PID pid, int tid) {
         }
     }
     cm->physUsedCount++;
-    cm->ensureFreePages(0);
-    /*if(cm->getTID() == -1){
+    cm->ensureFreePages();
+    if(cm->getTID() == -1){
         //parts_time[mapphys] += 
         cm->ymapBundle.mapPhysPage(0, cm->toPtr(pid));
         //parts_count[mapphys]++;
@@ -382,8 +377,7 @@ int default_handleFault(CacheManager* cm, PID pid, int tid) {
         //parts_time[mapphys] += 
         cm->ymapBundle.mapPhysPage(cm->getTID(), cm->toPtr(pid));
         //parts_count[mapphys]++;
-    }*/
-    cm->ymapBundle.mapPhysPage(tid, cm->toPtr(pid));
+    }
     if(get_stored_bit(cm->toPtr(pid))){ 
             // reuse "user mode" bit of the PTE to indicate if the page has already been resolved in the past
             // this is due to TPCC allocating pages "before they are backed by storage"
@@ -406,8 +400,7 @@ int default_evict(CacheManager* cm, u64 unused_u64, int unused_int) {
     toEvictAddresses.reserve(cm->batch);
     vector<PID> toWrite;
     toWrite.reserve(cm->batch);
-    //int tid = cm->getTID();
-    int tid=0;
+    int tid = cm->getTID();
     assert(tid<cm->nb_queues_used);
     
     // 0. find candidates, lock dirty ones in shared mode
@@ -494,20 +487,6 @@ int default_evict(CacheManager* cm, u64 unused_u64, int unused_int) {
    return 0;
 }
 
-void CacheManager::execute_swipe_in_kernel(u64 nthreads, u64 count, bool expli){
-    execute_in_parallel(0, count, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end){
-        pin_thread_to_core(worker);
-        //this->registerThread();
-        for(uint64_t i = begin; i<end; i++){
-            if(expli)
-                this->fixX(i, worker);
-            else
-                asm volatile("movq $42, (%0)": : "r" (this->toPtr(i)): "memory");
-        }
-        //this->forgetThread();
-    });
-}
-
 std::vector<CacheManager*> mmio_regions;
 
 CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int nb_threads, int batch, bool ex_cont){
@@ -527,12 +506,12 @@ void destroyMMIORegion(CacheManager* cache){
     mmio_regions.erase(mmio_regions.begin()+i);
     free(cache->pageState);
     execute_in_parallel(0, cache->virtCount, cache->n_threads, [&](uint64_t threads, uint64_t begin, uint64_t end){
-        //cache->registerThread();
+        cache->registerThread();
         for(u64 i=begin; i<end; i++){
 		    atomic<u64>* ptePtr = walkRef(cache->virtMem+i);
 		    ptePtr->store(0ull);
         }
-        //cache->forgetThread();
+        cache->forgetThread();
     });
     free(cache->virtMem);
     delete cache;
