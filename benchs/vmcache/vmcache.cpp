@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <span>
+#include <random>
 
 #include <errno.h>
 //#include <libaio.h>
@@ -26,7 +27,7 @@
 //#include "exmap.h"
 #include <osv/cache.hh>
 #include <osv/sampler.hh>
-//#include <osv/fast_memcmp.hh>
+//#include <osv/memcmp.hh>
 
 //__thread uint16_t workerThreadId = 0;
 //__thread int32_t tpcchistorycounter = 0;
@@ -39,100 +40,498 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-#define is_aligned(POINTER, BYTE_COUNT) \
-    (((uintptr_t)(const void *)(POINTER)) % (BYTE_COUNT) == 0)
+u64 acc_time = 0;
+u64 acc_count=0;
+u64 diff_time=0, dt_1=0, dt_2=0, dt_3=0, dt_4=0, dt_5=0, c_1=0, c_2=0, c_3=0, c_4=0, c_5=0; 
 
-std::map<int, int> sizes_memcpy = {};
-std::map<int, int> sizes_memcmp = {};
-std::map<int, int> alignement_l_memcpy = {};
-std::map<int, int> alignement_r_memcpy = {};
-std::map<int, int> alignement_l_memcmp = {};
-std::map<int, int> alignement_r_memcmp = {};
-std::atomic<u64> acc_memcpy = {0};
-std::atomic<u64> acc_memcmp = {0};
+#include <immintrin.h>
+#define likely(condition) __builtin_expect(condition, 1)
+#define unlikely(condition) __builtin_expect(condition, 0)
 
-void register_alignement(int choice, const void* ptr){
-    int res = 16;
-    while(res>1 && !is_aligned(ptr, res)){
-        res /= 2;
+/**
+ * Compare bytes between two locations. The locations must not overlap.
+ *
+ * @param src_1
+ *   Pointer to the first source of the data.
+ * @param src_2
+ *   Pointer to the second source of the data.
+ * @param n
+ *   Number of bytes to compare.
+ * @return
+ *   zero if src_1 equal src_2
+ *   -ve if src_1 less than src_2
+ *   +ve if src_1 greater than src_2
+ */
+static inline int
+rte_memcmp(const void *src_1, const void *src,
+        size_t n) __attribute__((always_inline));
+
+/**
+ * Find the first different bit for comparison.
+ */
+static inline int
+rte_cmpffd (uint32_t x, uint32_t y)
+{
+    int i;
+    int pos = x ^ y;
+    for (i = 0; i < 32; i++)
+        if (pos & (1<<i))
+            return i;
+    return -1;
+}
+
+/**
+ * Find the first different byte for comparison.
+ */
+static inline int
+rte_cmpffdb (const uint8_t *x, const uint8_t *y, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (x[i] != y[i])
+            return x[i] - y[i];
+    return 0;
+}
+
+/**
+ * Compare 16 bytes between two locations.
+ * locations should not overlap.
+ */
+static inline int
+rte_cmp16(const void *src_1, const void *src_2)
+{
+    __m128i xmm0, xmm1, xmm2;
+
+    xmm0 = _mm_lddqu_si128((const __m128i *)src_1);
+    xmm1 = _mm_lddqu_si128((const __m128i *)src_2);
+    xmm2 = _mm_xor_si128(xmm0, xmm1);
+
+    if (unlikely(!_mm_testz_si128(xmm2, xmm2))) {
+
+        uint64_t mm11 = _mm_extract_epi64(xmm0, 0);
+        uint64_t mm12 = _mm_extract_epi64(xmm0, 1);
+
+        uint64_t mm21 = _mm_extract_epi64(xmm1, 0);
+        uint64_t mm22 = _mm_extract_epi64(xmm1, 1);
+
+        if (mm11 == mm21)
+            return rte_cmpffdb((const uint8_t *)&mm12,
+                    (const uint8_t *)&mm22, 8);
+        else
+            return rte_cmpffdb((const uint8_t *)&mm11,
+                    (const uint8_t *)&mm21, 8);
     }
-    switch (choice){
-        case 0:
-            if(alignement_l_memcpy.contains(res)){
-                alignement_l_memcpy[res]++;
-            }else{
-                alignement_l_memcpy[res] = 0;
-            }
-            break;
-        case 1:
-            if(alignement_r_memcpy.contains(res)){
-                alignement_r_memcpy[res]++;
-            }else{
-                alignement_r_memcpy[res] = 0;
-            }
-            break;
-        case 2:
-            if(alignement_l_memcmp.contains(res)){
-                alignement_l_memcmp[res]++;
-            }else{
-                alignement_l_memcmp[res] = 0;
-            }
-            break;
-        case 3:
-            if(alignement_r_memcmp.contains(res)){
-                alignement_r_memcmp[res]++;
-            }else{
-                alignement_r_memcmp[res] = 0;
-            }
-            break;
-    } 
+
+    return 0;
 }
 
-void *local_memcpy(void *__restrict vl, const void *__restrict vr, size_t n){
-    register_alignement(0, vl);
-    register_alignement(1, vr);
-    if(sizes_memcpy.contains(n)){
-        sizes_memcpy[n]++;
-    }else{
-        sizes_memcpy[n] = 0;
+/**
+ * Compare 0 to 15 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_memcmp_regular(const uint8_t *src_1u, const uint8_t *src_2u, size_t n)
+{
+    int ret = 1;
+
+    /**
+     * Compare less than 16 bytes
+     */
+    if (n & 0x08) {
+        ret = (*(const uint64_t *)src_1u ==
+                *(const uint64_t *)src_2u);
+
+        if ((ret != 1))
+            goto exit_8;
+
+        n -= 0x8;
+        src_1u += 0x8;
+        src_2u += 0x8;
     }
-    acc_memcpy++;
-    return memcpy(vl, vr, n);
-}
-int local_memcmp(const void *vl, const void *vr, size_t n){
-    register_alignement(2, vl);
-    register_alignement(3, vr);
-    if(sizes_memcmp.contains(n)){
-        sizes_memcmp[n]++;
-    }else{
-        sizes_memcmp[n] = 0;
+
+    if (n & 0x04) {
+        ret = (*(const uint32_t *)src_1u ==
+                *(const uint32_t *)src_2u);
+
+        if ((ret != 1))
+            goto exit_4;
+
+        n -= 0x4;
+        src_1u += 0x4;
+        src_2u += 0x4;
     }
-    acc_memcmp++;
-    return memcmp(vl, vr, n);
+
+    if (n & 0x02) {
+        ret = (*(const uint16_t *)src_1u ==
+                *(const uint16_t *)src_2u);
+
+        if ((ret != 1))
+            goto exit_2;
+
+        n -= 0x2;
+        src_1u += 0x2;
+        src_2u += 0x2;
+    }
+
+    if (n & 0x01) {
+        ret = (*(const uint8_t *)src_1u ==
+                *(const uint8_t *)src_2u);
+
+        if ((ret != 1))
+            goto exit_1;
+
+        n -= 0x1;
+        src_1u += 0x1;
+        src_2u += 0x1;
+    }
+
+    return !ret;
+
+exit_8:
+    return rte_cmpffdb(src_1u, src_2u, 8);
+exit_4:
+    return rte_cmpffdb(src_1u, src_2u, 4);
+exit_2:
+    return rte_cmpffdb(src_1u, src_2u, 2);
+exit_1:
+    return rte_cmpffdb(src_1u, src_2u, 1);
 }
 
-void print_sorted_map(std::map<int,int> *map, char* str){
-    std::vector<std::pair<int, int>> tmp;
-    for (auto itr = map->begin(); itr != map->end(); ++itr)
-        tmp.push_back(*itr);
+/**
+ * AVX2 implementation below
+ */
 
-    sort(tmp.begin(), tmp.end(), [=](std::pair<int, int>& a, std::pair<int, int>& b)
-    {
-        return a.second > b.second;
-    });
-    cout << str << endl;
-    for (std::pair<int, int> p: tmp)
-        cout << "\t" << p.first << ": " << p.second << endl;
-    cout << endl;
+/**
+ * Compare 32 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_cmp32(const void *src_1, const void *src_2)
+{
+    const __m128i* src1 = (const __m128i*)src_1;
+    const __m128i* src2 = (const __m128i*)src_2;
+    const uint8_t *s1, *s2;
+
+    __m128i mm11 = _mm_lddqu_si128(src1);
+    __m128i mm12 = _mm_lddqu_si128(src1 + 1);
+    __m128i mm21 = _mm_lddqu_si128(src2);
+    __m128i mm22 = _mm_lddqu_si128(src2 + 1);
+
+    __m128i mm1 = _mm_xor_si128(mm11, mm21);
+    __m128i mm2 = _mm_xor_si128(mm12, mm22);
+    __m128i mm = _mm_or_si128(mm1, mm2);
+
+    if (unlikely(!_mm_testz_si128(mm, mm))) {
+
+        /*
+         * Find out which of the two 16-byte blocks
+         * are different.
+         */
+        if (_mm_testz_si128(mm1, mm1)) {
+            mm11 = mm12;
+            mm21 = mm22;
+            mm1 = mm2;
+            s1 = (const uint8_t *)(src1 + 1);
+            s2 = (const uint8_t *)(src2 + 1);
+        } else {
+            s1 = (const uint8_t *)src1;
+            s2 = (const uint8_t *)src2;
+        }
+
+        // Produce the comparison result
+        __m128i mm_cmp = _mm_cmpgt_epi8(mm11, mm21);
+        __m128i mm_rcmp = _mm_cmpgt_epi8(mm21, mm11);
+        mm_cmp = _mm_xor_si128(mm1, mm_cmp);
+        mm_rcmp = _mm_xor_si128(mm1, mm_rcmp);
+
+        uint32_t cmp = _mm_movemask_epi8(mm_cmp);
+        uint32_t rcmp = _mm_movemask_epi8(mm_rcmp);
+
+        int cmp_b = rte_cmpffd(cmp, rcmp);
+
+        int ret = (cmp_b == -1) ? 0 : (s1[cmp_b] - s2[cmp_b]);
+        return ret;
+    }
+
+    return 0;
 }
 
-void print_maps(){
-    print_sorted_map(&sizes_memcpy, "memcpy");
-    print_sorted_map(&sizes_memcmp, "memcmp");
-    print_sorted_map(&alignement_l_memcpy, "alignement_l_memcpy");
-    print_sorted_map(&alignement_r_memcpy, "alignement_r_memcpy");
-    print_sorted_map(&alignement_l_memcmp, "alignement_l_memcmp");
-    print_sorted_map(&alignement_r_memcmp, "alignement_r_memcmp");
+/**
+ * Compare 48 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_cmp48(const void *src_1, const void *src_2)
+{
+    int ret;
+
+    ret = rte_cmp32((const uint8_t *)src_1 + 0 * 32,
+            (const uint8_t *)src_2 + 0 * 32);
+
+    if (unlikely(ret != 0))
+        return ret;
+
+    ret = rte_cmp16((const uint8_t *)src_1 + 1 * 32,
+            (const uint8_t *)src_2 + 1 * 32);
+    return ret;
+}
+
+/**
+ * Compare 64 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_cmp64 (const void* src_1, const void* src_2)
+{
+    const __m256i* src1 = (const __m256i*)src_1;
+    const __m256i* src2 = (const __m256i*)src_2;
+    const uint8_t *s1, *s2;
+
+    __m256i mm11 = _mm256_lddqu_si256(src1);
+    __m256i mm12 = _mm256_lddqu_si256(src1 + 1);
+    __m256i mm21 = _mm256_lddqu_si256(src2);
+    __m256i mm22 = _mm256_lddqu_si256(src2 + 1);
+
+    __m256i mm1 = _mm256_xor_si256(mm11, mm21);
+    __m256i mm2 = _mm256_xor_si256(mm12, mm22);
+    __m256i mm = _mm256_or_si256(mm1, mm2);
+
+    if (unlikely(!_mm256_testz_si256(mm, mm))) {
+        /*
+         * Find out which of the two 32-byte blocks
+         * are different.
+         */
+        if (_mm256_testz_si256(mm1, mm1)) {
+            mm11 = mm12;
+            mm21 = mm22;
+            mm1 = mm2;
+            s1 = (const uint8_t *)(src1 + 1);
+            s2 = (const uint8_t *)(src2 + 1);
+        } else {
+            s1 = (const uint8_t *)src1;
+            s2 = (const uint8_t *)src2;
+        }
+
+        // Produce the comparison result
+        __m256i mm_cmp = _mm256_cmpgt_epi8(mm11, mm21);
+        __m256i mm_rcmp = _mm256_cmpgt_epi8(mm21, mm11);
+        mm_cmp = _mm256_xor_si256(mm1, mm_cmp);
+        mm_rcmp = _mm256_xor_si256(mm1, mm_rcmp);
+
+        uint32_t cmp = _mm256_movemask_epi8(mm_cmp);
+        uint32_t rcmp = _mm256_movemask_epi8(mm_rcmp);
+
+        int cmp_b = rte_cmpffd(cmp, rcmp);
+
+        int ret = (cmp_b == -1) ? 0 : (s1[cmp_b] - s2[cmp_b]);
+        return ret;
+    }
+
+    return 0;
+}
+
+/**
+ * Compare 128 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_cmp128(const void *src_1, const void *src_2)
+{
+    int ret;
+
+    ret = rte_cmp64((const uint8_t *)src_1 + 0 * 64,
+            (const uint8_t *)src_2 + 0 * 64);
+
+    if (unlikely(ret != 0))
+        return ret;
+
+    return rte_cmp64((const uint8_t *)src_1 + 1 * 64,
+            (const uint8_t *)src_2 + 1 * 64);
+}
+
+/**
+ * Compare 256 bytes between two locations.
+ * Locations should not overlap.
+ */
+static inline int
+rte_cmp256(const void *src_1, const void *src_2)
+{
+    int ret;
+
+    ret = rte_cmp64((const uint8_t *)src_1 + 0 * 64,
+            (const uint8_t *)src_2 + 0 * 64);
+
+    if (unlikely(ret != 0))
+        return ret;
+
+    ret = rte_cmp64((const uint8_t *)src_1 + 1 * 64,
+            (const uint8_t *)src_2 + 1 * 64);
+
+    if (unlikely(ret != 0))
+        return ret;
+
+    ret = rte_cmp64((const uint8_t *)src_1 + 2 * 64,
+            (const uint8_t *)src_2 + 2 * 64);
+
+    if (unlikely(ret != 0))
+        return ret;
+
+    return rte_cmp64((const uint8_t *)src_1 + 3 * 64,
+            (const uint8_t *)src_2 + 3 * 64);
+}
+
+/**
+ * Compare bytes between two locations. The locations must not overlap.
+ *
+ * @param src_1
+ *   Pointer to the first source of the data.
+ * @param src_2
+ *   Pointer to the second source of the data.
+ * @param n
+ *   Number of bytes to compare.
+ * @return
+ *   zero if src_1 equal src_2
+ *   -ve if src_1 less than src_2
+ *   +ve if src_1 greater than src_2
+ */
+static inline int
+rte_memcmp(const void *_src_1, const void *_src_2, size_t n)
+{
+    const uint8_t *src_1 = (const uint8_t *)_src_1;
+    const uint8_t *src_2 = (const uint8_t *)_src_2;
+    int ret = 0;
+
+    if (n < 16)
+        return rte_memcmp_regular(src_1, src_2, n);
+
+    if (n <= 32) {
+        ret = rte_cmp16(src_1, src_2);
+        if (unlikely(ret != 0))
+            return ret;
+
+        return rte_cmp16(src_1 - 16 + n, src_2 - 16 + n);
+    }
+
+    if (n <= 48) {
+        ret = rte_cmp32(src_1, src_2);
+        if (unlikely(ret != 0))
+            return ret;
+
+        return rte_cmp16(src_1 - 16 + n, src_2 - 16 + n);
+    }
+
+    if (n <= 64) {
+        ret = rte_cmp32(src_1, src_2);
+        if (unlikely(ret != 0))
+            return ret;
+
+        ret = rte_cmp16(src_1 + 32, src_2 + 32);
+
+        if (unlikely(ret != 0))
+            return ret;
+
+        return rte_cmp16(src_1 - 16 + n, src_2 - 16 + n);
+    }
+
+    if (n <= 96) {
+        ret = rte_cmp64(src_1, src_2);
+        if (unlikely(ret != 0))
+            return ret;
+
+        ret = rte_cmp16(src_1 + 64, src_2 + 64);
+        if (unlikely(ret != 0))
+            return ret;
+
+        return rte_cmp16(src_1 - 16 + n, src_2 - 16 + n);
+    }
+
+    if (n <= 128) {
+        ret = rte_cmp64(src_1, src_2);
+        if (unlikely(ret != 0))
+            return ret;
+
+        ret = rte_cmp32(src_1 + 64, src_2 + 64);
+        if (unlikely(ret != 0))
+            return ret;
+
+        ret = rte_cmp16(src_1 + 96, src_2 + 96);
+        if (unlikely(ret != 0))
+            return ret;
+
+        return rte_cmp16(src_1 - 16 + n, src_2 - 16 + n);
+    }
+
+CMP_BLOCK_LESS_THAN_512:
+    if (n <= 512) {
+        if (n >= 256) {
+            ret = rte_cmp256(src_1, src_2);
+            if (unlikely(ret != 0))
+                return ret;
+            src_1 = src_1 + 256;
+            src_2 = src_2 + 256;
+            n -= 256;
+        }
+        if (n >= 128) {
+            ret = rte_cmp128(src_1, src_2);
+            if (unlikely(ret != 0))
+                return ret;
+            src_1 = src_1 + 128;
+            src_2 = src_2 + 128;
+            n -= 128;
+        }
+        if (n >= 64) {
+            n -= 64;
+            ret = rte_cmp64(src_1, src_2);
+            if (unlikely(ret != 0))
+                return ret;
+            src_1 = src_1 + 64;
+            src_2 = src_2 + 64;
+        }
+        if (n > 32) {
+            ret = rte_cmp32(src_1, src_2);
+            if (unlikely(ret != 0))
+                return ret;
+            ret = rte_cmp32(src_1 - 32 + n, src_2 - 32 + n);
+            return ret;
+        }
+        if (n > 0)
+            ret = rte_cmp32(src_1 - 32 + n, src_2 - 32 + n);
+
+        return ret;
+    }
+
+    while (n > 512) {
+        ret = rte_cmp256(src_1 + 0 * 256, src_2 + 0 * 256);
+        if (unlikely(ret != 0))
+            return ret;
+
+        ret = rte_cmp256(src_1 + 1 * 256, src_2 + 1 * 256);
+        if (unlikely(ret != 0))
+            return ret;
+
+        src_1 = src_1 + 512;
+        src_2 = src_2 + 512;
+        n -= 512;
+    }
+    goto CMP_BLOCK_LESS_THAN_512;
+}
+
+inline int custom_memcmp(const void *_src_1, const void *_src_2, size_t n){
+    //u64 start = rdtsc();
+    int ret = rte_memcmp(_src_1, _src_2, n);
+    //int ret = memcmp(_src_1, _src_2, n);
+    //acc_time += (rdtsc() - start);
+    //acc_count++;
+    return ret;
+}
+
+inline int lowerBound_custom_memcmp(const void *_src_1, const void *_src_2, size_t n){
+    //u64 start = rdtsc();
+    int ret = rte_memcmp(_src_1, _src_2, n);
+    //int ret = memcmp(_src_1, _src_2, n);
+    //acc_time += (rdtsc() - start);
+    //acc_count++;
+    return ret;
 }
 
 /*typedef u64 PID; // page id type
@@ -419,7 +818,14 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, true);
+bool check_expl_ctrl(const char* env){
+    if(getenv(env))
+        if(strcmp(getenv(env), "TRUE"))
+            return true;
+    return false;
+}
+
+CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, check_expl_ctrl("EXPLICIT"));
 
 struct OLCRestartException {};
 
@@ -467,7 +873,7 @@ struct GuardO {
                break;
             case PageState::Evicted:
                if (ps.tryLockX(v)) {
-                  bm->handleFault(pid, tid);
+                  bm->handleFault(pid);
                   bm->unfixX(pid);
                }
                break;
@@ -544,7 +950,7 @@ struct GuardX {
 
    // constructor
    explicit GuardX(u64 pid, int tid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm->fixX(pid, tid));
+      ptr = reinterpret_cast<T*>(bm->fixX(pid));
       ptr->dirty = true;
    }
 
@@ -611,7 +1017,7 @@ template<class T>
 struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
    AllocGuard(int tid, Params&&... params) {
-      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage(tid));
+      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
       GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
    }
@@ -625,7 +1031,7 @@ struct GuardS {
 
    // constructor
    explicit GuardS(u64 pid, int tid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm->fixS(pid, tid));
+      ptr = reinterpret_cast<T*>(bm->fixS(pid));
    }
 
    GuardS(GuardO<T>&& other) {
@@ -974,7 +1380,7 @@ template <class T>
 static T loadUnaligned(void* p)
 {
    T x;
-   local_memcpy(&x, p, sizeof(T));
+   memcpy(&x, p, sizeof(T));
    return x;
 }
 
@@ -1076,9 +1482,12 @@ struct BTreeNode : public BTreeNodeHeader {
    u16 lowerBound(span<u8> skey, bool& foundExactOut)
    {
       foundExactOut = false;
+      //c_1++;
+      //u64 m0 = rdtsc();
 
       // check prefix
-      int cmp = local_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
+      int cmp = custom_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
+      //u64 m1 = rdtsc();
       if (cmp < 0) // key is less than prefix
          return 0;
       if (cmp > 0) // key is greater than prefix
@@ -1087,22 +1496,27 @@ struct BTreeNode : public BTreeNodeHeader {
          return 0;
       u8* key = skey.data() + prefixLen;
       unsigned keyLen = skey.size() - prefixLen;
+      //u64 m2 = rdtsc();
 
       // check hint
       u16 lower = 0;
       u16 upper = count;
       u32 keyHead = head(key, keyLen);
       searchHint(keyHead, lower, upper);
+      //u64 m3 = rdtsc();
 
+      u64 count=0;
+      u16 mid;
       // binary search on remaining range
       while (lower < upper) {
-         u16 mid = ((upper - lower) / 2) + lower;
+         count++;
+         mid = ((upper - lower) / 2) + lower;
          if (keyHead < slot[mid].head) {
             upper = mid;
          } else if (keyHead > slot[mid].head) {
             lower = mid + 1;
          } else { // head is equal, check full key
-            int cmp = local_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
+            int cmp = lowerBound_custom_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
             if (cmp < 0) {
                upper = mid;
             } else if (cmp > 0) {
@@ -1115,11 +1529,22 @@ struct BTreeNode : public BTreeNodeHeader {
                } else {
                   foundExactOut = true;
                   return mid;
+                  //break;
                }
             }
          }
       }
-      return lower;
+      /*u64 m4 = rdtsc();
+      dt_1 += (m1-m0);
+      dt_2 += (m2-m1);
+      dt_3 += (m3-m2);
+      dt_4 += (m4-m3);
+      c_2 += count;
+      if(foundExactOut){
+        return mid;
+      }else{*/
+        return lower;
+      //}
    }
 
    // lowerBound wrapper ignoring exact match argument (for convenience)
@@ -1165,7 +1590,7 @@ struct BTreeNode : public BTreeNodeHeader {
 
    void copyNode(BTreeNodeHeader* dst, BTreeNodeHeader* src) {
       u64 ofs = offsetof(BTreeNodeHeader, upperInnerNode);
-      local_memcpy(reinterpret_cast<u8*>(dst)+ofs, reinterpret_cast<u8*>(src)+ofs, sizeof(BTreeNode)-ofs);
+      memcpy(reinterpret_cast<u8*>(dst)+ofs, reinterpret_cast<u8*>(src)+ofs, sizeof(BTreeNode)-ofs);
    }
 
    void compactify()
@@ -1201,7 +1626,7 @@ struct BTreeNode : public BTreeNodeHeader {
       copyKeyValueRange(&tmp, 0, 0, count);
       right->copyKeyValueRange(&tmp, count, 0, right->count);
       PID pid = bm->toPID(this);
-      local_memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
+      memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
       parent->removeSlot(slotId);
       tmp.makeHint();
       tmp.nextLeafNode = right->nextLeafNode;
@@ -1225,8 +1650,8 @@ struct BTreeNode : public BTreeNodeHeader {
       spaceUsed += space;
       slot[slotId].offset = dataOffset;
       assert(getKey(slotId) >= reinterpret_cast<u8*>(&slot[slotId]));
-      local_memcpy(getKey(slotId), key, keyLen);
-      local_memcpy(getPayload(slotId).data(), payload.data(), payload.size());
+      memcpy(getKey(slotId), key, keyLen);
+      memcpy(getPayload(slotId).data(), payload.data(), payload.size());
    }
 
    void copyKeyValueRange(BTreeNode* dst, u16 dstSlot, u16 srcSlot, unsigned srcCount)
@@ -1240,7 +1665,7 @@ struct BTreeNode : public BTreeNodeHeader {
             dst->spaceUsed += space;
             dst->slot[dstSlot + i].offset = dst->dataOffset;
             u8* key = getKey(srcSlot + i) + diff;
-            local_memcpy(dst->getKey(dstSlot + i), key, space);
+            memcpy(dst->getKey(dstSlot + i), key, space);
             dst->slot[dstSlot + i].head = head(key, newKeyLen);
             dst->slot[dstSlot + i].keyLen = newKeyLen;
             dst->slot[dstSlot + i].payloadLen = slot[srcSlot + i].payloadLen;
@@ -1257,8 +1682,8 @@ struct BTreeNode : public BTreeNodeHeader {
    {
       unsigned fullLen = slot[srcSlot].keyLen + prefixLen;
       u8 key[fullLen];
-      local_memcpy(key, getPrefix(), prefixLen);
-      local_memcpy(key+prefixLen, getKey(srcSlot), slot[srcSlot].keyLen);
+      memcpy(key, getPrefix(), prefixLen);
+      memcpy(key+prefixLen, getKey(srcSlot), slot[srcSlot].keyLen);
       dst->storeKeyValue(dstSlot, {key, fullLen}, getPayload(srcSlot));
    }
 
@@ -1269,7 +1694,7 @@ struct BTreeNode : public BTreeNodeHeader {
       spaceUsed += key.size();
       fk.offset = dataOffset;
       fk.len = key.size();
-      local_memcpy(ptr() + dataOffset, key.data(), key.size());
+      memcpy(ptr() + dataOffset, key.data(), key.size());
    }
 
    void setFences(span<u8> lower, span<u8> upper)
@@ -1301,7 +1726,7 @@ struct BTreeNode : public BTreeNodeHeader {
          parent->upperInnerNode = newNode.pid;
       } else {
          assert(parent->getChild(oldParentSlot) == leftPID);
-         local_memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
+         memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
       }
       parent->insertInPage(sep, {reinterpret_cast<u8*>(&leftPID), sizeof(PID)});
 
@@ -1379,8 +1804,8 @@ struct BTreeNode : public BTreeNodeHeader {
 
    void getSep(u8* sepKeyOut, SeparatorInfo info)
    {
-      local_memcpy(sepKeyOut, getPrefix(), prefixLen);
-      local_memcpy(sepKeyOut + prefixLen, getKey(info.slot + info.isTruncated), info.len - prefixLen);
+      memcpy(sepKeyOut, getPrefix(), prefixLen);
+      memcpy(sepKeyOut + prefixLen, getKey(info.slot + info.isTruncated), info.len - prefixLen);
    }
 
    PID lookupInner(span<u8> key)
@@ -1437,7 +1862,7 @@ struct BTree {
                return -1;
 
             // key found, copy payload
-            local_memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
+            memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
             return node->slot[pos].payloadLen;
          } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
@@ -1698,8 +2123,8 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
       tree.scanAsc({k, l}, [&](BTreeNode& node, unsigned slot) {
-         local_memcpy(kk, node.getPrefix(), node.prefixLen);
-         local_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         memcpy(kk, node.getPrefix(), node.prefixLen);
+         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
@@ -1717,8 +2142,8 @@ struct vmcacheAdapter
             if (!exactMatch)
                return true;
          }
-         local_memcpy(kk, node.getPrefix(), node.prefixLen);
-         local_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         memcpy(kk, node.getPrefix(), node.prefixLen);
+         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
@@ -1776,9 +2201,9 @@ struct vmcacheAdapter
       u64 cnt = 0;
       u8 kk[Record::maxFoldLength()];
       tree.scanAsc({k, sizeof(Integer)}, [&](BTreeNode& node, unsigned slot) {
-         local_memcpy(kk, node.getPrefix(), node.prefixLen);
-         local_memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
-         if (local_memcmp(k, kk, sizeof(Integer))!=0)
+         memcpy(kk, node.getPrefix(), node.prefixLen);
+         memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
+         if (custom_memcmp(k, kk, sizeof(Integer))!=0)
             return false;
          cnt++;
          return true;
@@ -1827,6 +2252,7 @@ int main(int argc, char** argv) {
    }*/
 
    unsigned nthreads = envOr("THREADS", 1);
+   initRNG(nthreads);
    /*constexpr u64 N = 200000;
     auto start = chrono::high_resolution_clock::now();
     parallel_for(0, N*nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
@@ -1856,15 +2282,11 @@ int main(int argc, char** argv) {
          float rmb = (bm->readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm->writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         double prog_d = (double) prog;
-         double memcpy = (double)acc_memcpy.exchange(0);
-         double memcmp = (double)acc_memcmp.exchange(0);
-         double avg_memcpy = memcpy/prog_d;
-         double avg_memcmp = memcmp/prog_d;
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << "," << avg_memcpy << "," << avg_memcmp << endl;
-      }
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;//avg_memcpy << "," << avg_memcmp << endl;
+      }  
       keepRunning = false;
    };
+
 
    if (isRndread) {
       BTree bt;
@@ -1873,41 +2295,60 @@ int main(int argc, char** argv) {
       {
          // insert
          parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            //bm->registerThread();
+            bm->registerThread();
             //workerThreadId = worker;
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
-               local_memcpy(payload.data(), k1, sizeof(u64));
+               memcpy(payload.data(), k1, sizeof(u64));
                bt.insert({k1, sizeof(KeyType)}, payload, worker);
             }
-            //bm->forgetThread();
+            bm->forgetThread();
          });
       }
       cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
+      /*u64 c = 10'000'000'000;
+      vector<u64> v;
+      u64 start = rdtsc();
+      for(u64 cnt=0; cnt<c; cnt++){
+          union { u64 v1; u8 k1[sizeof(u64)]; };
+          v1 = __builtin_bswap64(cnt%n);
+          //v.push_back(RandomGenerator::getRand<u64>(0, n));
+          
+          array<u8, 120> payload;
+          bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
+            memcpy(payload.data(), p.data(), p.size());
+          }, 0);
+          assert(succ);
+          assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
+      }
+      u64 stop = rdtsc();
+      diff_time = stop-start;
+      cout << "Avg cycles lookup: " << (double)diff_time / c << endl;
+      return 0;*/
 
       bm->readCount = 0;
       bm->writeCount = 0;
-      acc_memcpy.store(0);
-      acc_memcmp.store(0);
+      //acc_memcpy.store(0);
+      //acc_memcmp.store(0);
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         //bm->registerThread();
+         bm->registerThread();
          //workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
          while (keepRunning.load()) {
             union { u64 v1; u8 k1[sizeof(u64)]; };
-            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n, worker));
 
             array<u8, 120> payload;
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-               local_memcpy(payload.data(), p.data(), p.size());
+               memcpy(payload.data(), p.data(), p.size());
             }, worker);
             assert(succ);
-            assert(local_memcmp(k1, payload.data(), sizeof(u64))==0);
+            assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
 
             cnt++;
             u64 stop = rdtsc();
@@ -1918,11 +2359,10 @@ int main(int argc, char** argv) {
             }
          }
          txProgress += cnt;
-         //bm->forgetThread();
+         bm->forgetThread();
       });
 
       statThread.join();
-      print_maps();
       return 0;
    }
 
@@ -1948,18 +2388,20 @@ int main(int argc, char** argv) {
       tpcc.loadWarehouse(0);
 
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         //bm->registerThread();
+         bm->registerThread();
          uint32_t tpcchistorycounter = 0;
          //workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
+            //printf("%lu: %u\n", worker, w_id);
             tpcc.loadStock(w_id, worker);
             tpcc.loadDistrinct(w_id, worker);
             for (Integer d_id = 1; d_id <= 10; d_id++) {
+               //printf("\t%u\n", d_id);
                tpcc.loadCustomer(w_id, d_id, worker, &tpcchistorycounter, worker);
                tpcc.loadOrders(w_id, d_id, worker);
             }
          }
-         //bm->forgetThread();
+         bm->forgetThread();
       });
    }
    cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -1971,13 +2413,13 @@ int main(int argc, char** argv) {
    //prof::config _config = { std::chrono::milliseconds(1) };
    //prof::start_sampler(_config);
    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      //bm->registerThread();
+      bm->registerThread();
       uint32_t tpcchistorycounter = 0;
       //workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
-         int w_id = tpcc.urand(1, warehouseCount); // wh crossing
+         int w_id = tpcc.urand(1, warehouseCount, worker); // wh crossing
          tpcc.tx(w_id, worker, &tpcchistorycounter, worker);
          cnt++;
          u64 stop = rdtsc();
@@ -1988,13 +2430,14 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
-      //bm->forgetThread();
+      bm->forgetThread();
    });
    //prof::stop_sampler();
 
    statThread.join();
+   //cout << "Avg cycles memcmp: " << (double)acc_time / acc_count << endl;
    cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-   print_maps();
+   //print_maps();
 
    return 0;
 }

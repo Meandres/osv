@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <vector>
 
 class MersenneTwister
 {
@@ -18,27 +19,33 @@ class MersenneTwister
    uint64_t rnd();
 };
 
-static thread_local MersenneTwister mt_generator;
+static std::vector<MersenneTwister> mt_generators;
+
+void initRNG(int nthreads){
+    for(int i=0; i<nthreads; i++){
+        mt_generators.push_back(MersenneTwister());
+    }
+}
 
 class RandomGenerator
 {
   public:
    // ATTENTION: open interval [min, max)
-   static u64 getRandU64(u64 min, u64 max)
+   static u64 getRandU64(u64 min, u64 max, u64 tid)
    {
-      u64 rand = min + (mt_generator.rnd() % (max - min));
+      u64 rand = min + (mt_generators[tid].rnd() % (max - min));
       assert(rand < max);
       assert(rand >= min);
       return rand;
    }
-   static u64 getRandU64() { return mt_generator.rnd(); }
+   static u64 getRandU64(u64 tid) { return mt_generators[tid].rnd(); }
    template <typename T>
-   static inline T getRand(T min, T max)
+   static inline T getRand(T min, T max, u64 tid)
    {
-      u64 rand = getRandU64(min, max);
+      u64 rand = getRandU64(min, max, tid);
       return static_cast<T>(rand);
    }
-   static void getRandString(u8* dst, u64 size);
+   static void getRandString(u8* dst, u64 size, u64 tid);
 };
 
 static std::atomic<u64> mt_counter = 0;
@@ -87,10 +94,10 @@ uint64_t MersenneTwister::rnd()
    return x;
 }
 // -------------------------------------------------------------------------------------
-void RandomGenerator::getRandString(u8* dst, u64 size)
+void RandomGenerator::getRandString(u8* dst, u64 size, u64 tid)
 {
    for (u64 t_i = 0; t_i < size; t_i++) {
-      dst[t_i] = getRand(48, 123);
+      dst[t_i] = getRand(48, 123, tid);
    }
 }
 // -------------------------------------------------------------------------------------

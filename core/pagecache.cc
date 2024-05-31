@@ -675,7 +675,7 @@ TRACEPOINT(trace_access_scanner, "scanned=%u, cleared=%u, %%cpu=%g", unsigned, u
 class access_scanner {
     static constexpr double _max_cpu = 20;
     static constexpr double _min_cpu = 0.1;
-    static constexpr unsigned _freq = 1000;
+    static constexpr unsigned _freq = 1000; // this causes a TLB flush very frequently. Can it be fixed or do we need to use ramfs ?
     double _cpu = _min_cpu;
     std::unique_ptr<sched::thread> _thread;
 public:

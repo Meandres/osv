@@ -1069,7 +1069,6 @@ objects += core/mempool.o
 objects += core/alloctracker.o
 objects += core/printf.o
 objects += core/sampler.o
-#objects += core/fast_string_op.o
 
 objects += linux.o
 objects += core/commands.o
@@ -1771,8 +1770,6 @@ musl += string/memchr.o
 musl += string/memcmp.o
 libc += string/memcpy.o
 libc_to_hide += string/memcpy.o
-libc += string/fast_memcmp.o
-$(out)/libc/string/fast_memcmp.o: CFLAGS += -O3 -march=native
 musl += string/memmem.o
 musl += string/mempcpy.o
 musl += string/memrchr.o

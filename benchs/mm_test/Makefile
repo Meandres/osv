@@ -4,7 +4,7 @@ linux-mmtest:
 osv-mmtest:
 src= ../..
 CXXFLAGS = -g -O3 -DNDEBUG -DCONF_debug_memory=0 -fnon-call-exceptions -fasynchronous-unwind-tables -fPIC -shared -DOSV
-CXXFLAGS += -I $(src)/include -I $(src) -I $(src)/arch/common -I $(src)/arch/x86
+CXXFLAGS += -I $(src)/include -I $(src) -I $(src)/arch/common -I $(src)/arch/x86 -mavx -mavx2
 
 osv-mmtest: mm_test.cc
 	$(CXX) $(CXXFLAGS) mm_test.cc -o mm_test

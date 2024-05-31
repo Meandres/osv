@@ -204,7 +204,12 @@ CacheManager::CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch,
     handlers.push_back(&default_allocate);
     handlers.push_back(&default_evict);
 
-    cout << "MMIO Region initialized at "<< virtMem <<" with virtmem size : " << virtSize/gb << " GB, physmem size : " << physSize/gb << " GB, max threads : " << n_threads << endl;
+    cout << "MMIO Region initialized at "<< virtMem <<" with virtmem size : " << virtSize/gb << " GB, physmem size : " << physSize/gb << " GB, max threads : " << n_threads;
+    if(explicit_control)
+        cout << ", explicit control";
+    else
+        cout << ", page fault control";
+    cout <<endl;
 }
 
 CacheManager::~CacheManager(){};
