@@ -280,6 +280,8 @@ inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
 // int createMMAPRegion(void* start, size_t size, void* file, size_t size);
 CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int nb_threads, int batch, bool ex_cont);
 void destroyMMIORegion(CacheManager* cache);
+extern __thread int tls_in_kernel;
+void increment_local_kernel_tls();
 
 /*
 // Base-level primitives

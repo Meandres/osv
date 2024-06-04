@@ -28,6 +28,12 @@
 
 using namespace std;
 
+__thread int tls_in_kernel = 0;
+static __thread int local_tls_kernel = 0;
+void increment_local_kernel_tls(){
+    ++local_tls_kernel;
+}
+
 TRACEPOINT(trace_cache_pf, "");
 TRACEPOINT(trace_cache_pf_ret, "");
 TRACEPOINT(trace_cache_evict, "");

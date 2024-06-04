@@ -20,6 +20,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <osv/cache.hh>
 
 __thread int var_tls;
 int var_global;
@@ -46,18 +47,18 @@ void parallel_for(uint64_t nthreads, Fn fn) {
         t.join();
 }
 
+uint64_t envOr(const char* env, uint64_t value) {
+   if (getenv(env))
+      return atof(getenv(env));
+   return value;
+}
+
 int main()
 {
-    #ifdef PIC
-    printf("PIC mode\n");
-    #endif
-    #ifdef PIE
-    printf("PIE mode\n");
-    #endif
-    constexpr uint64_t N = 1 000 000 000 000;
+    constexpr uint64_t N = 100000000;
 
-    std::cout << "nthreads;var;__thread" << std::endl;
-    // 1 thread
+    std::cout << "nthreads;__thread" << std::endl;
+    /*// 1 thread
     std::cout << "1;";
     auto start = std::chrono::system_clock::now();
     for (int i = 0; i < N; i++) {
@@ -77,7 +78,57 @@ int main()
     }
     end = std::chrono::system_clock::now();
     sec = end - start;
+    std::cout << (sec.count() / N / 1e-9) << "\n";*/
+    uint64_t nthreads = envOr("THREADS", 1);
+        auto start = std::chrono::system_clock::now();
+        parallel_for(nthreads, [&](uint64_t worker) {
+            int local_var;
+            for (int i = 0; i < N; i++) {
+                // To force gcc to not optimize this loop away
+                asm volatile("" : : : "memory");
+                ++var_tls;
+            }
+        }); 
+        auto end = std::chrono::system_clock::now();
+        std::chrono::duration<double> sec = end - start;
+        std::cout << (sec.count() / N / 1e-9) << "\n";
+
+    start = std::chrono::system_clock::now();
+    parallel_for(nthreads, [&](uint64_t worker) {
+        for (int i = 0; i < N; i++) {
+            // To force gcc to not optimize this loop away
+            asm volatile("" : : : "memory");
+            ++tls_in_kernel;
+        }
+    }); 
+    end = std::chrono::system_clock::now();
+    sec = end - start;
     std::cout << (sec.count() / N / 1e-9) << "\n";
+        
+    start = std::chrono::system_clock::now();
+    parallel_for(nthreads, [&](uint64_t worker) {
+        for (int i = 0; i < N; i++) {
+            // To force gcc to not optimize this loop away
+            asm volatile("" : : : "memory");
+            increment_local_kernel_tls();
+        }
+    }); 
+    end = std::chrono::system_clock::now();
+    sec = end - start;
+    std::cout << (sec.count() / N / 1e-9) << "\n";
+
+    start = std::chrono::system_clock::now();
+    parallel_for(nthreads, [&](uint64_t worker) {
+        for (int i = 0; i < N; i++) {
+            asm volatile(""::: "memory");
+            volatile std::thread::id tid = std::this_thread::get_id();
+        }
+    }); 
+    end = std::chrono::system_clock::now();
+    sec = end - start;
+    std::cout << (sec.count() / N / 1e-9) << "\n";
+
+    return 0;
     
     // 4, 8, 16, 32 and 64 threads
     for (int nthreads=4; nthreads<=64; nthreads*=2){
