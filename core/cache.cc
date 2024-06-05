@@ -28,11 +28,7 @@
 
 using namespace std;
 
-__thread int tls_in_kernel = 0;
-static __thread int local_tls_kernel = 0;
-void increment_local_kernel_tls(){
-    ++local_tls_kernel;
-}
+__thread uint64_t workerThreadId __attribute__ ((tls_model ("initial-exec"))) = 0;
 
 TRACEPOINT(trace_cache_pf, "");
 TRACEPOINT(trace_cache_pf_ret, "");

@@ -549,20 +549,6 @@ int main(int argc, char** argv){
         for(int i=0; i<repetitions; i++){
             uint64_t start = rdtsc();
             for(volatile uint64_t j = 0; j<nb_op; j++){
-                acc += memcmp(dest, og, cmpSize);
-            }
-            uint64_t stop = rdtsc();
-            acc_time += (stop-start);
-        }
-        cout << "memcmp_default," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc <<endl;
-    }
-   
-    acc = 0;
-    for(int cmpSize: sizes_memcmp){
-        acc_time=0;
-        for(int i=0; i<repetitions; i++){
-            uint64_t start = rdtsc();
-            for(volatile uint64_t j = 0; j<nb_op; j++){
                 acc += rte_memcmp(dest, og, cmpSize);
             }
             uint64_t stop = rdtsc();
@@ -570,6 +556,48 @@ int main(int argc, char** argv){
         }
         cout << "memcmp_dpdk," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc << endl;
     }
+    #endif
+    
+    #ifdef OSV
+    acc = 0;
+    for(int cmpSize: sizes_memcmp){
+        acc_time=0;
+        for(int i=0; i<repetitions; i++){
+            uint64_t start = rdtsc();
+            //auto start = chrono::system_clock::now();
+            for(volatile uint64_t j = 0; j<nb_op; j++){
+                acc += rte_memcmp(dest, og, cmpSize);
+            }
+            //auto stop = chrono::system_clock::now();
+            //chrono::duration<double> sec = stop - start;
+            //acc_time += sec.count();
+            uint64_t stop = rdtsc();
+            acc_time += (stop-start);
+        }
+        //cout << "glibc on osv," << cmpSize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << ",\t" <<acc << endl;
+        cout << "rte_memcmp," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc << endl;
+    }
 
+    acc = 0;
+    uint16_t *sse_og = (uint16_t*)og;
+    uint16_t *sse_dest = (uint16_t*)dest;
+    for(int cmpSize: sizes_memcmp){
+        acc_time=0;
+        for(int i=0; i<repetitions; i++){
+            uint64_t start = rdtsc();
+            //auto start = chrono::system_clock::now();
+            for(volatile uint64_t j = 0; j<nb_op; j++){
+                acc += __sse_memcmp(sse_dest, sse_og, cmpSize);
+            }
+            //auto stop = chrono::system_clock::now();
+            //chrono::duration<double> sec = stop - start;
+            //acc_time += sec.count();
+            uint64_t stop = rdtsc();
+            acc_time += (stop-start);
+        }
+        //cout << "glibc on osv," << cmpSize << "," << system << "," << (double)(acc_time/repetitions)/nb_op/1e-9 << ",\t" <<acc << endl;
+        cout << "glibc," << cmpSize << "," << system << "," << static_cast<double>(acc_time)/(repetitions*nb_op) << "," << acc << endl;
+    }
+    #endif
     return 0;
 }

@@ -24,7 +24,7 @@
 #include <osv/cache.hh>
 #endif
 
-__thread int var_tls __attribute__ ((tls_model ("initial-exec"))) = 0;
+__thread int* var_tls __attribute__ ((tls_model ("initial-exec"))) = 0;
 int var_global;
 
 int stick_this_thread_to_core(int core_id) {
@@ -62,37 +62,24 @@ int main()
     uint64_t nthreads = envOr("THREADS", 1);
         auto start = std::chrono::system_clock::now();
         parallel_for(nthreads, [&](uint64_t worker) {
-            int local_var;
+            var_tls = (int*)malloc(sizeof(int));
             for (int i = 0; i < N; i++) {
                 // To force gcc to not optimize this loop away
                 asm volatile("" : : : "memory");
-                ++var_tls;
+                ++(*var_tls);
             }
         }); 
         auto end = std::chrono::system_clock::now();
         std::chrono::duration<double> sec = end - start;
         std::cout << (sec.count() / N / 1e-9) << "\n";
 
-    #ifdef OSV
     start = std::chrono::system_clock::now();
     parallel_for(nthreads, [&](uint64_t worker) {
-        for (int i = 0; i < N; i++) {
-            // To force gcc to not optimize this loop away
-            asm volatile("" : : : "memory");
-            ++tls_in_kernel;
-        }
-    }); 
-    end = std::chrono::system_clock::now();
-    sec = end - start;
-    std::cout << (sec.count() / N / 1e-9) << "\n";
-    #endif
-
-    start = std::chrono::system_clock::now();
-    parallel_for(nthreads, [&](uint64_t worker) {
+        sched::tid = worker;
         volatile int acc;
         for (int i = 0; i < N; i++) {
             asm volatile(""::: "memory");
-            acc = std::hash<std::thread::id>(std::this_thread::get_id());
+            acc += sched::tid;
         }
     }); 
     end = std::chrono::system_clock::now();

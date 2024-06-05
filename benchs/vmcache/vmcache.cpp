@@ -27,7 +27,6 @@
 //#include "exmap.h"
 #include <osv/cache.hh>
 #include <osv/sampler.hh>
-//#include <osv/memcmp.hh>
 
 //__thread uint16_t workerThreadId = 0;
 //__thread int32_t tpcchistorycounter = 0;
@@ -1486,8 +1485,7 @@ struct BTreeNode : public BTreeNodeHeader {
       //u64 m0 = rdtsc();
 
       // check prefix
-      int cmp = custom_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
-      //u64 m1 = rdtsc();
+      int cmp = rte_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
       if (cmp < 0) // key is less than prefix
          return 0;
       if (cmp > 0) // key is greater than prefix
@@ -1516,7 +1514,7 @@ struct BTreeNode : public BTreeNodeHeader {
          } else if (keyHead > slot[mid].head) {
             lower = mid + 1;
          } else { // head is equal, check full key
-            int cmp = lowerBound_custom_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
+            int cmp = rte_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
             if (cmp < 0) {
                upper = mid;
             } else if (cmp > 0) {
@@ -2203,7 +2201,7 @@ struct vmcacheAdapter
       tree.scanAsc({k, sizeof(Integer)}, [&](BTreeNode& node, unsigned slot) {
          memcpy(kk, node.getPrefix(), node.prefixLen);
          memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
-         if (custom_memcmp(k, kk, sizeof(Integer))!=0)
+         if (rte_memcmp(k, kk, sizeof(Integer))!=0)
             return false;
          cnt++;
          return true;
@@ -2241,30 +2239,8 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 }
 
 int main(int argc, char** argv) {
-   /*if (bm->useExmap) {
-      struct sigaction action;
-      action.sa_flags = SA_SIGINFO;
-      action.sa_sigaction = handleSEGFAULT;
-      if (sigaction(SIGSEGV, &action, NULL) == -1) {
-         perror("sigusr: sigaction");
-         exit(1);
-      }
-   }*/
-
    unsigned nthreads = envOr("THREADS", 1);
    initRNG(nthreads);
-   /*constexpr u64 N = 200000;
-    auto start = chrono::high_resolution_clock::now();
-    parallel_for(0, N*nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-        workerThreadId = worker;
-        for (u64 i=begin; i<end; i++) {
-            bm->fixX(i);
-        }
-    });
-    auto end = chrono::high_resolution_clock::now();
-    chrono::duration<double> sec = end-start;
-    cout << "linux,explicit_control," << nthreads << "," << (sec.count()/ (N*nthreads) / 1e-9)<< endl;
-    return 0;*/
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -2308,30 +2284,9 @@ int main(int argc, char** argv) {
          });
       }
       cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-      /*u64 c = 10'000'000'000;
-      vector<u64> v;
-      u64 start = rdtsc();
-      for(u64 cnt=0; cnt<c; cnt++){
-          union { u64 v1; u8 k1[sizeof(u64)]; };
-          v1 = __builtin_bswap64(cnt%n);
-          //v.push_back(RandomGenerator::getRand<u64>(0, n));
-          
-          array<u8, 120> payload;
-          bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-            memcpy(payload.data(), p.data(), p.size());
-          }, 0);
-          assert(succ);
-          assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
-      }
-      u64 stop = rdtsc();
-      diff_time = stop-start;
-      cout << "Avg cycles lookup: " << (double)diff_time / c << endl;
-      return 0;*/
 
       bm->readCount = 0;
       bm->writeCount = 0;
-      //acc_memcpy.store(0);
-      //acc_memcmp.store(0);
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
@@ -2348,7 +2303,7 @@ int main(int argc, char** argv) {
                memcpy(payload.data(), p.data(), p.size());
             }, worker);
             assert(succ);
-            assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
+            assert(rte_memcmp(k1, payload.data(), sizeof(u64))==0);
 
             cnt++;
             u64 stop = rdtsc();
@@ -2388,9 +2343,9 @@ int main(int argc, char** argv) {
       tpcc.loadWarehouse(0);
 
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         bm->registerThread();
+         //bm->registerThread();
          uint32_t tpcchistorycounter = 0;
-         //workerThreadId = worker;
+         workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             //printf("%lu: %u\n", worker, w_id);
             tpcc.loadStock(w_id, worker);
@@ -2401,7 +2356,7 @@ int main(int argc, char** argv) {
                tpcc.loadOrders(w_id, d_id, worker);
             }
          }
-         bm->forgetThread();
+         //bm->forgetThread();
       });
    }
    cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -2412,10 +2367,10 @@ int main(int argc, char** argv) {
 
    //prof::config _config = { std::chrono::milliseconds(1) };
    //prof::start_sampler(_config);
-   parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      bm->registerThread();
+    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      //bm->registerThread();
       uint32_t tpcchistorycounter = 0;
-      //workerThreadId = worker;
+      workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
@@ -2430,7 +2385,7 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
-      bm->forgetThread();
+      //bm->forgetThread();
    });
    //prof::stop_sampler();
 

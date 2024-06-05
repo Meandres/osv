@@ -33,6 +33,9 @@
 #include <mutex>
 
 #ifndef VMCACHE
+
+extern __thread uint64_t workerThreadId __attribute__ ((tls_model ("initial-exec")));
+
 typedef u64 PID; // page id type
 extern std::atomic<u64> evictCount;
 
@@ -246,6 +249,7 @@ class CacheManager {
         lockFreeIDList.clear(std::memory_order_release);
     }
 	inline int getTID(){
+        //return workerThreadId;
 		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
         auto search = threadMap.find(tid);
         if (search != threadMap.end())
@@ -280,8 +284,6 @@ inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
 // int createMMAPRegion(void* start, size_t size, void* file, size_t size);
 CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int nb_threads, int batch, bool ex_cont);
 void destroyMMIORegion(CacheManager* cache);
-extern __thread int tls_in_kernel;
-void increment_local_kernel_tls();
 
 /*
 // Base-level primitives
