@@ -20,9 +20,11 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#ifdef OSV
 #include <osv/cache.hh>
+#endif
 
-__thread int var_tls;
+__thread int var_tls __attribute__ ((tls_model ("initial-exec"))) = 0;
 int var_global;
 
 int stick_this_thread_to_core(int core_id) {
@@ -57,28 +59,6 @@ int main()
 {
     constexpr uint64_t N = 100000000;
 
-    std::cout << "nthreads;__thread" << std::endl;
-    /*// 1 thread
-    std::cout << "1;";
-    auto start = std::chrono::system_clock::now();
-    for (int i = 0; i < N; i++) {
-        // To force gcc to not optimize this loop away
-        asm volatile("" : : : "memory");
-        ++var_global;
-    }
-    auto end = std::chrono::system_clock::now();
-    std::chrono::duration<double> sec = end - start;
-    std::cout << (sec.count() / N / 1e-9) << ";";
-
-    start = std::chrono::system_clock::now();
-    for (int i = 0; i < N; i++) {
-        // To force gcc to not optimize this loop away
-        asm volatile("" : : : "memory");
-        ++var_tls;
-    }
-    end = std::chrono::system_clock::now();
-    sec = end - start;
-    std::cout << (sec.count() / N / 1e-9) << "\n";*/
     uint64_t nthreads = envOr("THREADS", 1);
         auto start = std::chrono::system_clock::now();
         parallel_for(nthreads, [&](uint64_t worker) {
@@ -93,6 +73,7 @@ int main()
         std::chrono::duration<double> sec = end - start;
         std::cout << (sec.count() / N / 1e-9) << "\n";
 
+    #ifdef OSV
     start = std::chrono::system_clock::now();
     parallel_for(nthreads, [&](uint64_t worker) {
         for (int i = 0; i < N; i++) {
@@ -104,24 +85,14 @@ int main()
     end = std::chrono::system_clock::now();
     sec = end - start;
     std::cout << (sec.count() / N / 1e-9) << "\n";
-        
-    start = std::chrono::system_clock::now();
-    parallel_for(nthreads, [&](uint64_t worker) {
-        for (int i = 0; i < N; i++) {
-            // To force gcc to not optimize this loop away
-            asm volatile("" : : : "memory");
-            increment_local_kernel_tls();
-        }
-    }); 
-    end = std::chrono::system_clock::now();
-    sec = end - start;
-    std::cout << (sec.count() / N / 1e-9) << "\n";
+    #endif
 
     start = std::chrono::system_clock::now();
     parallel_for(nthreads, [&](uint64_t worker) {
+        volatile int acc;
         for (int i = 0; i < N; i++) {
             asm volatile(""::: "memory");
-            volatile std::thread::id tid = std::this_thread::get_id();
+            acc = std::hash<std::thread::id>(std::this_thread::get_id());
         }
     }); 
     end = std::chrono::system_clock::now();
