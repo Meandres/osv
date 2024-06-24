@@ -373,6 +373,14 @@ else
 $(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w
 endif
 
+ifeq ($(conf_nvme_fail), 1)
+NVME_CXXFLAGS = -DNVME_FAIL -DNVME_FAIL_TYPE=$(conf_nvme_fail_type) -DNVME_FAIL_BITFLIP \
+				-DNVME_FAIL_NTH=$(conf_nvme_fail_nth) -DNVME_FAIL_BLOCK=$(conf_nvme_fail_block) \
+				-DNVME_FAIL_TIMING=$(conf_nvme_fail_timing)	-DNVME_FAIL_TIMING_RND \
+				-DNVME_FAIL_TIMING_RND_UPLIM=$(conf_nvme_fail_timing_rnd_uplim)
+$(out)/drivers/nvme.o: CXXFLAGS += $(NVME_CXXFLAGS)
+endif
+
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/sys
 $(out)/bsd/%.o: INCLUDES += -isystem bsd/
 # for machine/
@@ -1103,7 +1111,7 @@ objects += core/osv_execve.o
 objects += core/osv_c_wrappers.o
 objects += core/options.o
 
-objects += cumultools/vmcache.o
+#objects += cumultools/vmcache.o
 
 #include $(src)/libc/build.mk:
 libc =

@@ -114,23 +114,23 @@ struct TPCCWorkload
    inline Integer getItemID(u64 tid)
    {
       // OL_I_ID_C
-      return nurand(8191, 1, ITEMS_NO, OL_I_ID_C, tid);
+      return nurand(8191, 1, ITEMS_NO, tid, OL_I_ID_C);
    }
    inline Integer getCustomerID(u64 tid)
    {
       // C_ID_C
-      return nurand(1023, 1, 3000, C_ID_C, tid);
+      return nurand(1023, 1, 3000, tid, C_ID_C);
       // return urand(1, 3000);
    }
    inline Integer getNonUniformRandomLastNameForRun(u64 tid)
    {
       // C_LAST_RUN_C
-      return nurand(255, 0, 999, C_LAST_RUN_C, tid);
+      return nurand(255, 0, 999, tid, C_LAST_RUN_C);
    }
    inline Integer getNonUniformRandomLastNameForLoad(u64 tid)
    {
       // C_LAST_LOAD_C
-      return nurand(255, 0, 999, C_LAST_LOAD_C, tid);
+      return nurand(255, 0, 999, tid, C_LAST_LOAD_C);
    }
    // -------------------------------------------------------------------------------------
    Timestamp currentTimestamp() { return 1; }

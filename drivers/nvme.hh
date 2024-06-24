@@ -870,6 +870,7 @@ unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc, void* buff, u6
 
 
 #define UNVME_TIMEOUT   60          ///< default timeout in seconds
+#define UNVME_SHORT_TIMEOUT 1
 #define UNVME_QSIZE     256         ///< default I/O queue size
 
 

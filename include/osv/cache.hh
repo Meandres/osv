@@ -249,12 +249,12 @@ class CacheManager {
         lockFreeIDList.clear(std::memory_order_release);
     }
 	inline int getTID(){
-        //return workerThreadId;
-		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+        return workerThreadId;
+		/*int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
         auto search = threadMap.find(tid);
         if (search != threadMap.end())
             return search->second;
-        return -1;
+        return -1;*/
 	}
 };
 

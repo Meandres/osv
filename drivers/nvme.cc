@@ -63,11 +63,63 @@
 #include "drivers/ymap.hh"
 #include <sys/time.h>
 
+#include <atomic>
+
 // Static global variables
 static FILE*                log_fp = NULL;  ///< log file pointer
 static int                  log_count = 0;  ///< log open count
 static pthread_mutex_t      log_lock = PTHREAD_MUTEX_INITIALIZER; ///< log lock
 nvme_controller_reg_t* globalReg;
+
+#ifdef NVME_FAIL
+// count successful requests
+static std::atomic<int> failure_cnt = {0};
+inline void wait_us(nvme_queue_t* q, u64 us){
+    u64 endtsc = rdtsc() + us * (q->dev->rdtsec/100000);
+    while (rdtsc() < endtsc){}
+}
+
+inline u64 hash(int opc, u64 prp1, u64 slba, int nlb){
+    return rdtsc() + (prp1*opc & slba*nlb) + opc-nlb;
+}
+
+inline bool do_fail(nvme_queue_t* q, int opc, u64 prp1, u64 prp2, u64 slba, int nlb){
+    switch(NVME_FAIL_TYPE){
+        case 1: // simply flips a bit in the physical page  
+
+            break;
+        case 2: // instead of using rng, simply fail every nth operation. This include any operation.
+            if(NVME_FAIL_NTH == 0)
+                return false;
+            else{
+                if(failure_cnt.load(std::memory_order_relaxed) >= NVME_FAIL_NTH){
+                    failure_cnt.exchange(0, std::memory_order_relaxed);
+                    return true;
+                }
+                failure_cnt++;
+                return false;
+            }
+        case 3:
+            if(NVME_FAIL_BLOCK >= slba && NVME_FAIL_BLOCK < slba + nlb){
+                return true;
+            }
+            return false;
+        case 4:
+            wait_us(q, NVME_FAIL_TIMING);
+            return false;
+        case 5:
+            FATAL("Not yet implemented\n");
+        case 6:
+            u64 ttw = hash(opc, prp1, slba, nlb)%NVME_FAIL_TIMING_RND_UPLIM;
+            wait_us(q, ttw);
+            return false;
+    }
+    return false;
+}
+#else
+inline bool do_fail(nvme_queue_t* q, int opc, u64 prp1, u64 prp2, u64 slba, int nlb){ return false; }
+#endif
+
 /// IO descriptor debug print
 #define PDEBUG(fmt, arg...) //fprintf(stderr, fmt "\n", ##arg)
 
@@ -592,6 +644,9 @@ int nvme_cmd_vs(nvme_queue_t* q, int opc, u16 cid, int nsid,
 int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid,
                 u64 slba, int nlb, u64 prp1, u64 prp2)
 {
+    if(do_fail(ioq, opc, prp1, prp2, slba, nlb)){
+        return -1;
+    }
     nvme_command_rw_t* cmd = &ioq->sq[ioq->sq_tail].rw;
 
     memset(cmd, 0, sizeof (*cmd));
@@ -1379,6 +1434,9 @@ int unvme_do_free(const unvme_ns_t* ns, void* buf)
  */
 int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
 {
+    if(do_fail(desc->q->nvmeq, timeout, (u64)desc, (u64)desc, (u64)desc, timeout)){
+        return -1;
+    }
     if (desc->sentinel != desc)
         FATAL("bad IO descriptor");
 
@@ -1425,9 +1483,9 @@ unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc,
         int cid = unvme_submit_io(ns, desc, buf, slba, n);
         if (cid < 0) {
             // poll currently pending descriptor
-            int err = unvme_do_poll(desc, UNVME_TIMEOUT, NULL);
+            int err = unvme_do_poll(desc, UNVME_SHORT_TIMEOUT, NULL);
             if (err) {
-                if (err == -1) FATAL("q%d timeout", q->nvmeq->id);
+                if (err == -1) return NULL; //FATAL("q%d timeout", q->nvmeq->id);
                 else ERROR("q%d error %#x", q->nvmeq->id, err);
             }
         }
@@ -1629,7 +1687,7 @@ int unvme_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid,
     unvme_iod_t iod = unvme_acmd(ns, qid, opc, nsid, buf, bufsz, cdw10_15);
     if (iod) {
         sched_yield();
-        return unvme_apoll_cs(iod, UNVME_TIMEOUT, cqe_cs);
+        return unvme_apoll_cs(iod, UNVME_SHORT_TIMEOUT, cqe_cs);
     }
     return -1;
 }
@@ -1649,7 +1707,7 @@ int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb)
     unvme_iod_t iod = unvme_aread(ns, qid, buf, slba, nlb);
     if (iod) {
         sched_yield();
-        return unvme_apoll(iod, UNVME_TIMEOUT);
+        return unvme_apoll(iod, UNVME_SHORT_TIMEOUT);
     }
     return -1;
 }
@@ -1669,7 +1727,7 @@ int unvme_write(const unvme_ns_t* ns, int qid,
     unvme_iod_t iod = unvme_awrite(ns, qid, buf, slba, nlb);
     if (iod) {
         sched_yield();
-        return unvme_apoll(iod, UNVME_TIMEOUT);
+        return unvme_apoll(iod, UNVME_SHORT_TIMEOUT);
     }
     return -1;
 }
@@ -1730,7 +1788,7 @@ nvme::nvme(pci::device &dev)
    dev.set_command(command);
 
     const unvme_ns_t* ns = unvme_open();
-    if (!ns) exit(1);
+    while(!ns){ ns = unvme_open(); };
     printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
     printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
 
@@ -1751,7 +1809,6 @@ nvme::nvme(pci::device &dev)
        //double end = gettime();
        //printf("%llu us\n", (end-start)*1e6/repeat);
     }*/
-
 }
 
 void nvme::dump_config(void)
