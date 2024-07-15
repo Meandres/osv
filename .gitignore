@@ -64,3 +64,4 @@ benchs/tls_bench/tls_bench
 benchs/idle_test/idle_test
 benchs/vmcache/vmcache
 benchs/io_test/io_test
+benchs/omp_test/omp_test
