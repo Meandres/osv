@@ -60,6 +60,7 @@
 #include <osv/device.h>
 #include <osv/ioctl.h>
 #include <osv/contiguous_alloc.hh>
+#include <osv/mmu.hh>
 #include "drivers/ymap.hh"
 #include <sys/time.h>
 
@@ -997,6 +998,8 @@ static u64 unvme_map_dma(const unvme_ns_t* ns, void* buf, u64 bufsz)
 {
 #ifdef UNVME_IDENTITY_MAP_DMA
     //u64 addr = (u64)buf & dev->vfiodev.iovamask;
+    //TODO: this doesn't work for malloc-ed memory
+    // need to use this instead u64 addr = mmu::virt_to_phys_dynamic_phys(buf);
     u64 addr = walk(buf).phys<<12;
     assert(addr!=0);
 #else
@@ -1752,6 +1755,7 @@ vfio_dma_t* vfio_dma_alloc(size_t size)
       madvise(p->buf, size, MADV_NOHUGEPAGE);
       memset(p->buf, 0, size);
       //p->addr = mmu::virt_to_phys(p->buf) * 4096;
+      //p->addr = mmu::virt_to_phys_dynamic_phys(p->buf)*4096;
       //p->addr = (uintptr_t)p->buf;
       p->addr = walk(p->buf).phys * 4096;
    } else {

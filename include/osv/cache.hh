@@ -330,7 +330,7 @@ void handleFault(void* vma);
 void evict();
 void ioError();
 */
-//struct OLCRestartException{};
+struct OLCRestartException{};
 
 //extern CacheManager cache;
 #endif

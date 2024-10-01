@@ -1111,8 +1111,6 @@ objects += core/osv_execve.o
 objects += core/osv_c_wrappers.o
 objects += core/options.o
 
-#objects += cumultools/vmcache.o
-
 #include $(src)/libc/build.mk:
 libc =
 libc_to_hide =

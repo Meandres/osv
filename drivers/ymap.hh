@@ -46,6 +46,16 @@ inline void write_cr3(ulong r) {
     asm volatile ("mov %0, %%cr3" : : "r"(r)  : "memory");
 }
 
+inline ulong read_cr4() {
+    ulong r;
+    asm volatile ("mov %%cr4, %0" : "=r"(r));
+    return r;
+}
+
+inline void write_cr4(ulong r) {
+    asm volatile ("mov %0, %%cr4" : : "r"(r)  : "memory");
+}
+
 inline void invalidateTLB() {
    write_cr3(read_cr3());
 }

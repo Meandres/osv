@@ -6,6 +6,7 @@ COMMON += -O2 -fPIC -D __BSD_VISIBLE=1 -D _KERNEL=1
 CXXFLAGS = -std=gnu++11 $(COMMON)
 CFLAGS = $(COMMON)
 quiet = $(if $V, $1, @echo " $2"; $1)
+LDFLAGS += $(OSV_BUILD_PATH)/libosv.so
 
 module: $(module_out)/libtools.so $(module_out)/lsroute.so $(module_out)/ifconfig.so
 	@echo "/usr/lib/libtools.so: $(module_out)/libtools.so" > usr.manifest;

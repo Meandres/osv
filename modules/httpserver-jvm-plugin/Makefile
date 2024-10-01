@@ -11,7 +11,7 @@ CXXFLAGS  = -g -Wall -std=c++11 -fPIC $(INCLUDES) -O2 $(autodepend)
 src = $(shell readlink -f ../..)
 
 CODE_GEN_FROM_JSON := ../httpserver-api/json2code.py
-RM := /bin/rm
+RM := rm #/bin/rm
 
 ifndef ARCH
 	ARCH = x64

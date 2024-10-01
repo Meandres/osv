@@ -6,14 +6,21 @@
 #
 SRC = $(shell readlink -f ../..)
 
+RUNNING_IN_NIXOS= $(shell uname -v | grep NixOS)
+
 module:
-	$(SRC)/scripts/manifest_from_host.sh -l libssl.so.1.1 > usr.manifest
-	# From krb5-libs
-	$(SRC)/scripts/manifest_from_host.sh -l libgssapi_krb5.so.2 >> usr.manifest
-	# From libselinux
-	$(SRC)/scripts/manifest_from_host.sh -l libselinux.so.1 >> usr.manifest
-	# From xz-libs
-	$(SRC)/scripts/manifest_from_host.sh -l liblzma.so.5 >> usr.manifest
+		# THIS WORKS ONLY IN NIXOS
+		echo "/usr/lib/libssl.so.1.1: $(OPENSSL_DIR)/lib/libssl.so.1.1" > usr.manifest
+		echo "/usr/lib/libgssapi_krb5.so.2: $(KRB5_DIR)/lib/libgssapi_krb5.so.2" > usr.manifest
+		echo "/usr/lib/libselinux.so.1: $(SELINUX_DIR)/lib/libselinux.so" > usr.manifest
+		echo "/usr/lib/liblzma.so.5: $(XZ_DIR)/lib/liblzma.so.5" > usr.manifest
+		# $(SRC)/scripts/manifest_from_host.sh -l libssl.so.1.1 > usr.manifest
+		# From krb5-libs
+		# $(SRC)/scripts/manifest_from_host.sh -l libgssapi_krb5.so.2 >> usr.manifest
+		# From libselinux
+		# $(SRC)/scripts/manifest_from_host.sh -l libselinux.so.1 >> usr.manifest
+		# From xz-libs
+		# $(SRC)/scripts/manifest_from_host.sh -l liblzma.so.5 >> usr.manifest
 
 .PHONY: module
 

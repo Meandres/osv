@@ -18,9 +18,12 @@
 [submodule "musl_1.1.24"]
 	path = musl_1.1.24
 	url = https://github.com/osvunikernel/musl
-[submodule "bench/MemoryLatencyTest"]
-	path = bench/MemoryLatencyTest
-	url = https://github.com/ChipsandCheese/MemoryLatencyTest.git
 [submodule "benchs/MemoryLatencyTest"]
 	path = benchs/MemoryLatencyTest
 	url = https://github.com/Meandres/MemoryLatencyTest.git
+[submodule "ubpf"]
+	path = ubpf
+	url = git@github.com:iovisor/ubpf.git
+[submodule "modules/ubpf"]
+	path = modules/ubpf
+	url = git@github.com:iovisor/ubpf.git
