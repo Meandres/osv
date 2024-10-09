@@ -121,10 +121,14 @@ def make_cmd(cmdline, j, jobserver):
 
 def make_modules(modules, args):
     for module in modules:
-        if os.path.exists(os.path.join(module.local_path, 'Makefile')):
-            if subprocess.call(make_cmd('module', j=args.j, jobserver=args.jobserver_fds),
+        if os.path.exists(os.path.join(module.local_path, 'CMakeLists.txt')):
+            if subprocess.call("bash build.sh", shell=True, cwd=module.local_path):
+                raise Exception("cmake failed for "+ module.name)
+        else:
+            if os.path.exists(os.path.join(module.local_path, 'Makefile')):
+                if subprocess.call(make_cmd('module', j=args.j, jobserver=args.jobserver_fds),
                                shell=True, cwd=module.local_path):
-                raise Exception('make failed for ' + module.name)
+                    raise Exception('make failed for ' + module.name)
 
 def flatten_list(elememnts):
     if not elememnts:

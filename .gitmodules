@@ -27,3 +27,6 @@
 [submodule "modules/ubpf"]
 	path = modules/ubpf
 	url = git@github.com:iovisor/ubpf.git
+[submodule "benchs/sdbe"]
+	path = benchs/sdbe
+	url = https://github.com/Meandres/sdbe

@@ -826,7 +826,7 @@ bool check_expl_ctrl(const char* env){
 
 CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, check_expl_ctrl("EXPLICIT"));
 
-struct OLCRestartException {};
+//struct OLCRestartException {};
 
 template<class T>
 struct GuardO {

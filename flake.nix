@@ -43,7 +43,7 @@
               ncurses
               pax-utils # elf security library
               python3
-              python312Packages.requests
+              python311Packages.requests
               p11-kit # PKCS#11 loader
               qemu_full # hypervisor
               readline # interactive line editing
@@ -59,6 +59,11 @@
               libz
               boost175
               #glibc.static
+              unixODBC
+              numactl
+              python311Packages.numpy
+              python311Packages.pandas
+              python311Packages.matplotlib
             ];
 
             buildInputs = with pkgs; [
