@@ -390,6 +390,7 @@ int default_handleFault(CacheManager* cm, PID pid, int unused) {
             // this is due to TPCC allocating pages "before they are backed by storage"
             // 0 -> never resolved before, 1 -> resolved then evicted
         cm->readPage(pid);
+        printf("Read page\n");
     }
     if(cm->explicit_control)
         cm->residentSet.insert(pid);

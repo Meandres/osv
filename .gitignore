@@ -60,8 +60,10 @@ benchs/DBmockup/dbmockup_mod
 benchs/mm_test/mm_test
 benchs/cache_example/cache_example
 benchs/pf_test/pf_test
+benchs/pf_test/pf_test_linux
 benchs/tls_bench/tls_bench
 benchs/idle_test/idle_test
 benchs/vmcache/vmcache
 benchs/io_test/io_test
 benchs/omp_test/omp_test
+benchs/nvme_test/ioengine_unvme

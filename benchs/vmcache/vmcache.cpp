@@ -2343,9 +2343,9 @@ int main(int argc, char** argv) {
       tpcc.loadWarehouse(0);
 
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         //bm->registerThread();
+         bm->registerThread();
          uint32_t tpcchistorycounter = 0;
-         workerThreadId = worker;
+         //workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             //printf("%lu: %u\n", worker, w_id);
             tpcc.loadStock(w_id, worker);
@@ -2356,7 +2356,7 @@ int main(int argc, char** argv) {
                tpcc.loadOrders(w_id, d_id, worker);
             }
          }
-         //bm->forgetThread();
+         bm->forgetThread();
       });
    }
    cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
@@ -2366,11 +2366,11 @@ int main(int argc, char** argv) {
    thread statThread(statFn);
 
    //prof::config _config = { std::chrono::milliseconds(1) };
-   //prof::start_sampler(_config);
+    //prof::start_sampler(_config);
     parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      //bm->registerThread();
+      bm->registerThread();
       uint32_t tpcchistorycounter = 0;
-      workerThreadId = worker;
+      //workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
@@ -2385,7 +2385,7 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
-      //bm->forgetThread();
+      bm->forgetThread();
    });
    //prof::stop_sampler();
 

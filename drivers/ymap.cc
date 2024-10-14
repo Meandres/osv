@@ -1,5 +1,7 @@
 #include <drivers/ymap.hh>
 #include <osv/trace.hh> 
+#include <vector>
+#include <thread>
 
 TRACEPOINT(trace_ymap_map, "");
 TRACEPOINT(trace_ymap_map_ret, "");
@@ -16,8 +18,9 @@ Ymap::Ymap(u64 count, int tid, void* virt) {
     pageStolen = 0ULL;
 	list.reserve(count*1.5);
 	for(u64 i=0; i<count; i++){
-		memset(virt+i*pageSize, 0, pageSize);
-		list.push_back(walk(virt+i*pageSize).phys);
+		int* j = (int*)(virt+i*pageSize);
+        *j=0;
+		list.push_back(walk(j).phys);
 	}
 }
 
@@ -61,9 +64,20 @@ YmapBundle::YmapBundle(u64 pageCount, int n_threads){
 	void* virt = mmap(NULL, pageCount * pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	madvise(virt, pageCount * pageSize, MADV_NOHUGEPAGE);
 	u64 pagesPerThread = pageCount / n_threads;
+    std::vector<std::thread> threads;
 	for(int i=0;i<n_threads;i++){
-		ymapInterfaces.push_back(new Ymap(pagesPerThread, i, virt + i*pagesPerThread*pageSize));
+        threads.emplace_back([&, i]() {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(i, &cpuset);
+            pthread_t current_thread = pthread_self();
+            pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+		    ymapInterfaces.push_back(new Ymap(pagesPerThread, i, virt + i*pagesPerThread*pageSize));
+        });
 	}
+    for (auto& t: threads){
+        t.join();
+    }
 }
 
 bool YmapBundle::stealPages(int tid){

@@ -28,8 +28,8 @@ void generateRandPage(int tid, u64 pid){
     }
 }
 
-void updateRandomInt(int tid, void *start, u64 pageCount){
-    u64 page = rng(tid)%pageCount;
+void updateRandomInt(int tid, void *start, u64 pageCount, int pid){
+    u64 page = rng(tid)%pageCount; 
     int posInPage = rng(tid)%intPerPage;
     int increment = rng(tid);
     GuardX<Page> node(page);
@@ -103,7 +103,7 @@ int main(int argc, char** argv){
         }
         keepRunning = false;
     };
-    cache = createMMIORegion(NULL, virtSize, physSize, n_threads, 64, true);
+    cache = createMMIORegion(NULL, virtSize, physSize, n_threads, 64, false);
     if(cache->explicit_control)
         cout << "explicit_control " << endl;
     loadArray(cache->virtMem, virtSize/4096, n_threads);
@@ -117,7 +117,7 @@ int main(int argc, char** argv){
         u64 cnt = 0;
         u64 start = rdtsc();
         while(keepRunning.load()){
-            updateRandomInt(worker, cache->virtMem, virtSize/4096);
+            updateRandomInt(worker, cache->virtMem, virtSize/4096, i);
             cnt++;
             u64 stop = rdtsc();
             if((stop-start) > statDiff){
