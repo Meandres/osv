@@ -48,5 +48,6 @@ modules/libtools/*.o
 modules/libyaml/usr.manifest
 modules/dl_tests/usr.manifest
 .idea
+.cache
 compile_commands.json
 downloaded_packages
