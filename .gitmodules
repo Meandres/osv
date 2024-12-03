@@ -21,3 +21,6 @@
 [submodule "kbuild"]
 	path = kbuild
 	url = https://github.com/osvunikernel/kbuild-standalone.git
+[submodule "benchmarks"]
+	path = benchmarks
+	url = git@github.com:Martin-Lndbl/benchmarks.git
