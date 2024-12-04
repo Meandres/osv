@@ -32,6 +32,13 @@ void start_sampler(config) throw();
  */
 void stop_sampler() throw();
 
+typedef struct thread_runtime_checkpoint {
+    uint64_t counter;
+    std::string name;
+    long int runtime; 
+} trc_t;
+extern std::vector<trc_t> thread_runtime_log;
+void print_log();
 }
 
 #endif

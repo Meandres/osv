@@ -64,6 +64,7 @@ benchs/pf_test/pf_test_linux
 benchs/tls_bench/tls_bench
 benchs/idle_test/idle_test
 benchs/vmcache/vmcache
+benchs/vmcache/vmcache_transparent
 benchs/io_test/io_test
 benchs/omp_test/omp_test
 benchs/nvme_test/ioengine_unvme

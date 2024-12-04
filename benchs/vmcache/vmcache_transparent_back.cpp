@@ -15,7 +15,6 @@
 #include <random>
 
 #include <errno.h>
-//#include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -24,15 +23,12 @@
 #include <unistd.h>
 #include <immintrin.h>
 
-//#include "exmap.h"
 #include <osv/cache.hh>
 #include <osv/sampler.hh>
 #include <osv/sched.hh>
 #include "rte_string.hh"
 
-//__thread uint16_t workerThreadId = 0;
-//__thread int32_t tpcchistorycounter = 0;
-#include "tpcc_back/TPCCWorkload.hpp"
+#include "tpcc/TPCCWorkload.hpp"
 
 using namespace std;
 
@@ -41,287 +37,12 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-u64 acc_time = 0;
-u64 acc_count=0;
-u64 diff_time=0, dt_1=0, dt_2=0, dt_3=0, dt_4=0, dt_5=0, c_1=0, c_2=0, c_3=0, c_4=0, c_5=0; 
-
-/*typedef u64 PID; // page id type
-
-static const u64 pageSize = 4096;
-
-struct alignas(4096) Page {
-   bool dirty;
-};*/
-
-//static const int16_t maxWorkerThreads = 128;
-
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
-
-/*uint64_t rdtsc() {
-   uint32_t hi, lo;
-   __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
-   return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
-}
-
-// exmap helper function
-static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-   struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
-   return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
-}
-
-// allocate memory using huge pages
-void* allocHuge(size_t size) {
-   void* p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-   madvise(p, size, MADV_HUGEPAGE);
-   return p;
-}*/
 
 // use when lock is not free
 void yield(u64 counter) {
    _mm_pause();
 }
-
-/*struct PageState {
-   atomic<u64> stateAndVersion;
-
-   static const u64 Unlocked = 0;
-   static const u64 MaxShared = 252;
-   static const u64 Locked = 253;
-   static const u64 Marked = 254;
-   static const u64 Evicted = 255;
-
-   PageState() {}
-
-   void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
-
-   static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
-   static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
-
-   bool tryLockX(u64 oldStateAndVersion) {
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
-   }
-
-   void unlockX() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
-   }
-
-   void unlockXEvicted() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
-   }
-
-   void downgradeLock() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), 1), std::memory_order_release);
-   }
-
-   bool tryLockS(u64 oldStateAndVersion) {
-      u64 s = getState(oldStateAndVersion);
-      if (s<MaxShared)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s+1));
-      if (s==Marked)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
-      return false;
-   }
-
-   void unlockS() {
-      while (true) {
-         u64 oldStateAndVersion = stateAndVersion.load();
-         u64 state = getState(oldStateAndVersion);
-         assert(state>0 && state<=MaxShared);
-         if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state-1)))
-            return;
-      }
-   }
-
-   bool tryMark(u64 oldStateAndVersion) {
-      assert(getState(oldStateAndVersion)==Unlocked);
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Marked));
-   }
-
-   static u64 getState(u64 v) { return v >> 56; };
-   u64 getState() { return getState(stateAndVersion.load()); }
-
-   void operator=(PageState&) = delete;
-};
-
-// open addressing hash table used for second chance replacement to keep track of currently-cached pages
-struct ResidentPageSet {
-   static const u64 empty = ~0ull;
-   static const u64 tombstone = (~0ull)-1;
-
-   struct Entry {
-      atomic<u64> pid;
-   };
-
-   Entry* ht;
-   u64 count;
-   u64 mask;
-   atomic<u64> clockPos;
-
-   ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
-      ht = (Entry*)allocHuge(count * sizeof(Entry));
-      memset((void*)ht, 0xFF, count * sizeof(Entry));
-   }
-
-   ~ResidentPageSet() {
-      munmap(ht, count * sizeof(u64));
-   }
-
-   u64 next_pow2(u64 x) {
-      return 1<<(64-__builtin_clzl(x-1));
-   }
-
-   u64 hash(u64 k) {
-      const u64 m = 0xc6a4a7935bd1e995;
-      const int r = 47;
-      u64 h = 0x8445d61a4e774912 ^ (8*m);
-      k *= m;
-      k ^= k >> r;
-      k *= m;
-      h ^= k;
-      h *= m;
-      h ^= h >> r;
-      h *= m;
-      h ^= h >> r;
-      return h;
-   }
-
-   void insert(u64 pid) {
-      u64 pos = hash(pid) & mask;
-      while (true) {
-         u64 curr = ht[pos].pid.load();
-         assert(curr != pid);
-         if ((curr == empty) || (curr == tombstone))
-            if (ht[pos].pid.compare_exchange_strong(curr, pid))
-               return;
-
-         pos = (pos + 1) & mask;
-      }
-   }
-
-   bool remove(u64 pid) {
-      u64 pos = hash(pid) & mask;
-      while (true) {
-         u64 curr = ht[pos].pid.load();
-         if (curr == empty)
-            return false;
-
-         if (curr == pid)
-            if (ht[pos].pid.compare_exchange_strong(curr, tombstone))
-               return true;
-
-         pos = (pos + 1) & mask;
-      }
-   }
-
-   template<class Fn>
-   void iterateClockBatch(u64 batch, Fn fn) {
-      u64 pos, newPos;
-      do {
-         pos = clockPos.load();
-         newPos = (pos+batch) % count;
-      } while (!clockPos.compare_exchange_strong(pos, newPos));
-
-      for (u64 i=0; i<batch; i++) {
-         u64 curr = ht[pos].pid.load();
-         if ((curr != tombstone) && (curr != empty))
-            fn(curr);
-         pos = (pos + 1) & mask;
-      }
-   }
-};
-
-// libaio interface used to write batches of pages
-struct LibaioInterface {
-   static const u64 maxIOs = 256;
-
-   int blockfd;
-   Page* virtMem;
-   io_context_t ctx;
-   iocb cb[maxIOs];
-   iocb* cbPtr[maxIOs];
-   io_event events[maxIOs];
-
-   LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
-      memset(&ctx, 0, sizeof(io_context_t));
-      int ret = io_setup(maxIOs, &ctx);
-      if (ret != 0) {
-         std::cerr << "libaio io_setup error: " << ret << " ";
-         switch (-ret) {
-            case EAGAIN: std::cerr << "EAGAIN"; break;
-            case EFAULT: std::cerr << "EFAULT"; break;
-            case EINVAL: std::cerr << "EINVAL"; break;
-            case ENOMEM: std::cerr << "ENOMEM"; break;
-            case ENOSYS: std::cerr << "ENOSYS"; break;
-         };
-         exit(EXIT_FAILURE);
-      }
-   }
-
-   void writePages(const vector<PID>& pages) {
-      assert(pages.size() < maxIOs);
-      for (u64 i=0; i<pages.size(); i++) {
-         PID pid = pages[i];
-         virtMem[pid].dirty = false;
-         cbPtr[i] = &cb[i];
-         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
-      }
-      int cnt = io_subm->t(ctx, pages.size(), cbPtr);
-      assert(cnt == pages.size());
-      cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-      assert(cnt == pages.size());
-   }
-};
-
-struct BufferManager {
-   static const u64 mb = 1024ull * 1024;
-   static const u64 gb = 1024ull * 1024 * 1024;
-   u64 virtSize;
-   u64 physSize;
-   u64 virtCount;
-   u64 physCount;
-   struct exmap_user_interface* exmapInterface[maxWorkerThreads];
-   vector<LibaioInterface> libaioInterface;
-
-   bool useExmap;
-   int blockfd;
-   int exmapfd;
-
-   atomic<u64> physUsedCount;
-   ResidentPageSet residentSet;
-   atomic<u64> allocCount;
-
-   atomic<u64> readCount;
-   atomic<u64> writeCount;
-
-   Page* virtMem;
-   PageState* pageState;
-   u64 batch;
-
-   PageState& getPageState(PID pid) {
-      return pageState[pid];
-   }
-
-   BufferManager();
-   ~BufferManager() {}//munlockall();}
-
-   Page* fixX(PID pid);
-   void unfixX(PID pid);
-   Page* fixS(PID pid);
-   void unfixS(PID pid);
-
-   bool isValidPtr(void* page) { return (page >= virtMem) && (page < (virtMem + virtSize + 16)); }
-   PID toPID(void* page) { return reinterpret_cast<Page*>(page) - virtMem; }
-   Page* toPtr(PID pid) { return virtMem + pid; }
-
-   void ensureFreePages();
-   Page* allocPage();
-   void handleFault(PID pid);
-   void readPage(PID pid);
-   void evict();
-};*/
 
 u64 envOr(const char* env, u64 value) {
    if (getenv(env))
@@ -329,513 +50,7 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, true);
-
-//struct OLCRestartException {};
-
-template<class T>
-struct GuardO {
-   PID pid;
-   T* ptr;
-   u64 version;
-   static const u64 moved = ~0ull;
-
-   // constructor
-   explicit GuardO(u64 pid, int tid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
-      init(tid);
-   }
-
-   template<class T2>
-   GuardO(u64 pid, GuardO<T2>& parent, int tid)  {
-      parent.checkVersionAndRestart();
-      this->pid = pid;
-      ptr = reinterpret_cast<T*>(bm->toPtr(pid));
-      init(tid);
-   }
-
-   GuardO(GuardO&& other) {
-      pid = other.pid;
-      ptr = other.ptr;
-      version = other.version;
-   }
-
-   void init(int tid) {
-      assert(pid != moved);
-      PageState& ps = bm->getPageState(pid);
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         u64 v = ps.stateAndVersion.load();
-         switch (PageState::getState(v)) {
-            case PageState::Marked: {
-               u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-               if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                  version = newV;
-                  return;
-               }
-               break;
-            }
-            case PageState::Locked:
-               break;
-            case PageState::Evicted:
-               if (ps.tryLockX(v)) {
-                  bm->explicitFix(pid);
-                  bm->unfixX(pid);
-               }
-               break;
-            default:
-               version = v;
-               return;
-         }
-         yield(repeatCounter);
-      }
-   }
-
-   // move assignment operator
-   GuardO& operator=(GuardO&& other) {
-      if (pid != moved)
-         checkVersionAndRestart();
-      pid = other.pid;
-      ptr = other.ptr;
-      version = other.version;
-      other.pid = moved;
-      other.ptr = nullptr;
-      return *this;
-   }
-
-   // assignment operator
-   GuardO& operator=(const GuardO&) = delete;
-
-   // copy constructor
-   GuardO(const GuardO&) = delete;
-
-   void checkVersionAndRestart() {
-      if (pid != moved) {
-         PageState& ps = bm->getPageState(pid);
-         u64 stateAndVersion = ps.stateAndVersion.load();
-         if (version == stateAndVersion) // fast path, nothing changed
-            return;
-         if ((stateAndVersion<<8) == (version<<8)) { // same version
-            u64 state = PageState::getState(stateAndVersion);
-            if (state <= PageState::MaxShared)
-               return; // ignore shared locks
-            if (state == PageState::Marked)
-               if (ps.stateAndVersion.compare_exchange_weak(stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
-                  return; // mark cleared
-         }
-         if (std::uncaught_exceptions()==0)
-            throw OLCRestartException();
-      }
-   }
-
-   // destructor
-   ~GuardO() noexcept(false) {
-      checkVersionAndRestart();
-   }
-
-   T* operator->() {
-      assert(pid != moved);
-      return ptr;
-   }
-
-   void release() {
-      checkVersionAndRestart();
-      pid = moved;
-      ptr = nullptr;
-   }
-};
-
-template<class T>
-struct GuardX {
-   PID pid;
-   T* ptr;
-   static const u64 moved = ~0ull;
-
-   // constructor
-   GuardX(): pid(moved), ptr(nullptr) {}
-
-   // constructor
-   explicit GuardX(u64 pid, int tid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm->fixX(pid));
-      ptr->dirty = true;
-   }
-
-   explicit GuardX(GuardO<T>&& other) {
-      assert(other.pid != moved);
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         PageState& ps = bm->getPageState(other.pid);
-         u64 stateAndVersion = ps.stateAndVersion;
-         if ((stateAndVersion<<8) != (other.version<<8))
-            throw OLCRestartException();
-         u64 state = PageState::getState(stateAndVersion);
-         if ((state == PageState::Unlocked) || (state == PageState::Marked)) {
-            if (ps.tryLockX(stateAndVersion)) {
-               pid = other.pid;
-               ptr = other.ptr;
-               ptr->dirty = true;
-               other.pid = moved;
-               other.ptr = nullptr;
-               return;
-            }
-         }
-         yield(repeatCounter);
-      }
-   }
-
-   // assignment operator
-   GuardX& operator=(const GuardX&) = delete;
-
-   // move assignment operator
-   GuardX& operator=(GuardX&& other) {
-      if (pid != moved) {
-         bm->unfixX(pid);
-      }
-      pid = other.pid;
-      ptr = other.ptr;
-      other.pid = moved;
-      other.ptr = nullptr;
-      return *this;
-   }
-
-   // copy constructor
-   GuardX(const GuardX&) = delete;
-
-   // destructor
-   ~GuardX() {
-      if (pid != moved)
-         bm->unfixX(pid);
-   }
-
-   T* operator->() {
-      assert(pid != moved);
-      return ptr;
-   }
-
-   void release() {
-      if (pid != moved) {
-         bm->unfixX(pid);
-         pid = moved;
-      }
-   }
-};
-
-template<class T>
-struct AllocGuard : public GuardX<T> {
-   template <typename ...Params>
-   AllocGuard(int tid, Params&&... params) {
-      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
-      new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
-      GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
-   }
-};
-
-template<class T>
-struct GuardS {
-   PID pid;
-   T* ptr;
-   static const u64 moved = ~0ull;
-
-   // constructor
-   explicit GuardS(u64 pid, int tid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm->fixS(pid));
-   }
-
-   GuardS(GuardO<T>&& other) {
-      assert(other.pid != moved);
-      if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
-         pid = other.pid;
-         ptr = other.ptr;
-         other.pid = moved;
-         other.ptr = nullptr;
-      } else {
-         throw OLCRestartException();
-      }
-   }
-
-   GuardS(GuardS&& other) {
-      if (pid != moved)
-         bm->unfixS(pid);
-      pid = other.pid;
-      ptr = other.ptr;
-      other.pid = moved;
-      other.ptr = nullptr;
-   }
-
-   // assignment operator
-   GuardS& operator=(const GuardS&) = delete;
-
-   // move assignment operator
-   GuardS& operator=(GuardS&& other) {
-      if (pid != moved)
-         bm->unfixS(pid);
-      pid = other.pid;
-      ptr = other.ptr;
-      other.pid = moved;
-      other.ptr = nullptr;
-      return *this;
-   }
-
-   // copy constructor
-   GuardS(const GuardS&) = delete;
-
-   // destructor
-   ~GuardS() {
-      if (pid != moved)
-         bm->unfixS(pid);
-   }
-
-   T* operator->() {
-      assert(pid != moved);
-      return ptr;
-   }
-
-   void release() {
-      if (pid != moved) {
-         bm->unfixS(pid);
-         pid = moved;
-      }
-   }
-};
-
-
-
-/*BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
-   assert(virtSize>=physSize);
-   const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm->;
-   blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
-   if (blockfd == -1) {
-      cerr << "cannot open BLOCK device '" << path << "'" << endl;
-      exit(EXIT_FAILURE);
-   }
-   u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
-
-   useExmap = envOr("EXMAP", 0);
-   if (useExmap) {
-      exmapfd = open("/dev/exmap", O_RDWR);
-      if (exmapfd < 0) die("open exmap");
-
-      struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
-      buffer.buffer_size    = physCount;
-      buffer.flags          = 0;
-      if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
-         die("ioctl: exmap_setup");
-
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
-         exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-         if (exmapInterface[i] == MAP_FAILED)
-            die("setup exmapInterface");
-      }
-
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-   } else {
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-   }
-
-   pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-   for (u64 i=0; i<virtCount; i++)
-      pageState[i].init();
-   if (virtMem == MAP_FAILED)
-      die("mmap failed");
-
-   libaioInterface.reserve(maxWorkerThreads);
-   for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
-
-   physUsedCount = 0;
-   allocCount = 1; // pid 0 reserved for meta data
-   readCount = 0;
-   writeCount = 0;
-   batch = envOr("BATCH", 64);
-
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
-}
-
-void BufferManager::ensureFreePages() {
-   if (physUsedCount >= physCount*0.95)
-      evict();
-}
-
-// allocated new page and fix it
-Page* BufferManager::allocPage() {
-   physUsedCount++;
-   ensureFreePages();
-   u64 pid = allocCount++;
-   if (pid >= virtCount) {
-      cerr << "VIRTGB is too low" << endl;
-      exit(EXIT_FAILURE);
-   }
-   u64 stateAndVersion = getPageState(pid).stateAndVersion;
-   bool succ = getPageState(pid).tryLockX(stateAndVersion);
-   assert(succ);
-   residentSet.insert(pid);
-
-   if (useExmap) {
-      exmapInterface[workerThreadId]->iov[0].page = pid;
-      exmapInterface[workerThreadId]->iov[0].len = 1;
-      while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-         cerr << "allocPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   }
-   virtMem[pid].dirty = true;
-
-   return virtMem + pid;
-}
-
-void BufferManager::handleFault(PID pid) {
-   physUsedCount++;
-   ensureFreePages();
-   readPage(pid);
-   residentSet.insert(pid);
-}
-
-Page* BufferManager::fixX(PID pid) {
-   PageState& ps = getPageState(pid);
-   for (u64 repeatCounter=0; ; repeatCounter++) {
-      u64 stateAndVersion = ps.stateAndVersion.load();
-      switch (PageState::getState(stateAndVersion)) {
-         case PageState::Evicted: {
-            if (ps.tryLockX(stateAndVersion)) {
-               handleFault(pid);
-               return virtMem + pid;
-            }
-            break;
-         }
-         case PageState::Marked: case PageState::Unlocked: {
-            if (ps.tryLockX(stateAndVersion))
-               return virtMem + pid;
-            break;
-         }
-      }
-      yield(repeatCounter);
-   }
-}
-
-Page* BufferManager::fixS(PID pid) {
-   PageState& ps = getPageState(pid);
-   for (u64 repeatCounter=0; ; repeatCounter++) {
-      u64 stateAndVersion = ps.stateAndVersion;
-      switch (PageState::getState(stateAndVersion)) {
-         case PageState::Locked: {
-            break;
-         } case PageState::Evicted: {
-            if (ps.tryLockX(stateAndVersion)) {
-               handleFault(pid);
-               ps.unlockX();
-            }
-            break;
-         }
-         default: {
-            if (ps.tryLockS(stateAndVersion))
-               return virtMem + pid;
-         }
-      }
-      yield(repeatCounter);
-   }
-}
-
-void BufferManager::unfixS(PID pid) {
-   getPageState(pid).unlockS();
-}
-
-void BufferManager::unfixX(PID pid) {
-   getPageState(pid).unlockX();
-}
-
-void BufferManager::readPage(PID pid) {
-   if (useExmap) {
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
-         if (ret == pageSize) {
-            assert(ret == pageSize);
-            readCount++;
-            return;
-         }
-         cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   } else {
-      int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-      assert(ret==pageSize);
-      readCount++;
-   }
-}
-
-void BufferManager::evict() {
-   vector<PID> toEvict;
-   toEvict.reserve(batch);
-   vector<PID> toWrite;
-   toWrite.reserve(batch);
-
-   // 0. find candidates, lock dirty ones in shared mode
-   while (toEvict.size()+toWrite.size() < batch) {
-      residentSet.iterateClockBatch(batch, [&](PID pid) {
-         PageState& ps = getPageState(pid);
-         u64 v = ps.stateAndVersion;
-         switch (PageState::getState(v)) {
-            case PageState::Marked:
-               if (virtMem[pid].dirty) {
-                  if (ps.tryLockS(v))
-                     toWrite.push_back(pid);
-               } else {
-                  toEvict.push_back(pid);
-               }
-               break;
-            case PageState::Unlocked:
-               ps.tryMark(v);
-               break;
-            default:
-               break; // skip
-         };
-      });
-   }
-
-   // 1. write dirty pages
-   libaioInterface[workerThreadId].writePages(toWrite);
-   writeCount += toWrite.size();
-
-   // 2. try to lock clean page candidates
-   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
-      PageState& ps = getPageState(pid);
-      u64 v = ps.stateAndVersion;
-      return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
-   }), toEvict.end());
-
-   // 3. try to upgrade lock for dirty page candidates
-   for (auto& pid : toWrite) {
-      PageState& ps = getPageState(pid);
-      u64 v = ps.stateAndVersion;
-      if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-         toEvict.push_back(pid);
-      else
-         ps.unlockS();
-   }
-
-   // 4. remove from page table
-   if (useExmap) {
-      for (u64 i=0; i<toEvict.size(); i++) {
-         exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-         exmapInterface[workerThreadId]->iov[i].len = 1;
-      }
-      if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
-         die("ioctl: EXMAP_OP_FREE");
-   } else {
-      for (u64& pid : toEvict)
-         madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-   }
-
-   // 5. remove from hash table and unlock
-   for (u64& pid : toEvict) {
-      bool succ = residentSet.remove(pid);
-      assert(succ);
-      getPageState(pid).unlockXEvicted();
-   }
-
-   physUsedCount -= toEvict.size();
-}*/
-
-//---------------------------------------------------------------------------
+CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, false);
 
 struct BTreeNode;
 
@@ -1216,8 +431,8 @@ struct BTreeNode : public BTreeNodeHeader {
       BTreeNode tmp(isLeaf);
       BTreeNode* nodeLeft = &tmp;
 
-      AllocGuard<BTreeNode> newNode(tid, isLeaf);
-      BTreeNode* nodeRight = newNode.ptr;
+      u64 newPID = bm->getNextPid();
+      BTreeNode* nodeRight = new(bm->toPtr(newPID))BTreeNode(isLeaf);
 
       nodeLeft->setFences(getLowerFence(), sep);
       nodeRight->setFences(sep, getUpperFence());
@@ -1226,17 +441,17 @@ struct BTreeNode : public BTreeNodeHeader {
       u16 oldParentSlot = parent->lowerBound(sep);
       if (oldParentSlot == parent->count) {
          assert(parent->upperInnerNode == leftPID);
-         parent->upperInnerNode = newNode.pid;
+         parent->upperInnerNode = newPID;
       } else {
          assert(parent->getChild(oldParentSlot) == leftPID);
-         rte_memcpy(parent->getPayload(oldParentSlot).data(), &newNode.pid, sizeof(PID));
+         rte_memcpy(parent->getPayload(oldParentSlot).data(), &newPID, sizeof(PID));
       }
       parent->insertInPage(sep, {reinterpret_cast<u8*>(&leftPID), sizeof(PID)});
 
       if (isLeaf) {
          copyKeyValueRange(nodeLeft, 0, 0, sepSlot + 1);
          copyKeyValueRange(nodeRight, 0, nodeLeft->count, count - nodeLeft->count);
-         nodeLeft->nextLeafNode = newNode.pid;
+         nodeLeft->nextLeafNode = newPID;
          nodeRight->nextLeafNode = this->nextLeafNode;
       } else {
          // in inner node split, separator moves to parent (count == 1 + nodeLeft->count + nodeRight->count)
@@ -1334,7 +549,7 @@ struct MetaDataPage {
 struct BTree {
    private:
 
-   void trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen, int tid);
+   void trySplit(BTreeNode* node, BTreeNode* parent, span<u8> key, unsigned payloadLen, int tid);
    void ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen, int tid);
 
    public:
@@ -1344,13 +559,12 @@ struct BTree {
    BTree();
    ~BTree();
 
-   GuardO<BTreeNode> findLeafO(span<u8> key, int tid) {
-      GuardO<MetaDataPage> meta(metadataPageId, tid);
-      GuardO<BTreeNode> node(meta->getRoot(slotId), meta, tid);
-      meta.release();
+   BTreeNode* findLeafO(span<u8> key, int tid) {
+      MetaDataPage* meta = (MetaDataPage*) bm->toPtr(metadataPageId);
+      BTreeNode* node = (BTreeNode*) bm->toPtr(meta->getRoot(slotId));
 
       while (node->isInner())
-         node = GuardO<BTreeNode>(node->lookupInner(key), node, tid);
+         node = (BTreeNode*)bm->toPtr(node->lookupInner(key));
       return node;
    }
 
@@ -1358,7 +572,7 @@ struct BTree {
    int lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize, int tid) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            BTreeNode* node = findLeafO(key, tid);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1376,7 +590,7 @@ struct BTree {
    bool lookup(span<u8> key, Fn fn, int tid) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            BTreeNode* node = findLeafO(key, tid);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1397,7 +611,7 @@ struct BTree {
    bool updateInPlace(span<u8> key, Fn fn, int tid) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            BTreeNode* node = findLeafO(key, tid);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1405,51 +619,39 @@ struct BTree {
             }
 
             {
-               GuardX<BTreeNode> nodeLocked(move(node));
-               fn(nodeLocked->getPayload(pos));
+               fn(node->getPayload(pos));
                return true;
             }
          } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
-   GuardS<BTreeNode> findLeafS(span<u8> key, int tid) {
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         try {
-            GuardO<MetaDataPage> meta(metadataPageId, tid);
-            GuardO<BTreeNode> node(meta->getRoot(slotId), meta, tid);
-            meta.release();
-
-            while (node->isInner())
-               node = GuardO<BTreeNode>(node->lookupInner(key), node, tid);
-
-            return GuardS<BTreeNode>(move(node));
-         } catch(const OLCRestartException&) { yield(repeatCounter); }
-      }
+   BTreeNode* findLeafS(span<u8> key, int tid) {
+       return findLeafO(key, tid);
    }
 
    template<class Fn>
    void scanAsc(span<u8> key, Fn fn, int tid) {
-      GuardS<BTreeNode> node = findLeafS(key, tid);
+      BTreeNode* node = findLeafS(key, tid);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          if (pos<node->count) {
-            if (!fn(*node.ptr, pos))
+            if (!fn(*node, pos))
                return;
             pos++;
          } else {
             if (!node->hasRightNeighbour())
                return;
             pos = 0;
-            node = GuardS<BTreeNode>(node->nextLeafNode, tid);
+            node = (BTreeNode*)bm->toPtr(node->nextLeafNode);
          }
       }
    }
 
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn, int tid) {
-      GuardS<BTreeNode> node = findLeafS(key, tid);
+      BTreeNode* node = findLeafS(key, tid);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
       if (pos == node->count) {
@@ -1458,7 +660,7 @@ struct BTree {
       }
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          while (pos>=0) {
-            if (!fn(*node.ptr, pos, exactMatch))
+            if (!fn(*node, pos, exactMatch))
                return;
             pos--;
          }
@@ -1473,24 +675,26 @@ struct BTree {
 static unsigned btreeslotcounter = 0;
 
 BTree::BTree() : splitOrdered(false) {
-   GuardX<MetaDataPage> page(metadataPageId, 0);
-   AllocGuard<BTreeNode> rootNode(0, true);
+   MetaDataPage* page = (MetaDataPage*) bm->toPtr(metadataPageId);
+   u64 newPID = bm->getNextPid();
+   BTreeNode* rootNode = new(bm->toPtr(newPID))BTreeNode(true);
    slotId = btreeslotcounter++;
-   page->roots[slotId] = rootNode.pid;
+   page->roots[slotId] = newPID;
 }
 
 BTree::~BTree() {}
 
-void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen, int tid)
+void BTree::trySplit(BTreeNode* node, BTreeNode* parent, span<u8> key, unsigned payloadLen, int tid)
 {
 
    // create new root if necessary
-   if (parent.pid == metadataPageId) {
-      MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent.ptr);
-      AllocGuard<BTreeNode> newRoot(tid, false);
-      newRoot->upperInnerNode = node.pid;
-      metaData->roots[slotId] = newRoot.pid;
-      parent = move(newRoot);
+   if (bm->toPID(parent) == metadataPageId) {
+      MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent);
+      u64 newPID = bm->getNextPid();
+      BTreeNode* newRoot = new(bm->toPtr(newPID))BTreeNode(false);
+      newRoot->upperInnerNode = bm->toPID(node);
+      metaData->roots[slotId] = newPID;
+      parent = newRoot;
    }
 
    // split
@@ -1499,34 +703,31 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
    node->getSep(sepKey, sepInfo);
 
    if (parent->hasSpaceFor(sepInfo.len, sizeof(PID))) {  // is there enough space in the parent for the separator?
-      node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len}, tid);
+      node->splitNode(parent, sepInfo.slot, {sepKey, sepInfo.len}, tid);
       return;
    }
 
    // must split parent to make space for separator, restart from root to do this
-   node.release();
-   parent.release();
-   ensureSpace(parent.ptr, {sepKey, sepInfo.len}, sizeof(PID), tid);
+   ensureSpace(parent, {sepKey, sepInfo.len}, sizeof(PID), tid);
 }
 
 void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen, int tid)
 {
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         BTreeNode* parent = (BTreeNode*) bm->toPtr(metadataPageId);
+         MetaDataPage* meta = (MetaDataPage*)parent;
+         BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
-         while (node->isInner() && (node.ptr != toSplit)) {
+         while (node->isInner() && (node != toSplit)) {
             parent = move(node);
-            node = GuardO<BTreeNode>(parent->lookupInner(key), parent, tid);
+            node = (BTreeNode*)bm->toPtr(parent->lookupInner(key));
          }
-         if (node.ptr == toSplit) {
+         if (node == toSplit) {
             if (node->hasSpaceFor(key.size(), payloadLen)){
                return; // someone else did split concurrently
             }
-            GuardX<BTreeNode> parentLocked(move(parent));
-            GuardX<BTreeNode> nodeLocked(move(node));
-            trySplit(move(nodeLocked), move(parentLocked), key, payloadLen, tid);
+            trySplit(node, parent, key, payloadLen, tid);
          }
          return;
       } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -1539,26 +740,23 @@ void BTree::insert(span<u8> key, span<u8> payload, int tid)
 
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         BTreeNode* parent = (BTreeNode*) bm->toPtr(metadataPageId);
+         MetaDataPage* meta = (MetaDataPage*)parent;
+         BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
          while (node->isInner()) {
             parent = move(node);
-            node = GuardO<BTreeNode>(parent->lookupInner(key), parent, tid);
+            node = (BTreeNode*)bm->toPtr(parent->lookupInner(key));
          }
 
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
-            GuardX<BTreeNode> nodeLocked(move(node));
-            parent.release();
-            nodeLocked->insertInPage(key, payload);
+            node->insertInPage(key, payload);
             return; // success
          }
 
          // lock parent and leaf
-         GuardX<BTreeNode> parentLocked(move(parent));
-         GuardX<BTreeNode> nodeLocked(move(node));
-         trySplit(move(nodeLocked), move(parentLocked), key, payload.size(), tid);
+         trySplit(node, parent, key, payload.size(), tid);
          // insert hasn't happened, restart from root
       } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
@@ -1568,15 +766,16 @@ bool BTree::remove(span<u8> key, int tid)
 {
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         BTreeNode* parent = (BTreeNode*) bm->toPtr(metadataPageId);
+         MetaDataPage* meta = (MetaDataPage*)parent;
+         BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
 
          u16 pos;
          while (node->isInner()) {
             pos = node->lowerBound(key);
             PID nextPage = (pos == node->count) ? node->upperInnerNode : node->getChild(pos);
             parent = move(node);
-            node = GuardO<BTreeNode>(nextPage, parent, tid);
+            node = (BTreeNode*)bm->toPtr(nextPage);
          }
 
          bool found;
@@ -1586,21 +785,17 @@ bool BTree::remove(span<u8> key, int tid)
          }
 
          unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
-         if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
+         if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (bm->toPID(parent) != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
             // underfull
-            GuardX<BTreeNode> parentLocked(move(parent));
-            GuardX<BTreeNode> nodeLocked(move(node));
-            GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1), tid);
-            nodeLocked->removeSlot(slotId);
-            if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
-               if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {
+            BTreeNode* right = (BTreeNode*)bm->toPtr(parent->getChild(pos + 1));
+            node->removeSlot(slotId);
+            if (right->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
+               if (node->mergeNodes(pos, parent, right)) {
                   // XXX: should reuse page Id
                }
             }
          } else {
-            GuardX<BTreeNode> nodeLocked(move(node));
-            parent.release();
-            nodeLocked->removeSlot(slotId);
+            node->removeSlot(slotId);
          }
          return true;
       } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -1758,7 +953,7 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = "osv";
+   auto systemName = "osv_transparent";
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
@@ -1774,13 +969,14 @@ int main(int argc, char** argv) {
    };
 
 
-   if (isRndread) {
+   //if (isRndread) {
+   {
       BTree bt;
       bt.splitOrdered = true;
 
       {
          // insert
-         parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+         parallel_for(0, n, 1, [&](uint64_t worker, uint64_t begin, uint64_t end) {
             bm->registerThread();
             //workerThreadId = worker;
             array<u8, 120> payload;
@@ -1829,83 +1025,5 @@ int main(int argc, char** argv) {
 
       statThread.join();
       return 0;
-   }
-
-   // TPC-C
-   Integer warehouseCount = n;
-
-   vmcacheAdapter<warehouse_t> warehouse;
-   vmcacheAdapter<district_t> district;
-   vmcacheAdapter<customer_t> customer;
-   vmcacheAdapter<customer_wdl_t> customerwdl;
-   vmcacheAdapter<history_t> history;
-   vmcacheAdapter<neworder_t> neworder;
-   vmcacheAdapter<order_t> order;
-   vmcacheAdapter<order_wdc_t> order_wdc;
-   vmcacheAdapter<orderline_t> orderline;
-   vmcacheAdapter<item_t> item;
-   vmcacheAdapter<stock_t> stock;
-
-   TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
-
-   {
-      tpcc.loadItem(0);
-      tpcc.loadWarehouse(0);
-
-      parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         bm->registerThread();
-         uint32_t tpcchistorycounter = 0;
-         //workerThreadId = worker;
-         for (Integer w_id=begin; w_id<end; w_id++) {
-            //printf("%lu: %u\n", worker, w_id);
-            tpcc.loadStock(w_id, worker);
-            tpcc.loadDistrinct(w_id, worker);
-            for (Integer d_id = 1; d_id <= 10; d_id++) {
-               //printf("\t%u\n", d_id);
-               tpcc.loadCustomer(w_id, d_id, worker, &tpcchistorycounter, worker);
-               tpcc.loadOrders(w_id, d_id, worker);
-            }
-         }
-         bm->forgetThread();
-      });
-   }
-   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-
-   bm->readCount = 0;
-   bm->writeCount = 0;
-   thread statThread(statFn);
-
-   //prof::config _config = { std::chrono::milliseconds(1) };
-    //prof::start_sampler(_config);
-    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      zeroout_measures();
-      bm->registerThread();
-      uint32_t tpcchistorycounter = 0;
-      //workerThreadId = worker;
-      u64 cnt = 0;
-      u64 start = rdtsc();
-      while (keepRunning.load()) {
-         int w_id = tpcc.urand(1, warehouseCount, worker); // wh crossing
-         tpcc.tx(w_id, worker, &tpcchistorycounter, worker);
-         cnt++;
-         u64 stop = rdtsc();
-         if ((stop-start) > statDiff) {
-            txProgress += cnt;
-            start = stop;
-            cnt = 0;
-         }
-      }
-      txProgress += cnt;
-      bm->forgetThread();
-      //add_measures();
-   });
-   //prof::stop_sampler();
-
-   statThread.join();
-   //cout << "Avg cycles memcmp: " << (double)acc_time / acc_count << endl;
-   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
-   //print_measures();
-   //prof::print_log();
-
-   return 0;
+    }
 }

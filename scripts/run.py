@@ -191,7 +191,7 @@ def start_osv_qemu(options):
         "-drive", "file=%s,if=none,id=hd1" % (options.second_disk_image)]
    
     if options.nvme_file:
-        args += ["-device", "nvme,serial=nvme-1,drive=nvm", "-drive", "format=raw,file=nvme.img,if=none,id=nvm"];
+        args += ["-device", "nvme,serial=nvme-1,drive=nvm", "-drive", "format=raw,file={}/nvme.img,if=none,id=nvm".format(osv_base)];
 
     if options.nvme:
         args += [ "-device", "vfio-pci,host=%s"%options.nvme ];

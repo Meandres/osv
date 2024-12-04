@@ -16,7 +16,8 @@
 #include "drivers/clockevent.hh"
 #include <boost/intrusive/set.hpp>
 #include <boost/intrusive/list.hpp>
-#include <osv/mutex.h>
+#include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include "osv/lockless-queue.hh"
 #include <array>
@@ -374,6 +375,7 @@ struct thread_switch_data {
    thread_state* new_thread_state = nullptr;
 };
 #endif
+void save_all_thread_runtimes(uint64_t counter);
 /**
  * OSv thread
  */
@@ -1018,9 +1020,11 @@ struct cpu : private timer_base::client {
     void idle_poll_start();
     void idle_poll_end();
     void send_wakeup_ipi();
-    mutex _load_balance_lock; 
-    void disable_load_balancing();
+    std::atomic<bool> _load_balance_resume;
+    std::mutex _load_balance_mutex;
+    std::condition_variable _load_balance_condvar;
     void enable_load_balancing();
+    void disable_load_balancing();
     void load_balance();
     unsigned load();
     /**

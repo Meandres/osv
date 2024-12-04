@@ -99,7 +99,7 @@ enum {
 // Invalidate TLB entry (locally)
 void invlpg_tlb_entry(void* addr);
 // Invalidate TLB entry range (locally)
-void invlpg_tlb_entry_range();
+void invlpg_tlb_entry_range(bool);
 // Invalidate TLB range locally and sends IPI to all other CPUs
 void invlpg_tlb_all(std::vector<void*> addresses);
 

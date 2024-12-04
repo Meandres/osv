@@ -31,8 +31,8 @@
 #include "rte_string.hh"
 
 //__thread uint16_t workerThreadId = 0;
-//__thread int32_t tpcchistorycounter = 0;
-#include "tpcc_back/TPCCWorkload.hpp"
+__thread int32_t __attribute__ ((tls_model ("initial-exec"))) tpcchistorycounter = 0;
+#include "tpcc/TPCCWorkload.hpp"
 
 using namespace std;
 
@@ -55,7 +55,7 @@ struct alignas(4096) Page {
 
 //static const int16_t maxWorkerThreads = 128;
 
-#define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
+#define die(msg) do { fprint(stderr, msg); exit(EXIT_FAILURE); } while(0)
 
 /*uint64_t rdtsc() {
    uint32_t hi, lo;
@@ -329,9 +329,68 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, true);
+bool check_expl_ctrl(const char* env){
+    if(getenv(env))
+        if(strcmp(getenv(env), "TRUE"))
+            return true;
+    return false;
+}
+
+CacheManager *bm= createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, envOr("THREADS", 1), 64, false);
 
 //struct OLCRestartException {};
+
+template<class T>
+struct dummyGuard {
+   PID pid;
+   T* ptr;
+   u64 version;
+   static const u64 moved = ~0ull;
+
+   // constructor
+   explicit dummyGuard(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
+   }
+
+   template<class T2>
+   dummyGuard(u64 pid, dummyGuard<T2>& parent)  {
+      this->pid = pid;
+      ptr = reinterpret_cast<T*>(bm->toPtr(pid));
+   }
+
+   dummyGuard(dummyGuard&& other) {
+      pid = other.pid;
+      ptr = other.ptr;
+   }
+
+   // move assignment operator
+   dummyGuard& operator=(dummyGuard&& other) {
+      pid = other.pid;
+      ptr = other.ptr;
+      other.pid = moved;
+      other.ptr = nullptr;
+      return *this;
+   }
+
+   // assignment operator
+   dummyGuard& operator=(const dummyGuard&) = delete;
+
+   // copy constructor
+   dummyGuard(const dummyGuard&) = delete;
+
+   // destructor
+   ~dummyGuard() noexcept(false) {
+   }
+
+   T* operator->() {
+      assert(pid != moved);
+      return ptr;
+   }
+
+   void release() {
+      pid = moved;
+      ptr = nullptr;
+   }
+};
 
 template<class T>
 struct GuardO {
@@ -341,16 +400,16 @@ struct GuardO {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardO(u64 pid, int tid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
-      init(tid);
+   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
+      init();
    }
 
    template<class T2>
-   GuardO(u64 pid, GuardO<T2>& parent, int tid)  {
+   GuardO(u64 pid, GuardO<T2>& parent)  {
       parent.checkVersionAndRestart();
       this->pid = pid;
       ptr = reinterpret_cast<T*>(bm->toPtr(pid));
-      init(tid);
+      init();
    }
 
    GuardO(GuardO&& other) {
@@ -359,7 +418,7 @@ struct GuardO {
       version = other.version;
    }
 
-   void init(int tid) {
+   void init() {
       assert(pid != moved);
       PageState& ps = bm->getPageState(pid);
       for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -453,7 +512,7 @@ struct GuardX {
    GuardX(): pid(moved), ptr(nullptr) {}
 
    // constructor
-   explicit GuardX(u64 pid, int tid) : pid(pid) {
+   explicit GuardX(u64 pid) : pid(pid) {
       ptr = reinterpret_cast<T*>(bm->fixX(pid));
       ptr->dirty = true;
    }
@@ -520,7 +579,7 @@ struct GuardX {
 template<class T>
 struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
-   AllocGuard(int tid, Params&&... params) {
+   AllocGuard(Params&&... params) {
       GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
       GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
@@ -534,7 +593,7 @@ struct GuardS {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardS(u64 pid, int tid) : pid(pid) {
+   explicit GuardS(u64 pid) : pid(pid) {
       ptr = reinterpret_cast<T*>(bm->fixS(pid));
    }
 
@@ -982,73 +1041,58 @@ struct BTreeNode : public BTreeNodeHeader {
       }
    }
 
-   // lower bound search, foundExactOut indicates if there is an exact match, returns slotId
-   u16 lowerBound(span<u8> skey, bool& foundExactOut)
-   {
-      foundExactOut = false;
-      //c_1++;
-      //u64 m0 = rdtsc();
+    // lower bound search, foundExactOut indicates if there is an exact match, returns slotId
+    u16 lowerBound(span<u8> skey, bool& foundExactOut)
+    {
+        foundExactOut = false;
 
-      // check prefix
-      int cmp = rte_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
-      if (cmp < 0) // key is less than prefix
-         return 0;
-      if (cmp > 0) // key is greater than prefix
-         return count;
-      if (skey.size() < prefixLen) // key is equal but shorter than prefix
-         return 0;
-      u8* key = skey.data() + prefixLen;
-      unsigned keyLen = skey.size() - prefixLen;
-      //u64 m2 = rdtsc();
+        // check prefix
+        int cmp = memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
+        if (cmp < 0) // key is less than prefix
+            return 0;
+        if (cmp > 0) // key is greater than prefix
+            return count;
+        if (skey.size() < prefixLen) // key is equal but shorter than prefix
+            return 0;
+        u8* key = skey.data() + prefixLen;
+        unsigned keyLen = skey.size() - prefixLen;
 
-      // check hint
-      u16 lower = 0;
-      u16 upper = count;
-      u32 keyHead = head(key, keyLen);
-      searchHint(keyHead, lower, upper);
-      //u64 m3 = rdtsc();
+        // check hint
+        u16 lower = 0;
+        u16 upper = count;
+        u32 keyHead = head(key, keyLen);
+        searchHint(keyHead, lower, upper);
 
-      u64 count=0;
-      u16 mid;
-      // binary search on remaining range
-      while (lower < upper) {
-         count++;
-         mid = ((upper - lower) / 2) + lower;
-         if (keyHead < slot[mid].head) {
-            upper = mid;
-         } else if (keyHead > slot[mid].head) {
-            lower = mid + 1;
-         } else { // head is equal, check full key
-            int cmp = rte_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
-            if (cmp < 0) {
-               upper = mid;
-            } else if (cmp > 0) {
-               lower = mid + 1;
-            } else {
-               if (keyLen < slot[mid].keyLen) { // key is shorter
-                  upper = mid;
-               } else if (keyLen > slot[mid].keyLen) { // key is longer
-                  lower = mid + 1;
-               } else {
-                  foundExactOut = true;
-                  return mid;
-                  //break;
-               }
+        u64 count=0;
+        u16 mid;
+        // binary search on remaining range
+        while (lower < upper) {
+            count++;
+            mid = ((upper - lower) / 2) + lower;
+            if (keyHead < slot[mid].head) {
+                upper = mid;
+            } else if (keyHead > slot[mid].head) {
+                lower = mid + 1;
+            } else { // head is equal, check full key
+                int cmp = memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
+                if (cmp < 0) {
+                    upper = mid;
+                } else if (cmp > 0) {
+                    lower = mid + 1;
+                } else {
+                    if (keyLen < slot[mid].keyLen) { // key is shorter
+                        upper = mid;
+                    } else if (keyLen > slot[mid].keyLen) { // key is longer
+                        lower = mid + 1;
+                    } else {
+                        foundExactOut = true;
+                        return mid;
+                    }
+                }
             }
-         }
-      }
-      /*u64 m4 = rdtsc();
-      dt_1 += (m1-m0);
-      dt_2 += (m2-m1);
-      dt_3 += (m3-m2);
-      dt_4 += (m4-m3);
-      c_2 += count;
-      if(foundExactOut){
-        return mid;
-      }else{*/
+        }
         return lower;
-      //}
-   }
+    }
 
    // lowerBound wrapper ignoring exact match argument (for convenience)
    u16 lowerBound(span<u8> key)
@@ -1208,7 +1252,7 @@ struct BTreeNode : public BTreeNodeHeader {
          ;
    }
 
-   void splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep, int tid)
+   void splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep)
    {
       assert(sepSlot > 0);
       assert(sepSlot < (pageSize / sizeof(PID)));
@@ -1216,7 +1260,7 @@ struct BTreeNode : public BTreeNodeHeader {
       BTreeNode tmp(isLeaf);
       BTreeNode* nodeLeft = &tmp;
 
-      AllocGuard<BTreeNode> newNode(tid, isLeaf);
+      AllocGuard<BTreeNode> newNode(isLeaf);
       BTreeNode* nodeRight = newNode.ptr;
 
       nodeLeft->setFences(getLowerFence(), sep);
@@ -1334,8 +1378,8 @@ struct MetaDataPage {
 struct BTree {
    private:
 
-   void trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen, int tid);
-   void ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen, int tid);
+   void trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen);
+   void ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen);
 
    public:
    unsigned slotId;
@@ -1344,21 +1388,63 @@ struct BTree {
    BTree();
    ~BTree();
 
-   GuardO<BTreeNode> findLeafO(span<u8> key, int tid) {
-      GuardO<MetaDataPage> meta(metadataPageId, tid);
-      GuardO<BTreeNode> node(meta->getRoot(slotId), meta, tid);
+   GuardO<BTreeNode> findLeafO(span<u8> key) {
+      GuardO<MetaDataPage> meta(metadataPageId);
+      GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
       meta.release();
 
       while (node->isInner())
-         node = GuardO<BTreeNode>(node->lookupInner(key), node, tid);
+         node = GuardO<BTreeNode>(node->lookupInner(key), node);
       return node;
    }
 
+/*#pragma GCC push_options
+#pragma GCC optimize("O0")
+    dummyGuard<BTreeNode> gf_findLeafO(span<u8> key) {
+        dummyGuard<MetaDataPage> meta(metadataPageId);
+        dummyGuard<BTreeNode> node(meta->getRoot(slotId), meta);
+        meta.release();
+
+        while (node->isInner()){
+            BTreeNode* oldNode = node.ptr;
+            PID newPID = node->lookupInner(key);
+            if(newPID>=bm->virtCount){
+                printf("notValid : %u\n", workerThreadId);
+                exit(EXIT_FAILURE);
+            }
+            node = dummyGuard<BTreeNode>(newPID, node);
+        }
+        return node;
+    }
+#pragma GCC pop_options*/
+
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+   BTreeNode* gf_findLeafO(span<u8> key) {
+      MetaDataPage* meta = (MetaDataPage*)bm->toPtr(metadataPageId);
+      BTreeNode* node = (BTreeNode*)bm->toPtr(meta->getRoot(slotId));
+
+      while (node->isInner()){
+         BTreeNode* oldNode = node;
+         PID newPID = node->lookupInner(key);
+         if(newPID>bm->virtCount){
+             printf("notValid: %u\n", workerThreadId);
+             exit(EXIT_FAILURE);
+         }
+         node = (BTreeNode*)bm->toPtr(node->lookupInner(key));
+      }
+      return node;
+   }
+#pragma GCC pop_options
+
+
    // point lookup, returns payload len on success, or -1 on failure
-   int lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize, int tid) {
+   int lookup(span<u8> key, u8* payloadOut, unsigned payloadOutSize) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            BTreeNode* node = gf_findLeafO(key);
+            //dummyGuard<BTreeNode> node = gf_findLeafO(key);
+            //GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1373,10 +1459,12 @@ struct BTree {
    }
 
    template<class Fn>
-   bool lookup(span<u8> key, Fn fn, int tid) {
+   bool lookup(span<u8> key, Fn fn) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            BTreeNode* node = gf_findLeafO(key);
+            //dummyGuard<BTreeNode> node = gf_findLeafO(key);
+            //GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1390,14 +1478,14 @@ struct BTree {
       }
    }
 
-   void insert(span<u8> key, span<u8> payload, int tid);
-   bool remove(span<u8> key, int tid);
+   void insert(span<u8> key, span<u8> payload);
+   bool remove(span<u8> key);
 
    template<class Fn>
-   bool updateInPlace(span<u8> key, Fn fn, int tid) {
+   bool updateInPlace(span<u8> key, Fn fn) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<BTreeNode> node = findLeafO(key, tid);
+            GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
             if (!found){
@@ -1413,15 +1501,15 @@ struct BTree {
       }
    }
 
-   GuardS<BTreeNode> findLeafS(span<u8> key, int tid) {
+   GuardS<BTreeNode> findLeafS(span<u8> key) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
-            GuardO<MetaDataPage> meta(metadataPageId, tid);
-            GuardO<BTreeNode> node(meta->getRoot(slotId), meta, tid);
+            GuardO<MetaDataPage> meta(metadataPageId);
+            GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
             meta.release();
 
             while (node->isInner())
-               node = GuardO<BTreeNode>(node->lookupInner(key), node, tid);
+               node = GuardO<BTreeNode>(node->lookupInner(key), node);
 
             return GuardS<BTreeNode>(move(node));
          } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -1429,8 +1517,8 @@ struct BTree {
    }
 
    template<class Fn>
-   void scanAsc(span<u8> key, Fn fn, int tid) {
-      GuardS<BTreeNode> node = findLeafS(key, tid);
+   void scanAsc(span<u8> key, Fn fn) {
+      GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
@@ -1442,14 +1530,14 @@ struct BTree {
             if (!node->hasRightNeighbour())
                return;
             pos = 0;
-            node = GuardS<BTreeNode>(node->nextLeafNode, tid);
+            node = GuardS<BTreeNode>(node->nextLeafNode);
          }
       }
    }
 
    template<class Fn>
-   void scanDesc(span<u8> key, Fn fn, int tid) {
-      GuardS<BTreeNode> node = findLeafS(key, tid);
+   void scanDesc(span<u8> key, Fn fn) {
+      GuardS<BTreeNode> node = findLeafS(key);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
       if (pos == node->count) {
@@ -1464,7 +1552,7 @@ struct BTree {
          }
          if (!node->hasLowerFence())
             return;
-         node = findLeafS(node->getLowerFence(), tid);
+         node = findLeafS(node->getLowerFence());
          pos = node->count-1;
       }
    }
@@ -1473,21 +1561,21 @@ struct BTree {
 static unsigned btreeslotcounter = 0;
 
 BTree::BTree() : splitOrdered(false) {
-   GuardX<MetaDataPage> page(metadataPageId, 0);
-   AllocGuard<BTreeNode> rootNode(0, true);
+   GuardX<MetaDataPage> page(metadataPageId);
+   AllocGuard<BTreeNode> rootNode(true);
    slotId = btreeslotcounter++;
    page->roots[slotId] = rootNode.pid;
 }
 
 BTree::~BTree() {}
 
-void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen, int tid)
+void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen)
 {
 
    // create new root if necessary
    if (parent.pid == metadataPageId) {
       MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent.ptr);
-      AllocGuard<BTreeNode> newRoot(tid, false);
+      AllocGuard<BTreeNode> newRoot(false);
       newRoot->upperInnerNode = node.pid;
       metaData->roots[slotId] = newRoot.pid;
       parent = move(newRoot);
@@ -1499,26 +1587,26 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
    node->getSep(sepKey, sepInfo);
 
    if (parent->hasSpaceFor(sepInfo.len, sizeof(PID))) {  // is there enough space in the parent for the separator?
-      node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len}, tid);
+      node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len});
       return;
    }
 
    // must split parent to make space for separator, restart from root to do this
    node.release();
    parent.release();
-   ensureSpace(parent.ptr, {sepKey, sepInfo.len}, sizeof(PID), tid);
+   ensureSpace(parent.ptr, {sepKey, sepInfo.len}, sizeof(PID));
 }
 
-void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen, int tid)
+void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
 {
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         GuardO<BTreeNode> parent(metadataPageId);
+         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
          while (node->isInner() && (node.ptr != toSplit)) {
             parent = move(node);
-            node = GuardO<BTreeNode>(parent->lookupInner(key), parent, tid);
+            node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
          if (node.ptr == toSplit) {
             if (node->hasSpaceFor(key.size(), payloadLen)){
@@ -1526,25 +1614,25 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen, i
             }
             GuardX<BTreeNode> parentLocked(move(parent));
             GuardX<BTreeNode> nodeLocked(move(node));
-            trySplit(move(nodeLocked), move(parentLocked), key, payloadLen, tid);
+            trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
          }
          return;
       } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
-void BTree::insert(span<u8> key, span<u8> payload, int tid)
+void BTree::insert(span<u8> key, span<u8> payload)
 {
    assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         GuardO<BTreeNode> parent(metadataPageId);
+         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
          while (node->isInner()) {
             parent = move(node);
-            node = GuardO<BTreeNode>(parent->lookupInner(key), parent, tid);
+            node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
 
          if (node->hasSpaceFor(key.size(), payload.size())) {
@@ -1558,25 +1646,25 @@ void BTree::insert(span<u8> key, span<u8> payload, int tid)
          // lock parent and leaf
          GuardX<BTreeNode> parentLocked(move(parent));
          GuardX<BTreeNode> nodeLocked(move(node));
-         trySplit(move(nodeLocked), move(parentLocked), key, payload.size(), tid);
+         trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
       } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
-bool BTree::remove(span<u8> key, int tid)
+bool BTree::remove(span<u8> key)
 {
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
-         GuardO<BTreeNode> parent(metadataPageId, tid);
-         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent, tid);
+         GuardO<BTreeNode> parent(metadataPageId);
+         GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
          u16 pos;
          while (node->isInner()) {
             pos = node->lowerBound(key);
             PID nextPage = (pos == node->count) ? node->upperInnerNode : node->getChild(pos);
             parent = move(node);
-            node = GuardO<BTreeNode>(nextPage, parent, tid);
+            node = GuardO<BTreeNode>(nextPage, parent);
          }
 
          bool found;
@@ -1590,7 +1678,7 @@ bool BTree::remove(span<u8> key, int tid)
             // underfull
             GuardX<BTreeNode> parentLocked(move(parent));
             GuardX<BTreeNode> nodeLocked(move(node));
-            GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1), tid);
+            GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             nodeLocked->removeSlot(slotId);
             if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
                if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {
@@ -1626,7 +1714,7 @@ struct vmcacheAdapter
    BTree tree;
 
    public:
-   void scan(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb, int tid) {
+   void scan(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
@@ -1636,10 +1724,10 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-      }, tid);
+      });
    }
    // -------------------------------------------------------------------------------------
-   void scanDesc(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb, int tid) {
+   void scanDesc(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       u8 kk[Record::maxFoldLength()];
@@ -1655,55 +1743,55 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-      }, tid);
+      });
    }
    // -------------------------------------------------------------------------------------
-   void insert(const typename Record::Key& key, const Record& record, int tid) {
+   void insert(const typename Record::Key& key, const Record& record) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)}, tid);
+      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)});
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
-   void lookup1(const typename Record::Key& key, Fn fn, int tid) {
+   void lookup1(const typename Record::Key& key, Fn fn) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       bool succ = tree.lookup({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<const Record*>(payload.data()));
-      }, tid);
+      });
       assert(succ);
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
-   void update1(const typename Record::Key& key, Fn fn, int tid) {
+   void update1(const typename Record::Key& key, Fn fn) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       tree.updateInPlace({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<Record*>(payload.data()));
-      }, tid);
+      });
    }
    // -------------------------------------------------------------------------------------
    // Returns false if the record was not found
-   bool erase(const typename Record::Key& key, int tid) {
+   bool erase(const typename Record::Key& key) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-      return tree.remove({k, l}, tid);
+      return tree.remove({k, l});
    }
    // -------------------------------------------------------------------------------------
    template <class Field>
-   Field lookupField(const typename Record::Key& key, Field Record::*f, int tid) {
+   Field lookupField(const typename Record::Key& key, Field Record::*f) {
       Field value;
-      lookup1(key, [&](const Record& r) { value = r.*f; }, tid);
+      lookup1(key, [&](const Record& r) { value = r.*f; });
       return value;
    }
 
-   u64 count(int tid) {
+   u64 count() {
       u64 cnt = 0;
-      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; } , tid);
+      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; });
       return cnt;
    }
 
-   u64 countw(Integer w_id, int tid) {
+   u64 countw(Integer w_id) {
       u8 k[sizeof(Integer)];
       fold(k, w_id);
       u64 cnt = 0;
@@ -1715,7 +1803,7 @@ struct vmcacheAdapter
             return false;
          cnt++;
          return true;
-      }, tid);
+      });
       return cnt;
    }
 };
@@ -1750,7 +1838,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 
 int main(int argc, char** argv) {
    unsigned nthreads = envOr("THREADS", 1);
-   initRNG(nthreads);
+   //initRNG(nthreads);
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -1768,7 +1856,15 @@ int main(int argc, char** argv) {
          float rmb = (bm->readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm->writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;//avg_memcpy << "," << avg_memcmp << endl;
+         u64 pfc = pfCount.exchange(0);
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << "," << pfc << endl;
+         /*for(int i=0; i<64; i++){
+             u64 nb = readCountThread[i].exchange(0);
+             if(nb==0){
+                 cout << i << ",";
+             }
+         }
+         cout << endl;*/
       }  
       keepRunning = false;
    };
@@ -1781,37 +1877,57 @@ int main(int argc, char** argv) {
       {
          // insert
          parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            bm->registerThread();
-            //workerThreadId = worker;
+            //bm->registerThread();
+            workerThreadId = worker;
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
                rte_memcpy(payload.data(), k1, sizeof(u64));
-               bt.insert({k1, sizeof(KeyType)}, payload, worker);
+               bt.insert({k1, sizeof(KeyType)}, payload);
             }
-            bm->forgetThread();
+            //bm->forgetThread();
+            workerThreadId = -1;
          });
       }
       cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)gb << " GB " << endl;
+      std::vector<PID> toWrite;
+      u64 initialPos = bm->residentSet.clockPos.load(), finalPos = initialPos + bm->residentSet.count, currPos = initialPos;
+      while(currPos < finalPos){
+        while (toWrite.size() < 64 && currPos < finalPos) {
+            u64 pid = bm->residentSet.ht[bm->residentSet.clockPos.load()].pid.load();
+            if (walk(bm->toPtr(pid)).dirty == 1) {
+                toWrite.push_back(pid);
+            }
+            PageState& ps = bm->getPageState(pid);
+            ps.setToUnlockedIfMarked();
+            currPos++;
+            bm->residentSet.clockPos++;
+        }
+        if(toWrite.size() == maxQueueSize){
+            bm->sync(toWrite, 0);
+            toWrite.clear();
+        }
+      }
 
       bm->readCount = 0;
       bm->writeCount = 0;
+      pfCount.store(0);
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         bm->registerThread();
-         //workerThreadId = worker;
+         //bm->registerThread();
+         workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
          while (keepRunning.load()) {
             union { u64 v1; u8 k1[sizeof(u64)]; };
-            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n, worker));
+            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
 
             array<u8, 120> payload;
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
                rte_memcpy(payload.data(), p.data(), p.size());
-            }, worker);
+            });
             assert(succ);
             assert(rte_memcmp(k1, payload.data(), sizeof(u64))==0);
 
@@ -1824,7 +1940,8 @@ int main(int argc, char** argv) {
             }
          }
          txProgress += cnt;
-         bm->forgetThread();
+         //bm->forgetThread();
+         workerThreadId = -1;
       });
 
       statThread.join();
@@ -1849,21 +1966,21 @@ int main(int argc, char** argv) {
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
 
    {
-      tpcc.loadItem(0);
-      tpcc.loadWarehouse(0);
+      tpcc.loadItem();
+      tpcc.loadWarehouse();
 
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
          bm->registerThread();
-         uint32_t tpcchistorycounter = 0;
+         //uint32_t tpcchistorycounter = 0;
          //workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             //printf("%lu: %u\n", worker, w_id);
-            tpcc.loadStock(w_id, worker);
-            tpcc.loadDistrinct(w_id, worker);
+            tpcc.loadStock(w_id);
+            tpcc.loadDistrinct(w_id);
             for (Integer d_id = 1; d_id <= 10; d_id++) {
                //printf("\t%u\n", d_id);
-               tpcc.loadCustomer(w_id, d_id, worker, &tpcchistorycounter, worker);
-               tpcc.loadOrders(w_id, d_id, worker);
+               tpcc.loadCustomer(w_id, d_id);
+               tpcc.loadOrders(w_id, d_id);
             }
          }
          bm->forgetThread();
@@ -1880,13 +1997,12 @@ int main(int argc, char** argv) {
     parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
       zeroout_measures();
       bm->registerThread();
-      uint32_t tpcchistorycounter = 0;
       //workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
-         int w_id = tpcc.urand(1, warehouseCount, worker); // wh crossing
-         tpcc.tx(w_id, worker, &tpcchistorycounter, worker);
+         int w_id = tpcc.urand(1, warehouseCount); // wh crossing
+         tpcc.tx(w_id);
          cnt++;
          u64 stop = rdtsc();
          if ((stop-start) > statDiff) {

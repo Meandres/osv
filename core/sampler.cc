@@ -26,6 +26,8 @@ static unsigned int _n_cpus;
 static config _config;
 static sched::thread_handle _controller;
 static mutex _control_lock;
+uint64_t counter_log=0;
+std::vector<trc_t> thread_runtime_log;
 
 class cpu_sampler : public sched::timer_base::client {
 private:
@@ -52,6 +54,8 @@ public:
     void timer_fired()
     {
         trace_sampler_tick();
+        sched::save_all_thread_runtimes(counter_log); 
+        counter_log++;
         rearm();
     }
 
@@ -78,6 +82,13 @@ public:
         return _active;
     }
 };
+
+void print_log(){
+    std::cerr << "name,counter,runtime" << std::endl;
+    for(trc_t thread_runtime: thread_runtime_log){
+        std::cerr << thread_runtime.name << "," << thread_runtime.counter << "," << thread_runtime.runtime << std::endl;
+    }
+}
 
 static dynamic_percpu<cpu_sampler> _sampler;
 

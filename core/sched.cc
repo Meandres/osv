@@ -27,6 +27,7 @@
 #include <osv/app.hh>
 #include <osv/symbols.hh>
 #include <osv/stubbing.hh>
+#include <osv/sampler.hh>
 
 MAKE_SYMBOL(sched::thread::current);
 MAKE_SYMBOL(sched::cpu::current);
@@ -146,6 +147,9 @@ cpu::cpu(unsigned _id)
     , preemption_timer(*this)
     , idle_thread()
     , terminating_thread(nullptr)
+    , _load_balance_resume(true)
+    , _load_balance_mutex()
+    , _load_balance_condvar()
     , c(cinitial)
     , renormalize_count(0)
 {
@@ -790,19 +794,27 @@ void thread::unpin()
 }
 
 void cpu::enable_load_balancing(){
-    this->_load_balance_lock.unlock();
+    _load_balance_resume.store(true);
+    _load_balance_mutex.unlock();
+    _load_balance_condvar.notify_all();
 }
 
 void cpu::disable_load_balancing(){
-    this->_load_balance_lock.lock();
+    _load_balance_mutex.lock();
+    _load_balance_resume.store(false);
 }
 
 void cpu::load_balance()
 {
+    std::unique_lock<std::mutex> mut(_load_balance_mutex);
     notifier::fire();
     timer tmr(*thread::current());
     while (true) {
-        //std::lock_guard<mutex> guard(_load_balance_lock);
+        if(_load_balance_resume.load() == false){
+            while (_load_balance_resume.load() != true){
+                _load_balance_condvar.wait(mut);
+            }
+        }
         tmr.set(osv::clock::uptime::now() + 100_ms);
         thread::wait_until([&] { return tmr.expired(); });
         if (runqueue.empty()) {
@@ -970,6 +982,14 @@ std::unordered_map<id_type, thread *> thread_map
     __attribute__((init_priority((int)init_prio::threadlist)));
 
 static thread_runtime::duration total_app_time_exited(0);
+
+void save_all_thread_runtimes(uint64_t counter){
+    WITH_LOCK(thread_map_mutex) {
+        for (auto th : thread_map) {
+            prof::thread_runtime_log.push_back({counter, (*th.second).name(), std::chrono::nanoseconds((*th.second).thread_clock()).count()});
+        }
+    }
+}
 
 thread_runtime::duration thread::thread_clock() {
     if (this == current()) {
@@ -1247,7 +1267,6 @@ void thread::start()
         _detached_state->st.store(status::prestarted);
         return;
     }
-
     _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : current()->tcpu();
     remote_thread_local_var(percpu_base) = _detached_state->_cpu->percpu_base;
     remote_thread_local_var(current_cpu) = _detached_state->_cpu;

@@ -1,5 +1,5 @@
 linux-mmtest:
-	g++ -std=c++20 -O3 mm_test.cc -o linux_mm_test -DLINUX
+	g++ -std=c++20 -mavx -mavx2 -O3 mm_test.cc -o linux_mm_test -DLINUX
 
 osv-mmtest:
 src= ../..

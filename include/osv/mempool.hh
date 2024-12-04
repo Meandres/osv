@@ -23,6 +23,7 @@
 #include <osv/contiguous_alloc.hh>
 #include <boost/lockfree/stack.hpp>
 #include <boost/lockfree/policies.hpp>
+#include <osv/ymap.hh>
 
 extern "C" void thread_mark_emergency();
 

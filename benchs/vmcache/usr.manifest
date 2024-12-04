@@ -1,1 +1,2 @@
 /vmcache: ${MODULE_DIR}/vmcache
+/vmcache_transparent: ${MODULE_DIR}/vmcache_transparent

@@ -1,7 +1,8 @@
-#include <drivers/ymap.hh>
+#include <osv/ymap.hh>
 #include <osv/trace.hh> 
 #include <vector>
 #include <thread>
+#include <osv/cache.hh>
 
 TRACEPOINT(trace_ymap_map, "");
 TRACEPOINT(trace_ymap_map_ret, "");
@@ -10,18 +11,39 @@ TRACEPOINT(trace_ymap_steal_ret, "");
 TRACEPOINT(trace_ymap_unmap, "");
 TRACEPOINT(trace_ymap_unmap_ret, "");
 
-Ymap::Ymap(u64 count, int tid, void* virt) {
+u64 startPhysRegion = 0;
+u64 sizePhysRegion = 0;
+
+//Ymap::Ymap(u64 count, int tid, void* virt) {
+Ymap::Ymap(u64 count, int tid){
 	//mmap_and_pmap(count);
 	nbPagesToSteal = 100; // should it be dynamic and/or depend on cout
 	interfaceId = tid;
 	vec_lock.clear();
     pageStolen = 0ULL;
-	list.reserve(count*1.5);
-	for(u64 i=0; i<count; i++){
+    maxSize = count * 1.5;
+    if(maxSize%8 != 0){
+        maxSize -= (maxSize%8);
+    }
+    //list = (frameCol_t*)malloc(sizeof(frameCol_t)*maxSize/8);
+    list.reserve(count*1.5);
+    u64 maxAddr = startPhysRegion + count * pageSize * (tid+1); // stop at the last page of the region
+	u64 handPos = startPhysRegion + count * pageSize * tid;
+    //u64 frameAddr = handPos;
+    /*for(u64 i = 0; i < count/8; i++){
+        for(u64 cnt = 0; cnt < 8; cnt++){
+            list[i].buf[cnt] = frameAddr>>12;
+            frameAddr += 4096;
+        }
+    }*/
+    for(u64 i=handPos; i<maxAddr; i+=4096){
+        list.push_back(i>>12);
+    }
+    /*for(u64 i=0; i<count; i++){
 		int* j = (int*)(virt+i*pageSize);
         *j=0;
 		list.push_back(walk(j).phys);
-	}
+	}*/
 }
 
 void Ymap::lock(){ // spinlock
@@ -38,11 +60,11 @@ void Ymap::setPhysAddr(void* virt, u64 phys){
 	PTE pagePTE(0ull);
 	std::atomic<u64>* ptePtr = walkRef(virt);
 	PTE oldPTE = PTE(ptePtr->load());
-    u64 oldPhys = oldPTE.phys;
-    if(oldPhys != 0){
-        printf("%p -> %llu\n", virt, oldPhys);
+    if(oldPTE.phys != 0){
+        printf("phys: %lu\n", oldPTE.phys);
+        printf("state %lu\n", (get_mmr(virt)->getPageState(get_mmr(virt)->toPID(virt))).getState());
+	    assert(oldPTE.phys == 0);
     }
-	assert(oldPhys == 0);
 	pagePTE.present = 1;
 	pagePTE.writable = 1;
     pagePTE.user = oldPTE.user;
@@ -60,23 +82,33 @@ u64 Ymap::clearPhysAddr(void* virt){
 	return phys;
 }
 
+/*u64 Ymap::getPage(){
+    u64 phys;
+    lock();
+    if(list.size() == 0){
+        assert(!currentlyStealing.exchange(true, std::memory_order_acquire));
+        assert(stealPages());
+        assert(currentlyStealing.exchange(false, std::memory_order_release));
+    }
+    phys = list.back();
+    list.pop_back();
+    unlock();
+    return phys;
+}
+
+void Ymap::putPage(u64 phys){
+    lock();
+    list.push_back(phys);
+    unlock();
+}*/
+
 YmapBundle::YmapBundle(u64 pageCount, int n_threads){
-	void* virt = mmap(NULL, pageCount * pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	madvise(virt, pageCount * pageSize, MADV_NOHUGEPAGE);
+    if(pageCount * pageSize > sizePhysRegion){
+        assert(false);
+    }
 	u64 pagesPerThread = pageCount / n_threads;
-    std::vector<std::thread> threads;
-	for(int i=0;i<n_threads;i++){
-        threads.emplace_back([&, i]() {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(i, &cpuset);
-            pthread_t current_thread = pthread_self();
-            pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-		    ymapInterfaces.push_back(new Ymap(pagesPerThread, i, virt + i*pagesPerThread*pageSize));
-        });
-	}
-    for (auto& t: threads){
-        t.join();
+    for(int i=0; i<n_threads; i++){
+        ymapInterfaces.push_back(new Ymap(pagesPerThread, i));
     }
 }
 
@@ -93,7 +125,7 @@ bool YmapBundle::stealPages(int tid){
 		do{
 			phys = getPage(target, false);
 			if(phys != 0){
-				ymapInterfaces[tid]->list.push_back(phys);
+                putPage(tid, phys);
 				toSteal--;
 			}
 		}while(phys!=0 && toSteal>0);
@@ -108,7 +140,7 @@ bool YmapBundle::stealPages(int tid){
 	return false;
 }
 
-u64 YmapBundle::getPage(int tid, bool canSteal=true){
+u64 YmapBundle::getPage(int tid, bool canSteal){
 	u64 phys;
 	ymapInterfaces[tid]->lock();
 	if(ymapInterfaces[tid]->list.size() == 0){
@@ -134,7 +166,7 @@ void YmapBundle::putPage(int tid, u64 phys){
 
 void YmapBundle::mapPhysPage(int tid, void* virtAddr){
     trace_ymap_map();
-	u64 phys = getPage(tid);
+	u64 phys = getPage(tid, true);
 	assert(phys!=0);
 	ymapInterfaces[tid]->lock();
 	ymapInterfaces[tid]->setPhysAddr(virtAddr, phys);
@@ -150,6 +182,20 @@ void YmapBundle::unmapPhysPage(int tid, void* virtAddr){
     assert(walk(virtAddr).phys == 0ull);
 	ymapInterfaces[tid]->unlock();
     trace_ymap_unmap_ret();
+}
+    
+bool YmapBundle::tryMap(int tid, void* virtAddr, u64 phys){
+	std::atomic<u64>* ptePtr = walkRef(virtAddr);
+	PTE oldPTE = PTE(ptePtr->load());
+    if(oldPTE.phys != 0){
+        return false;
+    } 
+	PTE pagePTE(0ull);
+	pagePTE.present = 1;
+	pagePTE.writable = 1;
+    pagePTE.user = oldPTE.user;
+	pagePTE.phys = phys;
+	return ptePtr->compare_exchange_strong(oldPTE.word, pagePTE.word);
 }
 
 void YmapBundle::unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict){

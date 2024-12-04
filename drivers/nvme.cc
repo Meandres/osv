@@ -61,7 +61,7 @@
 #include <osv/ioctl.h>
 #include <osv/contiguous_alloc.hh>
 #include <osv/mmu.hh>
-#include "drivers/ymap.hh"
+#include <osv/ymap.hh>
 #include <sys/time.h>
 
 #include <atomic>
@@ -914,7 +914,7 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
     do {
         cid = nvme_check_completion(q->nvmeq, &err, cqe_cs);
         if (timeout == 0 || cid >= 0) break;
-        if (endtsc) sched_yield();
+        if (endtsc){} //sched_yield();
         else endtsc = rdtsc() + timeout * q->nvmeq->dev->rdtsec;
     } while (rdtsc() < endtsc);
 
@@ -970,6 +970,10 @@ static u16 unvme_get_cid(unvme_desc_t* desc)
 
     // get a free cid
     cid = q->cid;
+    if(q->cidmask == NULL){
+        printf("cidmask null for q : %u\n", q->nvmeq->id);
+        assert(false);
+    }
     while (q->cidmask[cid >> 6] & ((u64)1L << (cid & 63))) {
         if (++cid >= qsize) cid = 0;
     }
@@ -1000,6 +1004,7 @@ static u64 unvme_map_dma(const unvme_ns_t* ns, void* buf, u64 bufsz)
     //u64 addr = (u64)buf & dev->vfiodev.iovamask;
     //TODO: this doesn't work for malloc-ed memory
     // need to use this instead u64 addr = mmu::virt_to_phys_dynamic_phys(buf);
+    //u64 addr = mmu::virt_to_phys_dynamic_phys(buf);
     u64 addr = walk(buf).phys<<12;
     assert(addr!=0);
 #else
@@ -1709,7 +1714,7 @@ int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb)
     //trace_unvme_read(qid, nlb);
     unvme_iod_t iod = unvme_aread(ns, qid, buf, slba, nlb);
     if (iod) {
-        sched_yield();
+        //sched_yield();
         return unvme_apoll(iod, UNVME_SHORT_TIMEOUT);
     }
     return -1;

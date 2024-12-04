@@ -901,8 +901,8 @@ drivers += drivers/vmcache.o
 CXXFLAGS += -DVMCACHE
 else
 objects += core/cache.o
+objects += core/ymap.o
 endif
-drivers += drivers/ymap.o
 drivers += drivers/driver.o
 
 ifeq ($(arch),x64)
@@ -1077,6 +1077,7 @@ objects += core/mempool.o
 objects += core/alloctracker.o
 objects += core/printf.o
 objects += core/sampler.o
+#objects += core/rte_ring.o
 
 objects += linux.o
 objects += core/commands.o

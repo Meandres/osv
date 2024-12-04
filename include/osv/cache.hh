@@ -26,7 +26,7 @@
 
 #include <cstring>
 #include <drivers/nvme.hh>
-#include <drivers/ymap.hh>
+#include <osv/ymap.hh>
 #include <osv/mmu.hh>
 
 #include <chrono>
@@ -34,10 +34,10 @@
 
 #ifndef VMCACHE
 
-extern __thread uint64_t workerThreadId __attribute__ ((tls_model ("initial-exec")));
-
 typedef u64 PID; // page id type
 extern std::atomic<u64> evictCount;
+extern std::atomic<u64> pfCount;
+extern thread_local int __attribute__ ((tls_model ("initial-exec"))) workerThreadId;
 
 const u64 mb = 1024ull * 1024;
 const u64 gb = 1024ull * 1024 * 1024;
@@ -48,11 +48,61 @@ static const int16_t maxQueueSize = 256;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
+static const int NB_VAL = 1;
+typedef struct measure{
+    u64 count;
+    u64 values[NB_VAL];
+} measure_t;
+
+extern __thread measure_t local_measure __attribute__ ((tls_model ("initial-exec")));
+extern std::mutex measure_mutex;
+extern measure_t global_measure;
+
+inline void zeroout_measures(){
+    for(int i=0; i<NB_VAL; i++){
+        local_measure.values[i] = 0;
+        global_measure.values[i] = 0;
+    }
+    local_measure.count = 0;
+    global_measure.count = 0;
+}
+
+inline void add_measures(){
+    measure_mutex.lock();
+    for(int i=0; i<NB_VAL; i++){
+        global_measure.values[i] += local_measure.values[i];
+    }
+    global_measure.count += local_measure.count;
+    measure_mutex.unlock();
+}
+inline void print_measures(){
+    std::cerr << "Measures: " << std::endl;
+    std::cerr << "Count " << global_measure.count << std::endl;
+    std::cerr << "hanhandleFaultt: " << global_measure.values[0] << ", " << global_measure.values[0]/(global_measure.count+0.0)<< std::endl;
+}
+
 // allocate memory using huge pages
 void* allocHuge(size_t size);
 
 // use when lock is not free
 void yield(u64 counter);
+
+struct PagePin {
+    std::atomic<u64> count;
+    void init() { count.store(0); }
+
+    bool hasWaiters(){
+        return count.load() > 0;
+    }
+    
+    void add(){
+        count++;
+    }
+    void decr(){
+        u64 prevVal = count--;
+        assert(prevVal > 0);
+    }
+};
 
 struct PageState {
    std::atomic<u64> stateAndVersion;
@@ -113,8 +163,16 @@ struct PageState {
    }
 
    bool tryValidate(u64 oldStateAndVersion){
-       assert(getState(oldStateAndVersion)==Evicted);
+       if(getState(oldStateAndVersion)!=Evicted)
+           return false;
        return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Unlocked));
+   }
+
+   void setToUnlockedIfMarked(){
+       assert(getState() == 0 || getState() >= 254);
+       if(getState() == Evicted)
+           return;
+       stateAndVersion.store(sameVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
    }
 
    static u64 getState(u64 v) { return v >> 56; };
@@ -144,6 +202,7 @@ struct ResidentPageSet {
    u64 hash(u64 k);
    
    bool insert(u64 pid);
+   bool contains(u64 pid);
    bool remove(u64 pid);
    template<class Fn> void iterateClockBatch(u64 batch, Fn fn);
 };
@@ -167,6 +226,7 @@ class CacheManager {
    	u64 physSize;
    	int n_threads;
     int nb_queues_used;
+    Page* lastPage;
   
 	// accessory
 	u64 virtCount;
@@ -187,6 +247,8 @@ class CacheManager {
 	// interface <-> application
    	PageState* pageState;
    	ResidentPageSet residentSet;
+    Page* emptyPages;
+    PagePin* pagePin;
 
     // callbacks customization
     std::vector<cache_op_func_t> handlers;
@@ -202,6 +264,10 @@ class CacheManager {
     	return pageState[pid];
    	}
 
+    PagePin& getPagePin(PID pid){
+        return pagePin[pid];
+    }
+
    	Page* fixX(PID pid);
    	void unfixX(PID pid);
    	Page* fixS(PID pid);
@@ -213,10 +279,14 @@ class CacheManager {
 
    	void ensureFreePages();
    	void readPage(PID pid);
+    void readPageAt(PID pid, void* virt);
    	Page* allocPage();
+    u64 getNextPid() { return allocCount++; }
+    void sync(std::vector<PID> pages, int tid);
     
     int allocate(PID* listStart, int size);
    	void handleFault(PID pid);
+    void explicitFix(PID pid);
    	void evict();
 
     inline void registerThread(){
@@ -224,37 +294,42 @@ class CacheManager {
             _mm_pause();
         }
         assert(freeIDList.size()>=0);
-		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+		//int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
         if(freeIDList.empty()){
             printf("Overcommitment of threads. Failing\n");
             assert(false);
         }
         int id = freeIDList.back();
-        threadMap.insert({tid, id}); 
+        workerThreadId = id;
+        //threadMap.insert({tid, id}); 
         freeIDList.pop_back();
         //std::cout << "Mapped thread " << tid << " to ID " << id << std::endl;
         lockFreeIDList.clear(std::memory_order_release);
+        //sched::cpu::current()->disable_load_balancing();
     }
     inline void forgetThread(){
-		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+		//int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
         while(lockFreeIDList.test_and_set(std::memory_order_acquire)){
             _mm_pause();
         }
-        auto search = threadMap.find(tid);
+        /*auto search = threadMap.find(tid);
         if (search != threadMap.end()){
 			freeIDList.push_back(search->second);
             threadMap.erase(tid);
             //std::cout << "Unmapped thread " << tid << std::endl;
-		}
+		}*/
+        freeIDList.push_back(workerThreadId);
+        workerThreadId = -1;
         lockFreeIDList.clear(std::memory_order_release);
+        //sched::cpu::current()->enable_load_balancing();
     }
 	inline int getTID(){
-        //return workerThreadId;
-		int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
+        return workerThreadId;
+		/*int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
         auto search = threadMap.find(tid);
         if (search != threadMap.end())
             return search->second;
-        return -1;
+        return -1;*/
 	}
 };
 

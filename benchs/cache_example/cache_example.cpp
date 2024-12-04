@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <random>
 #include <functional>
-#include "BTree.hpp"
+//#include "BTree.hpp"
 #include "drivers/rdtsc.h"
 
 std::uniform_int_distribution<u64> int_distri[32];
@@ -15,7 +15,7 @@ using namespace std;
 
 const int intPerPage = 4096/sizeof(int);
 
-u64 rng(int tid){
+/*u64 rng(int tid){
     return int_distri[tid](engine[tid]);
 }
 
@@ -71,7 +71,7 @@ void loadArray(void* start, u64 size, int n_threads){
         cache->forgetThread();
         add_thread_results();
     });
-}
+}*/
 
 u64 envOr(const char* env, u64 value){
     if (getenv(env))
@@ -98,15 +98,19 @@ int main(int argc, char** argv){
             float rmb = (cache->readCount.exchange(0)*pageSize)/(1024.0*1024);
             float wmb = (cache->writeCount.exchange(0)*pageSize)/(1024.0*1024);
             u64 prog = txProgress.exchange(0);
-            u64 pfCount = pageFaultNumber.exchange(0);
-            cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  "," << pfCount << "," << n_threads << endl;
+            cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  "," << n_threads << endl;
         }
         keepRunning = false;
     };
     cache = createMMIORegion(NULL, virtSize, physSize, n_threads, 64, false);
     if(cache->explicit_control)
         cout << "explicit_control " << endl;
-    loadArray(cache->virtMem, virtSize/4096, n_threads);
+    int og = 42;
+    memcpy(cache->virtMem, &og, sizeof(int));
+    int i;
+    memcpy(&i, cache->virtMem, sizeof(int));
+    printf("%u\n", i); 
+    /*loadArray(cache->virtMem, virtSize/4096, n_threads);
     cache->readCount = 0;
     cache->writeCount = 0;
     pageFaultNumber = 0;
@@ -132,7 +136,7 @@ int main(int argc, char** argv){
     });
 
     statThread.join();
-    print_aggregate_avg();
+    print_aggregate_avg();*/
     return 0;
 }
 

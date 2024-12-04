@@ -12,9 +12,9 @@
 
 #include "drivers/nvme.hh"
 
-#include "fio/fio/config-host.h"
-#include "fio/fio/fio.h"
-#include "fio/fio/optgroup.h"       // since fio 2.4
+#include "fio/config-host.h"
+#include "fio/fio.h"
+#include "fio/optgroup.h"       // since fio 2.4
 
 #if 0
     #define DEBUG(fmt, arg...)  printf("#" fmt "\n", ##arg)
@@ -145,7 +145,7 @@ static enum fio_q_status fio_unvme_queue(struct thread_data *td, struct io_u *io
     fio_ro_check(td, io_u);
 
     int ret = 1;
-    unvme_io_u_t *unvme_io_u = (unvme_io_u_t*)io_u->engine_data;
+    unvme_io_u_t *unvme_io_u = io_u->engine_data;
     unvme_io_u->slba = io_u->offset / unvme.ns->blocksize;
     unvme_io_u->nlb = io_u->xfer_buflen / unvme.ns->blocksize;
 
@@ -198,10 +198,10 @@ static int fio_unvme_close(struct thread_data *td, struct fio_file *f)
  */
 static int fio_unvme_init(struct thread_data *td)
 {
-    unvme_data_t* udata = (unvme_data_t*)calloc(1, sizeof(unvme_data_t));
+    unvme_data_t* udata = calloc(1, sizeof(unvme_data_t));
     if (!udata) return 1;
 
-    udata->iocq = (io_u**)calloc(td->o.iodepth + 1, sizeof(void*));
+    udata->iocq = calloc(td->o.iodepth + 1, sizeof(void*));
     if (!udata->iocq) {
         free (udata);
         return 1;
@@ -218,7 +218,7 @@ static int fio_unvme_init(struct thread_data *td)
  */
 static void fio_unvme_cleanup(struct thread_data *td)
 {
-    unvme_data_t* udata = (unvme_data_t*)td->io_ops_data;
+    unvme_data_t* udata = td->io_ops_data;
     if (udata) {
         if (udata->iocq) free(udata->iocq);
         free(udata);
@@ -263,7 +263,7 @@ static int fio_unvme_io_u_init(struct thread_data *td, struct io_u *io_u)
  */
 static void fio_unvme_io_u_free(struct thread_data *td, struct io_u *io_u)
 {
-    unvme_io_u_t* unvme_io_u = (unvme_io_u_t*)io_u->engine_data;
+    unvme_io_u_t* unvme_io_u = io_u->engine_data;
     if (unvme_io_u) {
         assert(unvme_io_u->io_u == io_u);
         unvme_free(unvme.ns, unvme_io_u->buf);
@@ -297,15 +297,15 @@ static int fio_unvme_get_file_size(struct thread_data *td, struct fio_file *f)
 struct ioengine_ops ioengine = {
     .name               = "unvme_fio",
     .version            = FIO_IOOPS_VERSION,
-    .flags              = FIO_NOEXTEND | FIO_MEMALIGN | FIO_SYNCIO,
-    .init               = fio_unvme_init,
     .queue              = fio_unvme_queue,
+    .init               = fio_unvme_init,
     .cleanup            = fio_unvme_cleanup,
     .open_file          = fio_unvme_open,
     .close_file         = fio_unvme_close,
     .get_file_size      = fio_unvme_get_file_size,
     .io_u_init          = fio_unvme_io_u_init,
     .io_u_free          = fio_unvme_io_u_free,
+    .flags              = FIO_NOEXTEND | FIO_MEMALIGN | FIO_SYNCIO,
 };
     //.event              = fio_unvme_event,
     //.getevents          = fio_unvme_getevents,

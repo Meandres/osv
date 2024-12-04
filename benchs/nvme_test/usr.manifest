@@ -1,1 +1,2 @@
-/ioengine_unvme: ${MODULE_DIR}/ioengine_unvme
+/nvme_test: ${MODULE_DIR}/nvme_test
+/ioengine_nvme: ${MODULE_DIR}/ioengine_nvme

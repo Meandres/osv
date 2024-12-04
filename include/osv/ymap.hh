@@ -24,6 +24,9 @@ constexpr uintptr_t get_mem_area_base(u64 area)
     return 0x400000000000 | uintptr_t(area) << 44;
 }
 
+extern u64 startPhysRegion;
+extern u64 sizePhysRegion;
+
 inline Page* phys_to_virt(u64 phys) {
    return ((Page*)get_mem_area_base(0)) + phys;
 }
@@ -144,59 +147,64 @@ inline PTE walkHuge(void* virt) {
    return pte;
 }
 
-struct PhysicalPage{
-	u64 addr:40;
-	PhysicalPage *nextFree;
-};
-
 inline bool get_stored_bit(void *virt){
-    return walk(virt).user;
-}
-
-inline void print_PP(PhysicalPage *phys){
-	std::cout << "PhysicalPage{" << std::bitset<40>(phys->addr);
-	printf(", %p}\n", phys->nextFree);
+    return walk(virt).user==1;
 }
 
 static u64 constexpr pageSize = 4096;
-extern u64 YmapRegionStartAddr;
-extern u64 YmapRegionSize;
 
 typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
 //typedef u64 elapsed_time;
 
-struct Ymap {
-	PhysicalPage *freeList; // free physical pages
-	
-	std::atomic_flag vec_lock = ATOMIC_FLAG_INIT; // with a lock on the whole vector
-	Page* initialMapping;
-	std::vector<u64>list; // for now we implement this simply
+typedef struct frameCollection {
+    u64 buf[8];
+} frameCol_t;
+
+typedef struct Ymap {
+    std::atomic_flag vec_lock = ATOMIC_FLAG_INIT;
+    std::vector<u64> list;
+    //struct rte_ring freeframes_ring;
+    u64 maxSize;
 	int interfaceId;
     u64 pageStolen;
-	u64 mappingCount;
 	u64 nbPagesToSteal;
-	std::atomic<bool> currentlyStealing = {false}; // the two atomic variables are far from each other
-						       // in hope that they won't fall on the same cache line (PRANKEX)
+    std::atomic<bool> currentlyStealing = {false}; // the two atomic variables are far away from each other 
+                                                   // in hope that they won't fall on the same cache line (PRANKEX)
 
-	Ymap(u64, int, void*);
+    Ymap(u64, int);
 	void lock();
 	void unlock();
 	void setPhysAddr(void* virt, u64 phys);
 	u64 clearPhysAddr(void* virt);
-};
+    u64 getPage();
+    void putPage(u64);
+} ymap_t;
 
+//PERCPU(ymap_t*, percpu_ymap);
+
+/*inline void initYmaps(u64 frameCount){
+    if(frameCount * pageSize > sizePhysRegion){
+        std::cerr << "Ymap region is too small" << std::endl;
+        assert(false);
+    }
+    u64 pagesPerCore = frameCount / sched::cpus
+}
+
+inline ymap_t& get_ymap(){
+    return **percpu_ymap;
+}*/
 struct YmapBundle{
     std::vector<Ymap*> ymapInterfaces;
 
     YmapBundle(u64 pageCount, int n_threads);
-    u64 getPage(int tid, bool stealing);
+    u64 getPage(int tid, bool canSteal=true);
 	bool stealPages(int tid);
 	void putPage(int tid, u64 phys);
-	//elapsed_time mapPhysPage(int tid, void* virtAddr);
-	//elapsed_time unmapPhysPage(int tid, void* virtAddr);
 	void mapPhysPage(int tid, void* virtAddr);
 	void unmapPhysPage(int tid, void* virtAddr);
+    bool tryMap(int tid, void* virtAddr, u64 phys);
 	void unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict);
 
 };
+
 #endif

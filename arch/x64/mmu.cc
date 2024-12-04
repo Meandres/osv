@@ -65,12 +65,17 @@ void invlpg_tlb_entry(void* addr){
 mutex tlb_invlpg_mutex;
 sched::thread_handle tlb_invlpg_waiter;
 std::atomic<int> tlb_invlpg_pendingconfirms;
-std::vector<void*> pages_to_invalidate;
+static const int max_pages = 128;
+typedef struct pages_to_invalidate {
+    int end;
+    void* pages[max_pages];
+} pages_to_invalidate_t;
+pages_to_invalidate_t page_list;
 
 void invlpg_tlb_entry_range(){
-	for(void* addr: pages_to_invalidate){
-		if(addr!=NULL)
-			invlpg_tlb_entry(addr);
+	for(int i=0; i<page_list.end; i++){
+		if(page_list.pages[i]!=NULL)
+			invlpg_tlb_entry(page_list.pages[i]);
     }
 }
 
@@ -83,11 +88,14 @@ inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
 };
 
 void invlpg_tlb_all(std::vector<void*> addresses){
-    pages_to_invalidate.clear();
+    int i = 0;
+    assert(addresses.size() <= max_pages);
     for(void* addr: addresses){
-	    pages_to_invalidate.push_back(addr);
+        page_list.pages[i] = addr;
+        i++;
     }
-    std::vector<sched::cpu*> ipis(sched::max_cpus);
+    page_list.end = i;
+    std::vector<sched::cpu*> ipis;
 
     if (sched::cpus.size() <= 1) {
 		invlpg_tlb_entry_range();
