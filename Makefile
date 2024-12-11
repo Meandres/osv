@@ -1085,6 +1085,14 @@ objects += core/debug.o
 objects += core/rcu.o
 objects += core/pagecache.o
 objects += core/mempool.o
+
+objects += core/llfree/bitfield.o
+objects += core/llfree/llfree.o
+objects += core/llfree/child.o
+objects += core/llfree/local.o
+objects += core/llfree/lower.o
+objects += core/llfree/tree.o
+
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif
