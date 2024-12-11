@@ -37,6 +37,8 @@
 #include <osv/migration-lock.hh>
 #include <osv/export.h>
 
+#include "osv/llfree.h"
+
 #include <osv/kernel_config_lazy_stack.h>
 #include <osv/kernel_config_lazy_stack_invariant.h>
 #include <osv/kernel_config_memory_debug.h>
@@ -279,6 +281,9 @@ void pool::add_page()
     // we may add this page to the free list of a different cpu, due to the
     // enablement of preemption
     void* page = untracked_alloc_page();
+
+    // TODO llfree_alloc here
+
 #if CONF_lazy_stack_invariant
     assert(sched::preemptable() && arch::irq_enabled());
 #endif
@@ -361,6 +366,8 @@ void pool::free(void* object)
         page_header* header = to_header(obj);
         unsigned obj_cpu = header->cpu_id;
         unsigned cur_cpu = mempool_cpuid();
+
+        // TODO llfree_free here
 
         if (obj_cpu == cur_cpu) {
             // free from the same CPU this object has been allocated on.
@@ -1200,6 +1207,17 @@ static size_t large_object_size(void *obj)
 
 namespace page_pool {
 
+class llfree {
+public:
+    llfree(){
+        self = llfree_setup(sched::cpus.size(), 0, LLFREE_INIT_FREE);
+    }
+
+private:
+    llfree_t *self;
+
+};
+
 static std::vector<stats::pool_stats> l1_pool_stats;
 
 // L1-pool (Percpu page buffer pool)
@@ -1618,6 +1636,7 @@ static void* early_alloc_page()
     WITH_LOCK(free_page_ranges_lock) {
         on_alloc(page_size);
         return static_cast<void*>(free_page_ranges.alloc(page_size));
+        // TODO switch to different alloc strategy
     }
 }
 
@@ -1753,9 +1772,11 @@ static void* untracked_alloc_page()
 {
     void* ret;
 
+
     if (!smp_allocator) {
         ret = early_alloc_page();
     } else {
+        // TODO llfree_alloc here
         ret = page_pool::l1::alloc_page();
     }
     trace_memory_page_alloc(ret);
@@ -1773,10 +1794,13 @@ void* alloc_page()
 
 static inline void untracked_free_page(void *v)
 {
+
+
     trace_memory_page_free(v);
     if (!smp_allocator) {
         return early_free_page(v);
     }
+    // TODO llfree_free here
     page_pool::l1::free_page(v);
 }
 
@@ -2229,4 +2253,8 @@ extern "C" void* alloc_contiguous_aligned(size_t size, size_t align)
 extern "C" void free_contiguous_aligned(void* p)
 {
     memory::free_phys_contiguous_aligned(p);
+}
+
+void *llfree_extern_alloc(size_t size, size_t alignment) {
+    return memory::early_alloc_object(size, alignment);
 }
