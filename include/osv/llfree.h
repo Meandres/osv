@@ -110,6 +110,9 @@ typedef struct llfree_meta {
   uint8_t *lower;
 } llfree_meta_t;
 
+/// Initialize a llfree instance
+llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init);
+
 /// Allocate and initialize the data structures of the allocator.
 ///
 /// `offset` is the number of the first page to be managed and `len` determins
@@ -180,6 +183,9 @@ void llfree_print(llfree_t *self);
 /// Validate the internal data structures
 void llfree_validate(llfree_t *self);
 
+/// Wrapper for OS-specific allocation.
+/// Used to allocate data structure for llfree
+void *llfree_extern_alloc(size_t size, size_t alignment);
 
 #ifdef __cplusplus
 }
