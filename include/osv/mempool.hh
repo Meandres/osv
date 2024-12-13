@@ -8,6 +8,7 @@
 #ifndef MEMPOOL_HH
 #define MEMPOOL_HH
 
+#include "osv/llfree.h"
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -32,6 +33,27 @@ namespace memory {
 const size_t page_size = 4096;
 
 extern size_t phys_mem_size;
+
+class llf{
+public:
+  //Initialize llfree
+  static void init();
+
+  /// Allocates a contiguous range of memory
+  static void *early_alloc(size_t size, size_t alignment);
+
+  static void *alloc_page(size_t order);
+  static void *alloc_page(size_t order, unsigned cpu_id);
+  static void *alloc_page_at(uint64_t frame);
+
+  static void free_page(void *addr);
+private:
+  static llfree_t *self;
+};
+
+// static uint64_t virt_to_fameindex(void *addr){
+//   return (0x1fffffffffff & reinterpret_cast<uint64_t>(addr)) / page_size;
+// }
 
 void setup_free_memory(void* start, size_t bytes);
 

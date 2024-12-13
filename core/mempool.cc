@@ -1205,18 +1205,52 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
-namespace page_pool {
+llfree_t* llf::self = nullptr;
+void llf::init() {
 
-class llfree {
-public:
-    llfree(){
-        self = llfree_setup(sched::cpus.size(), 0, LLFREE_INIT_FREE);
+    // We initialize llfree with the entire memory known to OSv, even already allocated one.
+    // It's therefore important that the allocated pages are set to allocated in OSv before
+    // the first actual allocation request comes in.
+    size_t frames = phys_mem_size / page_size;
+
+    self = llfree_setup(sched::cpus.size(), frames, LLFREE_INIT_FREE);
+
+    if(self)
+      printf("llfree init successful\n");
+    else
+      printf("llfree init failed\n");
+
+    // TODO setup allocated pages mapping
     }
 
-private:
-    llfree_t *self;
+void *llf::alloc_page(size_t size = page_size) {
+    unsigned order = ilog2(size / page_size);
+    printf("order: %d\n", order);
 
-};
+    llfree_result_t page = llfree_get(self, sched::cpu::current()->id, llflags(order));
+    if(llfree_is_ok(page)){
+      // return page.frame;
+    }
+    oom();
+    return nullptr;
+}
+
+void *llf::alloc_page_at(uint64_t frame){
+    llfree_result_t page = llfree_get_at(self, sched::cpu::current()->id, frame, llflags(0));
+    if(llfree_is_ok(page))
+        printf("alloc at successful\n");
+    else
+        printf("alloc at failed\n");
+
+    // return page.frame;
+    return nullptr;
+}
+
+void llf::free_page(void* addr){
+    printf("LLFREE free is not implemented yet\n");
+}
+
+namespace page_pool {
 
 static std::vector<stats::pool_stats> l1_pool_stats;
 
@@ -1871,6 +1905,11 @@ void free_initial_memory_range(void* addr, size_t size)
 void  __attribute__((constructor(init_prio::mempool))) setup()
 {
     arch_setup_free_memory();
+
+    // Now that the memory is mapped, we can initialize llfree.
+    // It will still take a bit of time until threads are set up
+    // but for now lets do it here anyways
+    llf::init();
 }
 
 }
@@ -2059,6 +2098,7 @@ void* malloc(size_t size, size_t alignment)
         memory::reclaimer_thread.wait_for_minimum_memory();
     }
 
+    printf("THIS SHOULD NEVER BE PRINTED\n");
     // There will be multiple allocations needed to satisfy this allocation; request
     // access to the emergency pool to avoid us holding some lock and then waiting
     // in an internal allocation
@@ -2256,5 +2296,5 @@ extern "C" void free_contiguous_aligned(void* p)
 }
 
 void *llfree_extern_alloc(size_t size, size_t alignment) {
-    return memory::early_alloc_object(size, alignment);
+    return aligned_alloc(alignment, size); 
 }
