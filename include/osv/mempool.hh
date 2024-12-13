@@ -39,8 +39,9 @@ public:
   //Initialize llfree
   static void init();
 
-  /// Allocates a contiguous range of memory
-  static void *early_alloc(size_t size, size_t alignment);
+  static bool is_ready();
+
+  static void add_region(void *mem_start, size_t mem_size);
 
   static void *alloc_page(size_t order);
   static void *alloc_page(size_t order, unsigned cpu_id);
@@ -49,6 +50,8 @@ public:
   static void free_page(void *addr);
 private:
   static llfree_t *self;
+  static bool ready;
+  static std::vector<std::tuple<void*, size_t>> mem_regions;
 };
 
 // static uint64_t virt_to_fameindex(void *addr){
