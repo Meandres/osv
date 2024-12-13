@@ -1234,13 +1234,6 @@ void llf::init() {
     }
 
     ready = true;
-
-    printf("Allocating test page with llfree\n");
-    printf("before alloc: 0x%lx\n", llfree_free_frames(self));
-    void *p = alloc_page();
-    printf("after alloc:  0x%lx\n", llfree_free_frames(self));
-    free_page(p);
-    printf("after free:   0x%lx\n", llfree_free_frames(self));
 }
 
 void llf::add_region(void *mem_start, size_t mem_size){
@@ -1260,7 +1253,7 @@ void *llf::alloc_page(size_t size) {
 
     llfree_result_t page= llfree_get(
         self,
-        arch::tls_available() ? sched::cpu::current()->id : 0,
+        sched::cpu::current()->id,
         llflags(order)
     );
 
@@ -1279,7 +1272,7 @@ void *llf::alloc_page_at(u64 frame, u64 size){
     unsigned order = ilog2(size / page_size);
     llfree_result_t page = llfree_get_at(
         self,
-        arch::tls_available() ? sched::cpu::current()->id : 0,
+        sched::cpu::current()->id,
         frame,
         llflags(order)
     );
@@ -1296,7 +1289,7 @@ void llf::free_page(void* addr){
 
     llfree_result_t res = llfree_put(
         self,
-        arch::tls_available() ? sched::cpu::current()->id : 0,
+        mempool_cpuid(),
         virt_to_idx(addr),
         llflags(0)
     );
@@ -1326,6 +1319,12 @@ static sched::cpu::notifier _notifier([]{
     while(llf_cnt == 0)
       if(llf_cnt.compare_exchange_weak(i, 1))
           llfree.init();
+
+    if(llfree.is_ready()){
+        printf("Allocating test page on cpu %d\n", sched::cpu::current()->id);
+        void *p = alloc_page();
+        free_page(p);
+    }
 });
 
 static void* early_alloc_page()
@@ -1470,7 +1469,7 @@ static void* untracked_alloc_page()
     void* ret;
 
 
-    if (!smp_allocator) {
+    if (!llfree.is_ready()) {
         ret = early_alloc_page();
     } else {
         ret = llfree.alloc_page();
@@ -1493,7 +1492,7 @@ void* alloc_page()
 static inline void untracked_free_page(void *v)
 {
     trace_memory_page_free(v);
-    if (!smp_allocator) {
+    if (!llfree.is_ready()) {
         return early_free_page(v);
     }
     // TODO llfree_free here
@@ -1584,19 +1583,19 @@ static inline void* std_malloc(size_t size, size_t alignment)
         return libc_error_ptr<void *>(ENOMEM);
     void *ret;
     size_t minimum_size = std::max(size, memory::pool::min_object_size);
-    if (smp_allocator && size <= memory::pool::max_object_size && alignment <= minimum_size) {
+    if (memory::llfree.is_ready() && size <= memory::pool::max_object_size && alignment <= minimum_size) {
         unsigned n = ilog2_roundup(minimum_size);
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (smp_allocator && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
+    } else if (memory::llfree.is_ready() && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
         unsigned n = ilog2_roundup(alignment);
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (!smp_allocator && memory::will_fit_in_early_alloc_page(size,alignment)) {
+    } else if (!memory::llfree.is_ready() && memory::will_fit_in_early_alloc_page(size,alignment)) {
         ret = memory::early_alloc_object(size, alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
