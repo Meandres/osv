@@ -37,41 +37,39 @@ extern size_t phys_mem_size;
 class llf{
 public:
   /// Initialize llfree
-  static void init();
+  void init();
 
   /// Returns if llfree is set up
-  static bool is_ready();
+  bool is_ready();
 
   /// Add physical memory regions llfree should be in charge of.
   /// This function has no effect after llfree is ready
-  static void add_region(void *mem_start, size_t mem_size);
+  void add_region(void *mem_start, size_t mem_size);
 
   /// Allocate a page of the given order with llfree before threads are available
-  static void *alloc_page(size_t size = page_size);
+  void *alloc_page(size_t size = page_size);
 
   /// Allocate the frame llfree keeps at the given index
-  static void *alloc_page_at(u64 frame, size_t size);
+  void *alloc_page_at(u64 frame, size_t size);
 
   /// Free a page with llfree. Freeing pages not allocated by llfree will fail
-  static void free_page(void *addr);
+  void free_page(void *addr);
 private:
   /// The actual llfree instance
-  static llfree_t *self;
+  llfree_t *self{nullptr};
   /// Whether llfree is ready
-  static bool ready;
+  bool ready{false};
   /// TODO: Remove this as soon as llfree has its own mapping.
   /// For now this indicates at what offset of the main mapping the llfree managed memory regions begins
-  static u64 offset;
+  u64 offset{0};
   /// Storage of physical memory regions llfree is in charge of
-  static std::vector<std::tuple<void*, size_t>> mem_regions;
+  std::vector<std::tuple<void*, size_t>> mem_regions;
 
-  static void* idx_to_virt(u64 idx);
-  static u64 virt_to_idx(void *virt);
+  void* idx_to_virt(u64 idx);
+  u64 virt_to_idx(void *virt);
 };
 
-// static uint64_t virt_to_fameindex(void *addr){
-//   return (0x1fffffffffff & reinterpret_cast<uint64_t>(addr)) / page_size;
-// }
+void add_llfree_region(void *mem_start, size_t mem_size);
 
 void setup_free_memory(void* start, size_t bytes);
 
@@ -256,9 +254,6 @@ namespace stats {
         size_t _watermark_lo;
         size_t _watermark_hi;
     };
-
-    void get_global_l2_stats(pool_stats &stats);
-    void get_l1_stats(unsigned int cpu_id, stats::pool_stats &stats);
 }
 
 class phys_contiguous_memory final {

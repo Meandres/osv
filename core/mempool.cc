@@ -35,7 +35,6 @@
 #include <osv/shrinker.h>
 #include <osv/defer.hh>
 #include <osv/dbg-alloc.hh>
-#include <osv/migration-lock.hh>
 #include <osv/export.h>
 
 #include "osv/llfree.h"
@@ -282,8 +281,6 @@ void pool::add_page()
     // we may add this page to the free list of a different cpu, due to the
     // enablement of preemption
     void* page = untracked_alloc_page();
-
-    // TODO llfree_alloc here
 
 #if CONF_lazy_stack_invariant
     assert(sched::preemptable() && arch::irq_enabled());
@@ -1206,11 +1203,6 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
-llfree_t* llf::self{nullptr};
-bool llf::ready{false};
-u64 llf::offset{0};
-std::vector<std::tuple<void *, size_t>> llf::mem_regions{};
-
 void llf::init() {
 
     // We initialize llfree with the entire memory known to OSv, even already allocated one.
@@ -1218,21 +1210,21 @@ void llf::init() {
     // the first actual allocation request comes in.
     size_t frames{0};
     for(auto m : mem_regions){
-      frames += std::get<1>(m);
-
+      printf("0x%lx + 0x%lx\n", std::get<0>(m), std::get<1>(m));
       // llfree expects continuous virtual memory. Since we cannot guarantee that until we do
-      // our own mapping, we have to skip after the first region.
-      offset = reinterpret_cast<u64>(std::get<0>(m)) & 0x1fffffffffff;
+      // our own mapping, we just take the biggest region.
+      if (std::get<1>(m) > frames){
+          frames = std::get<1>(m);
+          offset = reinterpret_cast<u64>(std::get<0>(m)) & 0x1fffffffffff;
+      }
       break;
     }
 
-    for(auto m : mem_regions){
-      printf("0x%lx + 0x%lx\n", std::get<0>(m), std::get<1>(m));
-    }
-
-    // sched::cpus.size() doesn't have right amount of cores
-    // TODO initialize with correct size of cores
-    self = llfree_setup(1, frames / page_size, LLFREE_INIT_FREE);
+    self = llfree_setup(
+        sched::cpus.size(),
+        frames / page_size,
+        LLFREE_INIT_FREE
+    );
 
     if(self)
       printf("llfree init successful\n");
@@ -1253,7 +1245,8 @@ void llf::init() {
 
 void llf::add_region(void *mem_start, size_t mem_size){
     assert(!is_ready());
-    mem_regions.push_back({mem_start, mem_size});
+    if(mem_size > 0)
+        mem_regions.push_back({mem_start, mem_size});
 }
 
 bool llf::is_ready(){
@@ -1262,6 +1255,7 @@ bool llf::is_ready(){
 
 void *llf::alloc_page(size_t size) {
     assert(is_ready());
+
     unsigned order = ilog2(size / page_size);
 
     llfree_result_t page= llfree_get(
@@ -1274,6 +1268,7 @@ void *llf::alloc_page(size_t size) {
         return idx_to_virt(page.frame);
     }
     // TODO: we could try using early_alloc, there might still be some memory there
+    printf("llfree ran out of memory\n");
     oom();
     return nullptr;
 }
@@ -1316,423 +1311,22 @@ void *llf::idx_to_virt(u64 idx){
 u64 llf::virt_to_idx(void *idx){
     // TODO: change this as soon as we have out own mapping
     return  ((0x1fffffffffff & reinterpret_cast<u64>(idx)) - offset) / page_size;
-
 }
 
-namespace page_pool {
+llf llfree
+    __attribute__((init_priority((int)init_prio::llfree)));
 
-static std::vector<stats::pool_stats> l1_pool_stats;
+void add_llfree_region(void *addr, size_t size){
+    llfree.add_region(addr, size);
+}
 
-// L1-pool (Percpu page buffer pool)
-//
-// if nr < max * 1 / 4
-//    refill
-//
-// if nr > max * 3 / 4
-//   unfill
-//
-// nr_cpus threads are created to help filling the L1-pool.
-struct l1 {
-    l1(sched::cpu* cpu)
-        : _fill_thread(sched::thread::make([] { fill_thread(); },
-            sched::thread::attr().pin(cpu).name(std::string("page_pool_l1_") + std::to_string(cpu->id))))
-    {
-        cpu_id = cpu->id;
-        _fill_thread->start();
-    }
-
-    static void* alloc_page()
-    {
-        void* ret;
-        while (!(ret = alloc_page_local())) {
-            refill();
-        }
-        return ret;
-    }
-
-    static void free_page(void* v)
-    {
-        while (!free_page_local(v)) {
-            unfill();
-        }
-    }
-    static void* alloc_page_local();
-    static bool free_page_local(void* v);
-    void* pop()
-    {
-        assert(nr);
-        l1_pool_stats[cpu_id]._nr = nr - 1;
-        return _pages[--nr];
-    }
-    void push(void* page)
-    {
-        assert(nr < CONF_memory_l1_pool_size);
-        _pages[nr++] = page;
-        l1_pool_stats[cpu_id]._nr = nr;
-
-    }
-    void* top() { return _pages[nr - 1]; }
-    void wake_thread() { _fill_thread->wake(); }
-    static void fill_thread();
-    static void refill();
-    static void unfill();
-
-    static constexpr size_t max = CONF_memory_l1_pool_size;
-    static constexpr size_t watermark_lo = max * 1 / 4;
-    static constexpr size_t watermark_hi = max * 3 / 4;
-    size_t nr = 0;
-    unsigned int cpu_id;
-
-private:
-    std::unique_ptr<sched::thread> _fill_thread;
-    void* _pages[max];
-};
-
-struct page_batch {
-    // Number of pages per batch
-    static constexpr size_t nr_pages = CONF_memory_page_batch_size;
-    void* pages[nr_pages];
-};
-
-// L2-pool (Global page buffer pool)
-//
-// if nr < max * 1 / 4
-//    refill
-//
-// if nr > max * 3 / 4
-//    unfill
-//
-// When L1-pool needs refill or unfill, it moves a batch of pages from or to
-// L2-pool.
-//
-// When L2-pool needs refill or unfill, it moves a batch of pages from or to
-// global free page list.
-//
-// Single thread is created to help filling the L2-pool.
-class l2 {
-public:
-    l2()
-        : _max(sched::cpus.size() * (l1::max / page_batch::nr_pages))
-        , _nr(0)
-        , _watermark_lo(_max * 1 / 4)
-        , _watermark_hi(_max * 3 / 4)
-        , _stack(_max)
-        , _fill_thread(sched::thread::make([=] { fill_thread(); }, sched::thread::attr().name("page_pool_l2")))
-    {
-       _fill_thread->start();
-    }
-
-    page_batch* alloc_page_batch()
-    {
-        page_batch* pb;
-        while (!(pb = try_alloc_page_batch())) {
-            WITH_LOCK(migration_lock) {
-                DROP_LOCK(preempt_lock) {
-#if CONF_lazy_stack_invariant
-                    assert(sched::preemptable());
-#endif
-                    refill();
-                }
-            }
-        }
-        return pb;
-    }
-
-    void free_page_batch(page_batch* pb)
-    {
-        while (!try_free_page_batch(pb)) {
-            WITH_LOCK(migration_lock) {
-                DROP_LOCK(preempt_lock) {
-#if CONF_lazy_stack_invariant
-                    assert(sched::preemptable());
-#endif
-                    unfill();
-                }
-            }
-        }
-    }
-
-    page_batch* try_alloc_page_batch()
-    {
-        if (get_nr() < _watermark_lo) {
-            _fill_thread->wake();
-        }
-        page_batch* pb;
-        if (!_stack.pop(pb)) {
-            return nullptr;
-        }
-        dec_nr();
-        return pb;
-    }
-
-    bool try_free_page_batch(page_batch* pb)
-    {
-        if (get_nr() > _watermark_hi) {
-            _fill_thread->wake();
-        }
-        if (!_stack.push(pb)) {
-            return false;
-        }
-        inc_nr();
-        return true;
-    }
-
-    void stats(stats::pool_stats &stats)
-    {
-        stats._nr = get_nr();
-        stats._max = _max;
-        stats._watermark_lo = _watermark_lo;
-        stats._watermark_hi = _watermark_hi;
-    }
-
-    void fill_thread();
-    void refill();
-    void unfill();
-    void free_batch(page_batch& batch);
-    size_t get_nr() { return _nr.load(std::memory_order_relaxed); }
-    void inc_nr() { _nr.fetch_add(1, std::memory_order_relaxed); }
-    void dec_nr() { _nr.fetch_sub(1, std::memory_order_relaxed); }
-
-private:
-    size_t _max;
-    std::atomic<size_t> _nr;
-    size_t _watermark_lo;
-    size_t _watermark_hi;
-    boost::lockfree::stack<page_batch*, boost::lockfree::fixed_sized<true>> _stack;
-    std::unique_ptr<sched::thread> _fill_thread;
-};
-
-std::atomic<unsigned int> l1_initialized_cnt{};
-PERCPU(l1*, percpu_l1);
-static sched::cpu::notifier _notifier([] () {
-    *percpu_l1 = new l1(sched::cpu::current());
-    if (++l1_initialized_cnt == sched::cpus.size()) {
-        l1_pool_stats.resize(sched::cpus.size());
-    }
-    // N per-cpu threads for L1 page pool, 1 thread for L2 page pool
-    // Switch to smp_allocator only when all the N + 1 threads are ready
-    if (smp_allocator_cnt++ == sched::cpus.size()) {
-        smp_allocator = true;
-    }
+std::atomic<unsigned> llf_cnt{0};
+static sched::cpu::notifier _notifier([]{
+    unsigned i = 0;
+    while(llf_cnt == 0)
+      if(llf_cnt.compare_exchange_weak(i, 1))
+          llfree.init();
 });
-static inline l1& get_l1()
-{
-    return **percpu_l1;
-}
-
-class l2 global_l2;
-
-// Percpu thread for L1 page pool
-void l1::fill_thread()
-{
-    sched::thread::wait_until([] {return smp_allocator;});
-    auto& pbuf = get_l1();
-    for (;;) {
-        sched::thread::wait_until([&] {
-#if CONF_lazy_stack_invariant
-            assert(!sched::thread::current()->is_app());
-#endif
-            WITH_LOCK(preempt_lock) {
-                return pbuf.nr < pbuf.watermark_lo || pbuf.nr > pbuf.watermark_hi;
-            }
-        });
-        if (pbuf.nr < pbuf.watermark_lo) {
-            while (pbuf.nr + page_batch::nr_pages < pbuf.max / 2) {
-                refill();
-            }
-        }
-        if (pbuf.nr > pbuf.watermark_hi) {
-            while (pbuf.nr > page_batch::nr_pages + pbuf.max / 2) {
-                unfill();
-            }
-        }
-    }
-}
-
-void l1::refill()
-{
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    SCOPE_LOCK(preempt_lock);
-    auto& pbuf = get_l1();
-    if (pbuf.nr + page_batch::nr_pages < pbuf.max / 2) {
-        auto* pb = global_l2.alloc_page_batch();
-        if (pb) {
-            // Other threads might have filled the array while we waited for
-            // the page batch.  Make sure there is enough room to add the pages
-            // we just acquired, otherwise return them.
-            if (pbuf.nr + page_batch::nr_pages <= pbuf.max) {
-                for (auto& page : pb->pages) {
-                    pbuf.push(page);
-                }
-            } else {
-                global_l2.free_page_batch(pb);
-            }
-        }
-    }
-}
-
-void l1::unfill()
-{
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    SCOPE_LOCK(preempt_lock);
-    auto& pbuf = get_l1();
-    if (pbuf.nr > page_batch::nr_pages + pbuf.max / 2) {
-        auto* pb = static_cast<page_batch*>(pbuf.top());
-        for (size_t i = 0 ; i < page_batch::nr_pages; i++) {
-            pb->pages[i] = pbuf.pop();
-        }
-        global_l2.free_page_batch(pb);
-    }
-}
-
-void* l1::alloc_page_local()
-{
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    SCOPE_LOCK(preempt_lock);
-    auto& pbuf = get_l1();
-    if (pbuf.nr < pbuf.watermark_lo) {
-        pbuf.wake_thread();
-    }
-    if (pbuf.nr == 0) {
-        return nullptr;
-    }
-    return pbuf.pop();
-}
-
-bool l1::free_page_local(void* v)
-{
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    SCOPE_LOCK(preempt_lock);
-    auto& pbuf = get_l1();
-    if (pbuf.nr > pbuf.watermark_hi) {
-        pbuf.wake_thread();
-    }
-    if (pbuf.nr == pbuf.max) {
-        return false;
-    }
-    pbuf.push(v);
-    return true;
-}
-
-// Global thread for L2 page pool
-void l2::fill_thread()
-{
-    if (smp_allocator_cnt++ == sched::cpus.size()) {
-        smp_allocator = true;
-    }
-
-    sched::thread::wait_until([] {return smp_allocator;});
-    for (;;) {
-        sched::thread::wait_for([=] {
-                auto nr = get_nr();
-                return nr < _watermark_lo || nr > _watermark_hi;
-        });
-        if (get_nr() < _watermark_lo) {
-            refill();
-        }
-        if (get_nr() > _watermark_hi) {
-            unfill();
-        }
-    }
-}
-
-void l2::refill()
-{
-    page_batch batch;
-    page_batch* pb;
-    while (get_nr() < _max / 2) {
-        WITH_LOCK(free_page_ranges_lock) {
-            reclaimer_thread.wait_for_minimum_memory();
-            if (free_page_ranges.empty()) {
-                // That is almost a guaranteed oom, but we can still have some hope
-                // if we the current allocation is a small one. Another advantage
-                // of waiting here instead of oom'ing directly is that we can have
-                // less points in the code where we can oom, and be more
-                // predictable.
-                reclaimer_thread.wait_for_memory(mmu::page_size);
-            }
-            auto total_size = 0;
-            for (size_t i = 0 ; i < page_batch::nr_pages; i++) {
-                batch.pages[i] = free_page_ranges.alloc(page_size);
-                total_size += page_size;
-            }
-            on_alloc(total_size);
-        }
-        // Use the last page to store other page address
-        pb = static_cast<page_batch*>(batch.pages[page_batch::nr_pages - 1]);
-        *pb = batch;
-        if (_stack.push(pb)) {
-            inc_nr();
-        } else {
-            // FIXME: _nr can change within {alloc,free}_page_batch_{fast,slow}
-            // _stack might be full at this point, so we need to free the newly
-            // allocated pages!!!
-            free_batch(batch);
-        }
-    }
-}
-
-void l2::unfill()
-{
-    page_batch batch;
-    page_batch* pb;
-    while (get_nr() > _max / 2) {
-        if (_stack.pop(pb)) {
-            batch = *pb;
-            dec_nr();
-            free_batch(batch);
-        }
-    }
-}
-
-void l2::free_batch(page_batch& batch)
-{
-    WITH_LOCK(free_page_ranges_lock) {
-        for (size_t i = 0 ; i < page_batch::nr_pages; i++) {
-            auto v = batch.pages[i];
-            assert(v != nullptr);
-            auto pr = new (v) page_range(page_size);
-            free_page_range_locked(pr);
-        }
-    }
-}
-
-}
-
-namespace stats {
-    void get_global_l2_stats(pool_stats &stats)
-    {
-        page_pool::global_l2.stats(stats);
-    }
-
-    void get_l1_stats(unsigned int cpu_id, pool_stats &stats)
-    {
-        stats._nr = page_pool::l1_pool_stats[cpu_id]._nr;
-        stats._max = page_pool::l1::max;
-        stats._watermark_lo = page_pool::l1::watermark_lo;
-        stats._watermark_hi = page_pool::l1::watermark_hi;
-    }
-}
 
 static void* early_alloc_page()
 {
@@ -1879,8 +1473,9 @@ static void* untracked_alloc_page()
     if (!smp_allocator) {
         ret = early_alloc_page();
     } else {
+        ret = llfree.alloc_page();
         // TODO llfree_alloc here
-        ret = page_pool::l1::alloc_page();
+        // ret = page_pool::l1::alloc_page();
     }
     trace_memory_page_alloc(ret);
     return ret;
@@ -1897,14 +1492,13 @@ void* alloc_page()
 
 static inline void untracked_free_page(void *v)
 {
-
-
     trace_memory_page_free(v);
     if (!smp_allocator) {
         return early_free_page(v);
     }
     // TODO llfree_free here
-    page_pool::l1::free_page(v);
+    // page_pool::l1::free_page(v);
+    llfree.free_page(v);
 }
 
 void free_page(void* v)
@@ -1971,14 +1565,9 @@ void free_initial_memory_range(void* addr, size_t size)
     free_page_ranges.initial_add(pr);
 }
 
-void  __attribute__((constructor(init_prio::mempool))) setup()
+void  __attribute__((constructor(init_prio::mempool))) setupp()
 {
     arch_setup_free_memory();
-
-    // Now that the memory is mapped, we can initialize llfree.
-    // It will still take a bit of time until threads are set up
-    // but for now lets do it here anyways
-    llf::init();
 }
 
 }
