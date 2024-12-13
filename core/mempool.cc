@@ -1206,14 +1206,20 @@ static size_t large_object_size(void *obj)
 }
 
 llfree_t* llf::self = nullptr;
+bool llf::ready = false;
+std::vector<std::tuple<void *, size_t>> llf::mem_regions{};
+
 void llf::init() {
 
     // We initialize llfree with the entire memory known to OSv, even already allocated one.
     // It's therefore important that the allocated pages are set to allocated in OSv before
     // the first actual allocation request comes in.
-    size_t frames = phys_mem_size / page_size;
+    size_t frames{0};
+    for(auto m : mem_regions){
+      frames += std::get<1>(m);
+    }
 
-    self = llfree_setup(sched::cpus.size(), frames, LLFREE_INIT_FREE);
+    self = llfree_setup(sched::cpus.size(), frames / page_size, LLFREE_INIT_FREE);
 
     if(self)
       printf("llfree init successful\n");
@@ -1221,7 +1227,16 @@ void llf::init() {
       printf("llfree init failed\n");
 
     // TODO setup allocated pages mapping
-    }
+}
+
+void llf::add_region(void *mem_start, size_t mem_size){
+    assert(!is_ready());
+    mem_regions.push_back({mem_start, mem_size});
+}
+
+bool llf::is_ready(){
+    return ready;
+}
 
 void *llf::alloc_page(size_t size = page_size) {
     unsigned order = ilog2(size / page_size);

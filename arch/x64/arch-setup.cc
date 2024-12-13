@@ -215,7 +215,9 @@ void arch_setup_free_memory()
                area == mmu::mem_area::main ? "main" :
                area == mmu::mem_area::page ? "page" : "mempool", ~0);
         }
-        mmu::free_initial_memory_range(ent.addr, ent.size);
+        // early_alloc will have to do with ~1GiB of memory. We'll use the rest for llfree
+        // mmu::free_initial_memory_range(ent.addr, ent.size);
+        memory::llf::add_region(mmu::phys_cast<void>(ent.addr), ent.size);
     });
 }
 
