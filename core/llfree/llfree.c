@@ -71,6 +71,8 @@ static ll_unused bool check_meta(llfree_meta_t meta, llfree_meta_size_t sizes) {
 }
 
 llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init) {
+  assert(cores > 0);
+
   llfree_t *self = llfree_extern_alloc(sizeof(llfree_t), LLFREE_CACHE_SIZE);
 
   llfree_meta_size_t m = llfree_metadata_size(cores, frames);

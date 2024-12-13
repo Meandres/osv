@@ -115,9 +115,12 @@ void arch_setup_free_memory()
     auto e820_buffer = alloca(mb.mmap_length);
     auto e820_size = mb.mmap_length;
     memcpy(e820_buffer, reinterpret_cast<void*>(mb.mmap_addr), e820_size);
-    for_each_e820_entry(e820_buffer, e820_size, [] (e820ent ent) {
-        memory::phys_mem_size += ent.size;
-    });
+
+    // We give it 1GiB instead and take the rest for llfree
+    memory::phys_mem_size += 1 << 30;
+    // for_each_e820_entry(e820_buffer, e820_size, [] (e820ent ent) {
+    //     memory::phys_mem_size += ent.size;
+    // });
     constexpr u64 initial_map = 1 << 30; // 1GB mapped by startup code
 
     u64 time;
