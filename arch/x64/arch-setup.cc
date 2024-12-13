@@ -221,7 +221,7 @@ void arch_setup_free_memory()
         // early_alloc will have to do with ~1GiB of memory. We'll use the rest for llfree
         // mmu::free_initial_memory_range(ent.addr, ent.size);
         memory::add_llfree_region(mmu::phys_cast<void>(ent.addr), ent.size);
-        printf("add_region(0x%lx, 0x%lx)\n", ent.addr, ent.size);
+        printf("add_region(0x%10lx, 0x%10lx)\n", ent.addr, ent.size);
     });
 }
 

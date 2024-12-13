@@ -75,8 +75,6 @@ static size_t object_size(void* v);
 
 }
 
-std::atomic<unsigned int> smp_allocator_cnt{};
-bool smp_allocator = false;
 OSV_LIBSOLARIS_API
 unsigned char *osv_reclaimer_thread;
 
@@ -110,10 +108,6 @@ static inline void tracker_forget(void *addr)
 // are used immediately after virtual memory is being initialized.
 // sched::cpu::current() uses TLS which is set only later on.
 //
-
-static inline unsigned mempool_cpuid() {
-    return (smp_allocator ? sched::cpu::current()->id: 0);
-}
 
 static void garbage_collector_fn();
 PCPU_WORKERITEM(garbage_collector, garbage_collector_fn);
@@ -159,7 +153,9 @@ void pool::collect_garbage()
 {
     assert(!sched::preemptable());
 
-    unsigned cpu_id = mempool_cpuid();
+    assert(sched::cpus.size());
+
+    unsigned cpu_id = sched::cpu::current()->id;
 
     for (unsigned i = 0; i < sched::cpus.size(); i++) {
         auto sink = pcpu_free_list[cpu_id][i];
@@ -289,8 +285,9 @@ void pool::add_page()
     arch::ensure_next_stack_page();
 #endif
     WITH_LOCK(preempt_lock) {
+        assert(sched::cpus.size());
         page_header* header = new (page) page_header;
-        header->cpu_id = mempool_cpuid();
+        header->cpu_id = sched::cpu::current()->id;
         header->owner = this;
         header->nalloc = 0;
         header->local_free = nullptr;
@@ -360,12 +357,14 @@ void pool::free(void* object)
 #endif
     WITH_LOCK(preempt_lock) {
 
+        assert(sched::cpus.size());
+
         free_object* obj = static_cast<free_object*>(object);
         page_header* header = to_header(obj);
         unsigned obj_cpu = header->cpu_id;
-        unsigned cur_cpu = mempool_cpuid();
+        unsigned cur_cpu = sched::cpu::current()->id;
 
-        // TODO llfree_free here
+        // TODO consider changing how memory is freed
 
         if (obj_cpu == cur_cpu) {
             // free from the same CPU this object has been allocated on.
@@ -1208,23 +1207,25 @@ void llf::init() {
     // We initialize llfree with the entire memory known to OSv, even already allocated one.
     // It's therefore important that the allocated pages are set to allocated in OSv before
     // the first actual allocation request comes in.
-    size_t frames{0};
+    size_t size{0};
     for(auto m : mem_regions){
-      printf("0x%lx + 0x%lx\n", std::get<0>(m), std::get<1>(m));
       // llfree expects continuous virtual memory. Since we cannot guarantee that until we do
       // our own mapping, we just take the biggest region.
-      if (std::get<1>(m) > frames){
-          frames = std::get<1>(m);
-          offset = reinterpret_cast<u64>(std::get<0>(m)) & 0x1fffffffffff;
+      if (std::get<1>(m) > size){
+          size = std::get<1>(m);
+          offset = reinterpret_cast<u64>(std::get<0>(m));
       }
-      break;
     }
 
     self = llfree_setup(
         sched::cpus.size(),
-        frames / page_size,
+        size / page_size,
         LLFREE_INIT_FREE
     );
+
+    printf(" --- LLFREE --- \n");
+    printf("    managing virt region 0x%lx - 0x%lx\n", offset, offset + size);
+    printf("    highes frame index: 0x%lx\n", size/page_size);
 
     if(self)
       printf("llfree init successful\n");
@@ -1258,6 +1259,10 @@ void *llf::alloc_page(size_t size) {
     );
 
     if(llfree_is_ok(page)){
+        if(idx_to_virt(page.frame) < (void *)0x400040000000){
+            printf("0x%lx --> 0x%lx\n", page.frame, idx_to_virt(page.frame));
+            assert(false);
+        }
         return idx_to_virt(page.frame);
     }
     // TODO: we could try using early_alloc, there might still be some memory there
@@ -1289,7 +1294,7 @@ void llf::free_page(void* addr){
 
     llfree_result_t res = llfree_put(
         self,
-        mempool_cpuid(),
+        sched::cpu::current()->id,
         virt_to_idx(addr),
         llflags(0)
     );
@@ -1299,11 +1304,11 @@ void llf::free_page(void* addr){
 
 void *llf::idx_to_virt(u64 idx){
     // TODO: change this as soon as we have our own mapping
-    return mmu::phys_cast<void>(idx * page_size) + offset;
+    return reinterpret_cast<void *>(idx * page_size + offset);
 }
 u64 llf::virt_to_idx(void *idx){
     // TODO: change this as soon as we have out own mapping
-    return  ((0x1fffffffffff & reinterpret_cast<u64>(idx)) - offset) / page_size;
+    return  (reinterpret_cast<u64>(idx) - offset) / page_size;
 }
 
 llf llfree
@@ -1320,6 +1325,7 @@ static sched::cpu::notifier _notifier([]{
       if(llf_cnt.compare_exchange_weak(i, 1))
           llfree.init();
 
+          // TODO remove
     if(llfree.is_ready()){
         printf("Allocating test page on cpu %d\n", sched::cpu::current()->id);
         void *p = alloc_page();
