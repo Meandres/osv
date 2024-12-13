@@ -14,6 +14,7 @@
 #include <boost/utility.hpp>
 #include <string.h>
 #include <lockfree/unordered-queue-mpsc.hh>
+#include "arch.hh"
 #include "libc/libc.hh"
 #include <osv/align.hh>
 #include <osv/debug.hh>
@@ -1205,8 +1206,9 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
-llfree_t* llf::self = nullptr;
-bool llf::ready = false;
+llfree_t* llf::self{nullptr};
+bool llf::ready{false};
+u64 llf::offset{0};
 std::vector<std::tuple<void *, size_t>> llf::mem_regions{};
 
 void llf::init() {
@@ -1217,16 +1219,36 @@ void llf::init() {
     size_t frames{0};
     for(auto m : mem_regions){
       frames += std::get<1>(m);
+
+      // llfree expects continuous virtual memory. Since we cannot guarantee that until we do
+      // our own mapping, we have to skip after the first region.
+      offset = reinterpret_cast<u64>(std::get<0>(m)) & 0x1fffffffffff;
+      break;
     }
 
-    self = llfree_setup(sched::cpus.size(), frames / page_size, LLFREE_INIT_FREE);
+    for(auto m : mem_regions){
+      printf("0x%lx + 0x%lx\n", std::get<0>(m), std::get<1>(m));
+    }
+
+    // sched::cpus.size() doesn't have right amount of cores
+    // TODO initialize with correct size of cores
+    self = llfree_setup(1, frames / page_size, LLFREE_INIT_FREE);
 
     if(self)
       printf("llfree init successful\n");
-    else
+    else {
       printf("llfree init failed\n");
+      return;
+    }
 
-    // TODO setup allocated pages mapping
+    ready = true;
+
+    printf("Allocating test page with llfree\n");
+    printf("before alloc: 0x%lx\n", llfree_free_frames(self));
+    void *p = alloc_page();
+    printf("after alloc:  0x%lx\n", llfree_free_frames(self));
+    free_page(p);
+    printf("after free:   0x%lx\n", llfree_free_frames(self));
 }
 
 void llf::add_region(void *mem_start, size_t mem_size){
@@ -1238,31 +1260,63 @@ bool llf::is_ready(){
     return ready;
 }
 
-void *llf::alloc_page(size_t size = page_size) {
+void *llf::alloc_page(size_t size) {
+    assert(is_ready());
     unsigned order = ilog2(size / page_size);
-    printf("order: %d\n", order);
 
-    llfree_result_t page = llfree_get(self, sched::cpu::current()->id, llflags(order));
+    llfree_result_t page= llfree_get(
+        self,
+        arch::tls_available() ? sched::cpu::current()->id : 0,
+        llflags(order)
+    );
+
     if(llfree_is_ok(page)){
-      // return page.frame;
+        return idx_to_virt(page.frame);
     }
+    // TODO: we could try using early_alloc, there might still be some memory there
     oom();
     return nullptr;
 }
 
-void *llf::alloc_page_at(uint64_t frame){
-    llfree_result_t page = llfree_get_at(self, sched::cpu::current()->id, frame, llflags(0));
-    if(llfree_is_ok(page))
-        printf("alloc at successful\n");
-    else
-        printf("alloc at failed\n");
+void *llf::alloc_page_at(u64 frame, u64 size){
+    assert(is_ready());
 
-    // return page.frame;
+    unsigned order = ilog2(size / page_size);
+    llfree_result_t page = llfree_get_at(
+        self,
+        arch::tls_available() ? sched::cpu::current()->id : 0,
+        frame,
+        llflags(order)
+    );
+
+    if(llfree_is_ok(page))
+        return idx_to_virt(page.frame);
+
+    printf("alloc at failed\n");
     return nullptr;
 }
 
 void llf::free_page(void* addr){
-    printf("LLFREE free is not implemented yet\n");
+    assert(is_ready());
+
+    llfree_result_t res = llfree_put(
+        self,
+        arch::tls_available() ? sched::cpu::current()->id : 0,
+        virt_to_idx(addr),
+        llflags(0)
+    );
+
+    assert(llfree_is_ok(res));
+}
+
+void *llf::idx_to_virt(u64 idx){
+    // TODO: change this as soon as we have our own mapping
+    return mmu::phys_cast<void>(idx * page_size) + offset;
+}
+u64 llf::virt_to_idx(void *idx){
+    // TODO: change this as soon as we have out own mapping
+    return  ((0x1fffffffffff & reinterpret_cast<u64>(idx)) - offset) / page_size;
+
 }
 
 namespace page_pool {
