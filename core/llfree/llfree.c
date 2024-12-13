@@ -71,10 +71,20 @@ static ll_unused bool check_meta(llfree_meta_t meta, llfree_meta_size_t sizes) {
 }
 
 llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init) {
-  llfree_extern_alloc(sizeof(llfree_t), LLFREE_CACHE_SIZE);
+  llfree_t *self = llfree_extern_alloc(sizeof(llfree_t), LLFREE_CACHE_SIZE);
 
-  llfree_warn("LLFREE setup not implemented\n");
-  return NULL;
+  llfree_meta_size_t m = llfree_metadata_size(cores, frames);
+
+  llfree_meta_t meta = {
+      .local = llfree_extern_alloc(m.local, LLFREE_CACHE_SIZE),
+      .trees = llfree_extern_alloc(m.trees, LLFREE_CACHE_SIZE),
+      .lower = llfree_extern_alloc(m.lower, LLFREE_CACHE_SIZE),
+  };
+
+  llfree_result_t ret =
+      llfree_init(self, cores, frames, LLFREE_INIT_FREE, meta);
+
+  return llfree_is_ok(ret) ? self : NULL;
 }
 
 llfree_result_t llfree_init(llfree_t *self, size_t cores, size_t frames,
