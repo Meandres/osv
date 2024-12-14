@@ -724,7 +724,7 @@ private:
 };
 
 page_range_allocator free_page_ranges
-    __attribute__((init_priority((int)init_prio::fpranges)));
+    __attribute__((init_priority((int)init_prio::page_allocator)));
 
 template<typename T>
 T* page_range_allocator::bitmap_allocator<T>::allocate(size_t n)
@@ -1311,11 +1311,12 @@ u64 llf::virt_to_idx(void *idx){
     return  (reinterpret_cast<u64>(idx) - offset) / page_size;
 }
 
-llf llfree
-    __attribute__((init_priority((int)init_prio::llfree)));
+llf page_allocator
+    __attribute__((init_priority((int)init_prio::page_allocator)));
 
+// TODO remove this in favor of free_initial_memory_range
 void add_llfree_region(void *addr, size_t size){
-    llfree.add_region(addr, size);
+    page_allocator.add_region(addr, size);
 }
 
 std::atomic<unsigned> llf_cnt{0};
@@ -1323,10 +1324,10 @@ static sched::cpu::notifier _notifier([]{
     unsigned i = 0;
     while(llf_cnt == 0)
       if(llf_cnt.compare_exchange_weak(i, 1))
-          llfree.init();
+          page_allocator.init();
 
           // TODO remove
-    if(llfree.is_ready()){
+    if(page_allocator.is_ready()){
         printf("Allocating test page on cpu %d\n", sched::cpu::current()->id);
         void *p = alloc_page();
         free_page(p);
@@ -1335,10 +1336,10 @@ static sched::cpu::notifier _notifier([]{
 
 static void* early_alloc_page()
 {
+  // TODO remove
     WITH_LOCK(free_page_ranges_lock) {
         on_alloc(page_size);
         return static_cast<void*>(free_page_ranges.alloc(page_size));
-        // TODO switch to different alloc strategy
     }
 }
 
@@ -1475,10 +1476,10 @@ static void* untracked_alloc_page()
     void* ret;
 
 
-    if (!llfree.is_ready()) {
+    if (!page_allocator.is_ready()) {
         ret = early_alloc_page();
     } else {
-        ret = llfree.alloc_page();
+        ret = page_allocator.alloc_page();
         // TODO llfree_alloc here
         // ret = page_pool::l1::alloc_page();
     }
@@ -1498,12 +1499,12 @@ void* alloc_page()
 static inline void untracked_free_page(void *v)
 {
     trace_memory_page_free(v);
-    if (!llfree.is_ready()) {
+    if (!page_allocator.is_ready()) {
         return early_free_page(v);
     }
     // TODO llfree_free here
     // page_pool::l1::free_page(v);
-    llfree.free_page(v);
+    page_allocator.free_page(v);
 }
 
 void free_page(void* v)
@@ -1589,19 +1590,19 @@ static inline void* std_malloc(size_t size, size_t alignment)
         return libc_error_ptr<void *>(ENOMEM);
     void *ret;
     size_t minimum_size = std::max(size, memory::pool::min_object_size);
-    if (memory::llfree.is_ready() && size <= memory::pool::max_object_size && alignment <= minimum_size) {
+    if (memory::page_allocator.is_ready() && size <= memory::pool::max_object_size && alignment <= minimum_size) {
         unsigned n = ilog2_roundup(minimum_size);
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (memory::llfree.is_ready() && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
+    } else if (memory::page_allocator.is_ready() && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
         unsigned n = ilog2_roundup(alignment);
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (!memory::llfree.is_ready() && memory::will_fit_in_early_alloc_page(size,alignment)) {
+    } else if (!memory::page_allocator.is_ready() && memory::will_fit_in_early_alloc_page(size,alignment)) {
         ret = memory::early_alloc_object(size, alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
