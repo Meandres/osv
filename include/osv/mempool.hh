@@ -52,6 +52,9 @@ public:
   /// Allocate the frame llfree keeps at the given index
   void *alloc_page_at(u64 frame, size_t size);
 
+  /// Allocate a page before llfree is initialized
+  void *early_alloc_page(size_t size = page_size);
+
   /// Free a page with llfree. Freeing pages not allocated by llfree will fail
   void free_page(void *addr);
 private:
