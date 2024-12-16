@@ -11,10 +11,11 @@
 #include <cstring>
 #include <bitset>
 #include "drivers/rdtsc.h"
+#include <osv/percpu.hh>
 
 typedef u64 PID;
 struct alignas(4096) Page {
-	//bool dirty;
+	bool dirty;
 };
 
 const bool debugTime = false;
@@ -151,60 +152,85 @@ inline bool get_stored_bit(void *virt){
     return walk(virt).user==1;
 }
 
-static u64 constexpr pageSize = 4096;
+struct PageBundle{
+   int index; // index of the first available page
+              // 0 is full, 512 is empty
+   u64 pages[512];
 
-typedef std::chrono::duration<int64_t, std::ratio<1, 1000000000>> elapsed_time;
-//typedef u64 elapsed_time;
+   PageBundle(){
+      index=512;
+   }
 
-typedef struct frameCollection {
-    u64 buf[8];
-} frameCol_t;
+   void insert(u64 phys){
+      assert(index>0);
+      index--;
+      pages[index] = phys;
+   }
 
-typedef struct Ymap {
-    std::atomic_flag vec_lock = ATOMIC_FLAG_INIT;
-    std::vector<u64> list;
-    //struct rte_ring freeframes_ring;
-    u64 maxSize;
-	int interfaceId;
-    u64 pageStolen;
-	u64 nbPagesToSteal;
-    std::atomic<bool> currentlyStealing = {false}; // the two atomic variables are far away from each other 
-                                                   // in hope that they won't fall on the same cache line (PRANKEX)
+   u64 retrieve(){
+      assert(index<512);
+      u64 phys = pages[index];
+      index++;
+      return phys;
+   }
+};
 
-    Ymap(u64, int);
-	void lock();
-	void unlock();
-	void setPhysAddr(void* virt, u64 phys);
-	u64 clearPhysAddr(void* virt);
-    u64 getPage();
-    void putPage(u64);
-} ymap_t;
+struct BundleList {
+   PageBundle** list;
+   u64 list_size;
+   std::atomic<u64> consume_index __attribute__ ((aligned (8)));
+   std::atomic<u64> produce_index __attribute__ ((aligned (8)));
 
-//PERCPU(ymap_t*, percpu_ymap);
+   BundleList(u64 nbEle){
+      list_size = nbEle;
+      list = (PageBundle**)malloc(nbEle * sizeof(PageBundle*));
+      for(u64 i=0; i<nbEle; i++){
+         list[i] = nullptr;
+      }
+      consume_index.store(0);
+      produce_index.store(0);
+   }
 
-/*inline void initYmaps(u64 frameCount){
-    if(frameCount * pageSize > sizePhysRegion){
-        std::cerr << "Ymap region is too small" << std::endl;
-        assert(false);
-    }
-    u64 pagesPerCore = frameCount / sched::cpus
-}
+   bool correct_indexes(u64 oldIndex1, u64 index2){
+      if((oldIndex1 + 1)%list_size == index2)
+         return false;
+      return true;
+   }
 
-inline ymap_t& get_ymap(){
-    return **percpu_ymap;
-}*/
-struct YmapBundle{
-    std::vector<Ymap*> ymapInterfaces;
+   void put(PageBundle* bundle){
+      u64 oldIndex, newIndex;
+      do{
+         oldIndex = produce_index.load();
+         newIndex = (oldIndex+1)%list_size;;
+         assert(correct_indexes(oldIndex, consume_index.load()));
+      }while(!produce_index.compare_exchange_strong(oldIndex, newIndex));
+      assert(list[oldIndex] == nullptr);
+      list[oldIndex] = bundle;
+   }
 
-    YmapBundle(u64 pageCount, int n_threads);
-    u64 getPage(int tid, bool canSteal=true);
-	bool stealPages(int tid);
-	void putPage(int tid, u64 phys);
-	void mapPhysPage(int tid, void* virtAddr);
-	void unmapPhysPage(int tid, void* virtAddr);
-    bool tryMap(int tid, void* virtAddr, u64 phys);
-	void unmapBatch(int tid, void* virtMem, std::vector<PID> toEvict);
+   PageBundle* get(){
+      u64 oldIndex, newIndex;
+      do{
+         oldIndex = consume_index.load();
+         newIndex = (oldIndex+1)%list_size;
+         assert(correct_indexes(oldIndex, produce_index.load()));
+      }while(!consume_index.compare_exchange_strong(oldIndex, newIndex));
+      PageBundle* res = list[oldIndex];
+      list[oldIndex] = nullptr;
+      return res;
+   }
 
 };
+
+extern BundleList* fullList;
+extern BundleList* emptyList;
+
+static u64 constexpr pageSize = 4096;
+
+void initYmaps();
+u64 ymap_getPage();
+void ymap_putPage(u64 phys);
+bool ymap_tryMap(void* virtAddr, u64 phys);
+u64 ymap_tryUnmap(void* virt);
 
 #endif
