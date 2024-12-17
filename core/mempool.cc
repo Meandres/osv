@@ -1202,6 +1202,14 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
+llf page_allocator
+    __attribute__((init_priority((int)init_prio::page_allocator)));
+
+size_t cpuid(){
+    return page_allocator.is_ready() ? sched::cpu::current()->id : 0;
+
+}
+
 void llf::init() {
 
     // We initialize llfree with the entire memory known to OSv, even already allocated one.
@@ -1254,7 +1262,7 @@ void *llf::alloc_page(size_t size) {
 
     llfree_result_t page= llfree_get(
         self,
-        sched::cpu::current()->id,
+        cpuid(),
         llflags(order)
     );
 
@@ -1277,7 +1285,7 @@ void *llf::alloc_page_at(u64 frame, u64 size){
     unsigned order = ilog2(size / page_size);
     llfree_result_t page = llfree_get_at(
         self,
-        sched::cpu::current()->id,
+        cpuid(),
         frame,
         llflags(order)
     );
@@ -1294,7 +1302,7 @@ void llf::free_page(void* addr){
 
     llfree_result_t res = llfree_put(
         self,
-        sched::cpu::current()->id,
+        cpuid(),
         virt_to_idx(addr),
         llflags(0)
     );
@@ -1306,13 +1314,12 @@ void *llf::idx_to_virt(u64 idx){
     // TODO: change this as soon as we have our own mapping
     return reinterpret_cast<void *>(idx * page_size + offset);
 }
-u64 llf::virt_to_idx(void *idx){
+u64 llf::virt_to_idx(void *addr){
     // TODO: change this as soon as we have out own mapping
-    return  (reinterpret_cast<u64>(idx) - offset) / page_size;
+    if(mmu::get_mem_area(addr) == mmu::mem_area::page)
+        addr = mmu::translate_mem_area(mmu::mem_area::page, mmu::mem_area::main, addr);
+    return  (reinterpret_cast<u64>(addr) - offset) / page_size;
 }
-
-llf page_allocator
-    __attribute__((init_priority((int)init_prio::page_allocator)));
 
 // TODO remove this in favor of free_initial_memory_range
 void add_llfree_region(void *addr, size_t size){
@@ -1328,7 +1335,7 @@ static sched::cpu::notifier _notifier([]{
 
           // TODO remove
     if(page_allocator.is_ready()){
-        printf("Allocating test page on cpu %d\n", sched::cpu::current()->id);
+        printf("Allocating test page on cpu %d\n", cpuid());
         void *p = alloc_page();
         free_page(p);
     }
