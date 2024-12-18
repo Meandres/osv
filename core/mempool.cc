@@ -478,11 +478,6 @@ void wake_reclaimer()
     reclaimer_thread.wake();
 }
 
-static void on_free(size_t mem)
-{
-    free_memory.fetch_add(mem);
-}
-
 static void on_alloc(size_t mem)
 {
     free_memory.fetch_sub(mem);
@@ -498,12 +493,6 @@ static void on_alloc(size_t mem)
 ) < watermark_lo) {
         reclaimer_thread.wake();
     }
-}
-
-static void on_new_memory(size_t mem)
-{
-    total_memory.fetch_add(mem);
-    watermark_lo = stats::total() * 10 / 100;
 }
 
 namespace stats {
@@ -591,314 +580,6 @@ void reclaimer::wait_for_memory(size_t mem)
     _oom_blocked.wait(mem);
 }
 
-class page_range_allocator {
-public:
-    static constexpr unsigned max_order = page_ranges_max_order;
-
-    page_range_allocator() : _deferred_free(nullptr) { }
-
-    template<bool UseBitmap = true>
-    page_range* alloc(size_t size, bool contiguous = true);
-    page_range* alloc_aligned(size_t size, size_t offset, size_t alignment,
-                              bool fill = false);
-    void free(page_range* pr);
-
-    void initial_add(page_range* pr);
-
-    template<typename Func>
-    void for_each(unsigned min_order, Func f);
-    template<typename Func>
-    void for_each(Func f) {
-        for_each<Func>(0, f);
-    }
-
-    bool empty() const {
-        return _not_empty.none();
-    }
-    size_t size() const {
-        size_t size = _free_huge.size();
-        for (auto&& list : _free) {
-            size += list.size();
-        }
-        return size;
-    }
-
-    void stats(stats::page_ranges_stats& stats) const {
-        stats.order[max_order].ranges_num = _free_huge.size();
-        stats.order[max_order].bytes = 0;
-        for (auto& pr : _free_huge) {
-            stats.order[max_order].bytes += pr.size;
-        }
-
-        for (auto order = max_order; order--;) {
-            stats.order[order].ranges_num = _free[order].size();
-            stats.order[order].bytes = 0;
-            for (auto& pr : _free[order]) {
-                stats.order[order].bytes += pr.size;
-            }
-        }
-    }
-
-private:
-    template<bool UseBitmap = true>
-    void insert(page_range& pr) {
-        auto addr = static_cast<void*>(&pr);
-        auto pr_end = static_cast<page_range**>(addr + pr.size - sizeof(page_range**));
-        *pr_end = &pr;
-        auto order = ilog2(pr.size / page_size);
-        if (order >= max_order) {
-            _free_huge.insert(pr);
-            _not_empty[max_order] = true;
-        } else {
-            _free[order].push_front(pr);
-            _not_empty[order] = true;
-        }
-        if (UseBitmap) {
-            set_bits(pr, true);
-        }
-    }
-    void remove_huge(page_range& pr) {
-        _free_huge.erase(_free_huge.iterator_to(pr));
-        if (_free_huge.empty()) {
-            _not_empty[max_order] = false;
-        }
-    }
-    void remove_list(unsigned order, page_range& pr) {
-        _free[order].erase(_free[order].iterator_to(pr));
-        if (_free[order].empty()) {
-            _not_empty[order] = false;
-        }
-    }
-    void remove(page_range& pr) {
-        auto order = ilog2(pr.size / page_size);
-        if (order >= max_order) {
-            remove_huge(pr);
-        } else {
-            remove_list(order, pr);
-        }
-    }
-
-    unsigned get_bitmap_idx(page_range& pr) const {
-        auto idx = reinterpret_cast<uintptr_t>(&pr);
-        idx -= reinterpret_cast<uintptr_t>(mmu::phys_mem);
-        return idx / page_size;
-    }
-    void set_bits(page_range& pr, bool value, bool fill = false) {
-        auto end = pr.size / page_size - 1;
-        if (fill) {
-            for (unsigned idx = 0; idx <= end; idx++) {
-                _bitmap[get_bitmap_idx(pr) + idx] = value;
-            }
-        } else {
-            _bitmap[get_bitmap_idx(pr)] = value;
-            _bitmap[get_bitmap_idx(pr) + end] = value;
-        }
-    }
-
-    bi::multiset<page_range,
-                 bi::member_hook<page_range,
-                                 bi::set_member_hook<>,
-                                 &page_range::set_hook>,
-                 bi::constant_time_size<false>> _free_huge;
-    bi::list<page_range,
-             bi::member_hook<page_range,
-                             bi::list_member_hook<>,
-                             &page_range::list_hook>,
-             bi::constant_time_size<false>> _free[max_order];
-
-    std::bitset<max_order + 1> _not_empty;
-
-    template<typename T>
-    class bitmap_allocator {
-    public:
-        typedef T value_type;
-        T* allocate(size_t n);
-        void deallocate(T* p, size_t n);
-        size_t get_size(size_t n) {
-            return align_up(sizeof(T) * n, page_size);
-        }
-    };
-    boost::dynamic_bitset<unsigned long,
-                          bitmap_allocator<unsigned long>> _bitmap;
-    page_range* _deferred_free;
-};
-
-page_range_allocator free_page_ranges
-    __attribute__((init_priority((int)init_prio::page_allocator)));
-
-template<typename T>
-T* page_range_allocator::bitmap_allocator<T>::allocate(size_t n)
-{
-    auto size = get_size(n);
-    on_alloc(size);
-    auto pr = free_page_ranges.alloc<false>(size);
-    return reinterpret_cast<T*>(pr);
-}
-
-template<typename T>
-void page_range_allocator::bitmap_allocator<T>::deallocate(T* p, size_t n)
-{
-    auto size = get_size(n);
-    on_free(size);
-    auto pr = new (p) page_range(size);
-    assert(!free_page_ranges._deferred_free);
-    free_page_ranges._deferred_free = pr;
-}
-
-template<bool UseBitmap>
-page_range* page_range_allocator::alloc(size_t size, bool contiguous)
-{
-    auto exact_order = ilog2_roundup(size / page_size);
-    if (exact_order > max_order) {
-        exact_order = max_order;
-    }
-    auto bitset = _not_empty.to_ulong();
-    if (exact_order) {
-        bitset &= ~((1 << exact_order) - 1);
-    }
-    auto order = count_trailing_zeros(bitset);
-
-    page_range* range = nullptr;
-    if (!bitset) {
-        if (!contiguous || !exact_order || _free[exact_order - 1].empty()) {
-            return nullptr;
-        }
-        // This linear search makes worst case complexity of the allocator
-        // O(n). Unfortunately we do not have choice for contiguous allocation
-        // so let us hope there is large enough range.
-        for (auto&& pr : _free[exact_order - 1]) {
-            if (pr.size >= size) {
-                range = &pr;
-                remove_list(exact_order - 1, *range);
-                break;
-            }
-        }
-        if (!range) {
-            return nullptr;
-        }
-    } else if (order == max_order) {
-        range = &*_free_huge.rbegin();
-        if (range->size < size) {
-            return nullptr;
-        }
-        remove_huge(*range);
-    } else {
-        range = &_free[order].front();
-        remove_list(order, *range);
-    }
-
-    auto& pr = *range;
-    if (pr.size > size) {
-        auto& np = *new (static_cast<void*>(&pr) + size)
-                        page_range(pr.size - size);
-        insert<UseBitmap>(np);
-        pr.size = size;
-    }
-    if (UseBitmap) {
-        set_bits(pr, false);
-    }
-    return &pr;
-}
-
-page_range* page_range_allocator::alloc_aligned(size_t size, size_t offset,
-                                                size_t alignment, bool fill)
-{
-    page_range* ret_header = nullptr;
-    for_each(std::max(ilog2(size / page_size), 1u) - 1, [&] (page_range& header) {
-        char* v = reinterpret_cast<char*>(&header);
-        auto expected_ret = v + header.size - size + offset;
-        auto alignment_shift = expected_ret - align_down(expected_ret, alignment);
-        if (header.size >= size + alignment_shift) {
-            remove(header);
-            if (alignment_shift) {
-                insert(*new (v + header.size - alignment_shift)
-                            page_range(alignment_shift));
-                header.size -= alignment_shift;
-            }
-            if (header.size == size) {
-                ret_header = &header;
-            } else {
-                header.size -= size;
-                insert(header);
-                ret_header = new (v + header.size) page_range(size);
-            }
-            set_bits(*ret_header, false, fill);
-            return false;
-        }
-        return true;
-    });
-    return ret_header;
-}
-
-void page_range_allocator::free(page_range* pr)
-{
-    auto idx = get_bitmap_idx(*pr);
-    if (idx && _bitmap[idx - 1]) {
-        auto pr2 = *(reinterpret_cast<page_range**>(pr) - 1);
-        remove(*pr2);
-        pr2->size += pr->size;
-        pr = pr2;
-    }
-    auto next_idx = get_bitmap_idx(*pr) + pr->size / page_size;
-    if (next_idx < _bitmap.size() && _bitmap[next_idx]) {
-        auto pr2 = static_cast<page_range*>(static_cast<void*>(pr) + pr->size);
-        remove(*pr2);
-        pr->size += pr2->size;
-    }
-    insert(*pr);
-}
-
-void page_range_allocator::initial_add(page_range* pr)
-{
-    auto idx = get_bitmap_idx(*pr) + pr->size / page_size;
-    if (idx > _bitmap.size()) {
-        auto prev_idx = get_bitmap_idx(*pr) - 1;
-        if (_bitmap.size() > prev_idx && _bitmap[prev_idx]) {
-            auto pr2 = *(reinterpret_cast<page_range**>(pr) - 1);
-            remove(*pr2);
-            pr2->size += pr->size;
-            pr = pr2;
-        }
-        insert<false>(*pr);
-        _bitmap.reset();
-        _bitmap.resize(idx);
-
-        for_each([this] (page_range& pr) { set_bits(pr, true); return true; });
-        if (_deferred_free) {
-            free(_deferred_free);
-            _deferred_free = nullptr;
-        }
-    } else {
-        free(pr);
-    }
-}
-
-template<typename Func>
-void page_range_allocator::for_each(unsigned min_order, Func f)
-{
-    for (auto& pr : _free_huge) {
-        if (!f(pr)) {
-            return;
-        }
-    }
-    for (auto order = max_order; order-- > min_order;) {
-        for (auto& pr : _free[order]) {
-            if (!f(pr)) {
-                return;
-            }
-        }
-    }
-}
-
-namespace stats {
-    void get_page_ranges_stats(page_ranges_stats &stats)
-    {
-        WITH_LOCK(free_page_ranges_lock) {
-            free_page_ranges.stats(stats);
-        }
-    }
-}
-
 static void* mapped_malloc_large(size_t size, size_t offset)
 {
     //TODO: For now pre-populate the memory, in future consider doing lazy population
@@ -917,6 +598,9 @@ static void mapped_free_large(void *object)
 
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
+
+    return llfree_extern_alloc(size, alignment);
+
     auto requested_size = size;
     size_t offset;
     if (alignment < page_size) {
@@ -934,43 +618,6 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
         trace_memory_malloc_large(obj, requested_size, size, alignment);
         return obj;
     }
-
-    while (true) {
-        WITH_LOCK(free_page_ranges_lock) {
-            reclaimer_thread.wait_for_minimum_memory();
-            page_range* ret_header;
-            if (alignment > page_size) {
-                ret_header = free_page_ranges.alloc_aligned(size, page_size, alignment);
-            } else {
-                ret_header = free_page_ranges.alloc(size, contiguous);
-            }
-            if (ret_header) {
-                on_alloc(size);
-                void* obj = ret_header;
-                obj += offset;
-                trace_memory_malloc_large(obj, requested_size, size, alignment);
-                return obj;
-            } else if (!contiguous) {
-                // If we failed to get contiguous memory allocation and
-                // the caller does not require one let us use map-based allocation
-                // which we do after the loop below
-                break;
-            }
-            if (block)
-                reclaimer_thread.wait_for_memory(size);
-            else
-                return nullptr;
-        }
-    }
-
-    // We are deliberately executing this code here because doing it
-    // in WITH_LOCK section above, would likely lead to a deadlock,
-    // as map_anon() eventually would be pulling memory from free_page_ranges
-    // to satisfy the request and even worse this method might get
-    // called recursively.
-    void* obj = mapped_malloc_large(size, offset);
-    trace_memory_malloc_large(obj, requested_size, size, alignment);
-    return obj;
 }
 
 void shrinker::deactivate_shrinker()
@@ -1005,40 +652,41 @@ void *osv_register_shrinker(const char *name,
 
 bool reclaimer_waiters::wake_waiters()
 {
-    bool woken = false;
-    assert(mutex_owned(&free_page_ranges_lock));
-    free_page_ranges.for_each([&] (page_range& fp) {
-        // We won't do the allocations, so simulate. Otherwise we can have
-        // 10Mb available in the whole system, and 4 threads that wait for
-        // it waking because they all believe that memory is available
-        auto in_this_page_range = fp.size;
-        // We expect less waiters than page ranges so the inner loop is one
-        // of waiters. But we cut the whole thing short if we're out of them.
-        if (_waiters.empty()) {
-            woken = true;
-            return false;
-        }
-
-        auto it = _waiters.begin();
-        while (it != _waiters.end()) {
-            auto& wr = *it;
-            it++;
-
-            if (in_this_page_range >= wr.bytes) {
-                in_this_page_range -= wr.bytes;
-                _waiters.erase(_waiters.iterator_to(wr));
-                wr.owner->wake();
-                wr.owner = nullptr;
-                woken = true;
-            }
-        }
-        return true;
-    });
-
-    if (!_waiters.empty()) {
-        reclaimer_thread.wake();
-    }
-    return woken;
+    // bool woken = false;
+    // assert(mutex_owned(&free_page_ranges_lock));
+    // free_page_ranges.for_each([&] (page_range& fp) {
+    //     // We won't do the allocations, so simulate. Otherwise we can have
+    //     // 10Mb available in the whole system, and 4 threads that wait for
+    //     // it waking because they all believe that memory is available
+    //     auto in_this_page_range = fp.size;
+    //     // We expect less waiters than page ranges so the inner loop is one
+    //     // of waiters. But we cut the whole thing short if we're out of them.
+    //     if (_waiters.empty()) {
+    //         woken = true;
+    //         return false;
+    //     }
+    //
+    //     auto it = _waiters.begin();
+    //     while (it != _waiters.end()) {
+    //         auto& wr = *it;
+    //         it++;
+    //
+    //         if (in_this_page_range >= wr.bytes) {
+    //             in_this_page_range -= wr.bytes;
+    //             _waiters.erase(_waiters.iterator_to(wr));
+    //             wr.owner->wake();
+    //             wr.owner = nullptr;
+    //             woken = true;
+    //         }
+    //     }
+    //     return true;
+    // });
+    //
+    // if (!_waiters.empty()) {
+    //     reclaimer_thread.wake();
+    // }
+    // return woken;
+    return true;
 }
 
 // Note for callers: Ideally, we would not only wake, but already allocate
@@ -1158,36 +806,6 @@ void reclaimer::_do_reclaim()
         }
     }
 }
-
-// Return a page range back to free_page_ranges. Note how the size of the
-// page range is range->size, but its start is at range itself.
-static void free_page_range_locked(page_range *range)
-{
-    on_free(range->size);
-    free_page_ranges.free(range);
-}
-
-// Return a page range back to free_page_ranges. Note how the size of the
-// page range is range->size, but its start is at range itself.
-static void free_page_range(page_range *range)
-{
-    WITH_LOCK(free_page_ranges_lock) {
-        free_page_range_locked(range);
-    }
-}
-
-static void free_page_range(void *addr, size_t size)
-{
-    new (addr) page_range(size);
-    free_page_range(static_cast<page_range*>(addr));
-}
-
-static void free_large(void* obj)
-{
-    obj = align_down(obj - 1, page_size);
-    free_page_range(static_cast<page_range*>(obj));
-}
-
 static size_t large_object_offset(void *&obj)
 {
     void *original_obj = obj;
@@ -1205,35 +823,45 @@ static size_t large_object_size(void *obj)
 llf page_allocator
     __attribute__((init_priority((int)init_prio::page_allocator)));
 
+
+bi::multiset<page_range,
+   bi::member_hook<page_range,
+       bi::set_member_hook<>,
+       &page_range::set_hook>,
+   bi::constant_time_size<false>> phys_mem_ranges
+    __attribute__((init_priority((int)init_prio::page_allocator)));
+
 size_t cpuid(){
     return page_allocator.is_ready() ? sched::cpu::current()->id : 0;
-
 }
 
 void llf::init() {
-
-    // We initialize llfree with the entire memory known to OSv, even already allocated one.
-    // It's therefore important that the allocated pages are set to allocated in OSv before
-    // the first actual allocation request comes in.
-    size_t size{0};
-    for(auto m : mem_regions){
-      // llfree expects continuous virtual memory. Since we cannot guarantee that until we do
-      // our own mapping, we just take the biggest region.
-      if (std::get<1>(m) > size){
-          size = std::get<1>(m);
-          offset = reinterpret_cast<u64>(std::get<0>(m));
-      }
-    }
-
     self = llfree_setup(
         sched::cpus.size(),
-        size / page_size,
+        phys_mem_size / page_size,
+        LLFREE_INIT_FREE
+    );
+    
+    if(self){
+        block_allocated();
+        ready = true;
+    }
+}
+
+void llf::init(size_t cores) {
+    printf("phys_mem_size: 0x%lx\n", phys_mem_size);
+    // We initialize llfree with the entire memory even already allocated one.
+    // It's therefore important that the allocated pages are set to allocated in OSv before
+    // the first actual allocation request comes in.
+
+    // This assumes that phys_mem_size doesn't change
+    self = llfree_setup(
+        cores,
+        phys_mem_size / page_size,
         LLFREE_INIT_FREE
     );
 
-    printf(" --- LLFREE --- \n");
-    printf("    managing virt region 0x%lx - 0x%lx\n", offset, offset + size);
-    printf("    highes frame index: 0x%lx\n", size/page_size);
+    // TODO block allocated pages
 
     if(self)
       printf("llfree init successful\n");
@@ -1242,13 +870,27 @@ void llf::init() {
       return;
     }
 
-    ready = true;
+    if(self){
+        block_allocated();
+        ready = true;
+    }
+
+    ready = false;
+}
+
+void llf::block_allocated(){
+    for(auto& r : phys_mem_ranges){
+        printf("addr: 0x%lx + 0x%lx\n", static_cast<void *>(&r), r.size);
+    }
 }
 
 void llf::add_region(void *mem_start, size_t mem_size){
     assert(!is_ready());
-    if(mem_size > 0)
-        mem_regions.push_back({mem_start, mem_size});
+    if(mem_size > 0){
+        auto pr = new (mem_start) page_range(mem_size);
+        phys_mem_ranges.insert(*pr);
+        printf("insert addr: 0x%lx, size: 0x%lx\n", mem_start, mem_size);
+    }
 }
 
 bool llf::is_ready(){
@@ -1312,13 +954,16 @@ void llf::free_page(void* addr){
 
 void *llf::idx_to_virt(u64 idx){
     // TODO: change this as soon as we have our own mapping
-    return reinterpret_cast<void *>(idx * page_size + offset);
+    return mmu::translate_mem_area(
+        mmu::mem_area::main, 
+        mmu::mem_area::page, 
+        mmu::phys_cast<void>(idx*page_size));
 }
 u64 llf::virt_to_idx(void *addr){
     // TODO: change this as soon as we have out own mapping
     if(mmu::get_mem_area(addr) == mmu::mem_area::page)
         addr = mmu::translate_mem_area(mmu::mem_area::page, mmu::mem_area::main, addr);
-    return  (reinterpret_cast<u64>(addr) - offset) / page_size;
+    return  reinterpret_cast<u64>(addr) / page_size;
 }
 
 // TODO remove this in favor of free_initial_memory_range
@@ -1326,14 +971,47 @@ void add_llfree_region(void *addr, size_t size){
     page_allocator.add_region(addr, size);
 }
 
+void *llfree_extern_alloc(size_t size, size_t alignment) {
+    for(auto& pr : phys_mem_ranges){
+        size_t offset{(alignment - reinterpret_cast<uintptr_t>(&pr) % alignment) % alignment};
+        size_t act_size{size + offset};
+        if(pr.size >= act_size){
+            // printf("addr: 0x%lx\n", &pr);
+            // printf("size: 0x%lx\n", size);
+            // printf("offs: 0x%lx\n", offset);
+            // printf("alig: 0x%lx\n", alignment);
+            // printf("acts: 0x%lx\n", act_size);
+            auto range = &pr;
+            phys_mem_ranges.erase(
+                phys_mem_ranges.iterator_to(pr));
+            
+            auto& pr = *range;
+            if(pr.size > act_size){
+                auto& np = *new (static_cast<void*>(&pr) + act_size)
+                                page_range(pr.size - act_size);
+                phys_mem_ranges.insert(np);
+            }
+
+            if(page_allocator.is_ready())
+                printf("extern alloc after llfree was initialized can cause allocation faults\n");
+            auto tmp = reinterpret_cast<void *>(&pr) + offset;
+            // printf("addr: 0x%lx + 0x%lx (0x%lx)\n", tmp, size, alignment);
+            return tmp;
+        }
+    }
+    memory::oom();
+    return nullptr;
+}
+
 std::atomic<unsigned> llf_cnt{0};
 static sched::cpu::notifier _notifier([]{
-    unsigned i = 0;
-    while(llf_cnt == 0)
-      if(llf_cnt.compare_exchange_weak(i, 1))
-          page_allocator.init();
+    // unsigned i = 0;
+    // while(llf_cnt == 0)
+    //   if(llf_cnt.compare_exchange_weak(i, 1))
+    //       page_allocator.init();
 
-          // TODO remove
+    // TODO remove
+    
     if(page_allocator.is_ready()){
         printf("Allocating test page on cpu %d\n", cpuid());
         void *p = alloc_page();
@@ -1346,14 +1024,18 @@ static void* early_alloc_page()
   // TODO remove
     WITH_LOCK(free_page_ranges_lock) {
         on_alloc(page_size);
-        return static_cast<void*>(free_page_ranges.alloc(page_size));
+        // return static_cast<void*>(free_page_ranges.alloc(page_size));
+        if(page_allocator.is_ready())
+          return page_allocator.alloc_page();
+        else
+          return llfree_extern_alloc(page_size, page_size);
     }
 }
 
 static void early_free_page(void* v)
 {
     auto pr = new (v) page_range(page_size);
-    free_page_range(pr);
+    phys_mem_ranges.insert(*pr);
 }
 //
 // Following variables and functions are used to implement simple
@@ -1529,53 +1211,13 @@ void free_page(void* v)
  */
 void* alloc_huge_page(size_t N)
 {
-    WITH_LOCK(free_page_ranges_lock) {
-        auto pr = free_page_ranges.alloc_aligned(N, 0, N, true);
-        if (pr) {
-            on_alloc(N);
-            return static_cast<void*>(pr);
-            // TODO: consider using tracker.remember() for each one of the small
-            // pages allocated. However, this would be inefficient, and since we
-            // only use alloc_huge_page in one place, maybe not worth it.
-        }
-        // Definitely a sign we are somewhat short on memory. It doesn't *mean* we
-        // are, because that might be just fragmentation. But we wake up the reclaimer
-        // just to be sure, and if this is not real pressure, it will just go back to
-        // sleep
-        reclaimer_thread.wake();
-        trace_memory_huge_failure(free_page_ranges.size());
-        return nullptr;
-    }
+  return malloc(N);
 }
 
 void free_huge_page(void* v, size_t N)
 {
-    free_page_range(v, N);
-}
-
-void free_initial_memory_range(void* addr, size_t size)
-{
-    if (!size) {
-        return;
-    }
-    auto a = reinterpret_cast<uintptr_t>(addr);
-    auto delta = align_up(a, page_size) - a;
-    if (delta > size) {
-        return;
-    }
-    addr += delta;
-    size -= delta;
-    size = align_down(size, page_size);
-    if (!size) {
-        return;
-    }
-
-    on_new_memory(size);
-
-    on_free(size);
-
-    auto pr = new (addr) page_range(size);
-    free_page_ranges.initial_add(pr);
+    free(v);
+    // free_page_range(v, N);
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setupp()
@@ -1692,6 +1334,9 @@ static inline void* std_realloc(void* object, size_t size)
 
 void free(void* object)
 {
+  // TODO remove
+  return;
+
     trace_memory_free(object);
     if (!object) {
         return;
@@ -1709,8 +1354,8 @@ void free(void* object)
         object = mmu::translate_mem_area(mmu::mem_area::page,
                                          mmu::mem_area::main, object);
         return memory::free_page(object);
-    case mmu::mem_area::main:
-         return memory::free_large(object);
+    // case mmu::mem_area::main:
+    //      return memory::free_large(object);
     case mmu::mem_area::mempool:
         object = mmu::translate_mem_area(mmu::mem_area::mempool,
                                          mmu::mem_area::main, object);
@@ -1935,7 +1580,8 @@ void* alloc_phys_contiguous_aligned(size_t size, size_t align, bool block)
 
 void free_phys_contiguous_aligned(void* p)
 {
-    free_large(p);
+    // free_large(p);
+    free(p);
 }
 
 bool throttling_needed()
@@ -1966,6 +1612,6 @@ extern "C" void free_contiguous_aligned(void* p)
     memory::free_phys_contiguous_aligned(p);
 }
 
-void *llfree_extern_alloc(size_t size, size_t alignment) {
-    return aligned_alloc(alignment, size); 
+void *llfree_extern_alloc(size_t size, size_t alignment){
+    return memory::llfree_extern_alloc(size, alignment);
 }

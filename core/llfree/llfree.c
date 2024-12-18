@@ -89,6 +89,28 @@ llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init) {
   return llfree_is_ok(ret) ? self : NULL;
 }
 
+llfree_result_t llfree_update_cores(llfree_t *self, size_t cores) {
+  size_t cur_cores = llfree_cores(self);
+
+  // Nothing to do
+  if (cores == cur_cores)
+    return llfree_err(LLFREE_ERR_OK);
+
+  // Cannot reduce number of cores
+  assert(cur_cores < cores);
+
+  // TODO consider removing this as it might not be that performant
+  llfree_validate(self);
+
+  llfree_meta_size_t cur_size = llfree_metadata_size(cur_cores, llfree_frames(self));
+  llfree_meta_size_t new_size = llfree_metadata_size(cores, llfree_frames(self));
+
+  printf("old local size: 0x%lx\n", cur_size.local);
+  printf("new local size: 0x%lx\n", new_size.local);
+
+  return llfree_err(LLFREE_ERR_OK);
+}
+
 llfree_result_t llfree_init(llfree_t *self, size_t cores, size_t frames,
                             uint8_t init, llfree_meta_t meta) {
   assert(self != NULL);
@@ -115,9 +137,10 @@ llfree_result_t llfree_init(llfree_t *self, size_t cores, size_t frames,
   self->trees = (_Atomic(tree_t) *)(meta.trees);
 
   // init local data do default 0
-  for (size_t local_idx = 0; local_idx < self->cores; ++local_idx) {
-    ll_local_init(&self->local[local_idx]);
-  }
+  if (init != LLFREE_INIT_NONE)
+    for (size_t local_idx = 0; local_idx < self->cores; ++local_idx) {
+      ll_local_init(&self->local[local_idx]);
+    }
 
   if (init != LLFREE_INIT_NONE)
     init_trees(self);
