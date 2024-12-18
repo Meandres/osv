@@ -113,6 +113,9 @@ typedef struct llfree_meta {
 /// Initialize a llfree instance
 llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init);
 
+/// Change number of cores used by llfree. It is the callers responsibility that no race condition happens on the local data of llfree.
+llfree_result_t llfree_update_cores(llfree_t *self, size_t cores);
+
 /// Allocate and initialize the data structures of the allocator.
 ///
 /// `offset` is the number of the first page to be managed and `len` determins

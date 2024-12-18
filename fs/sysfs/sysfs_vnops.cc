@@ -34,23 +34,24 @@ static string sysfs_distance()
 using namespace memory;
 static string sysfs_free_page_ranges()
 {
-    stats::page_ranges_stats stats;
-    stats::get_page_ranges_stats(stats);
-
-    std::string output("");
-    if (stats.order[page_ranges_max_order].ranges_num) {
-        output += osv::sprintf("huge %04d %012ld\n", //TODO: Show in GB/MB/KB
-           stats.order[page_ranges_max_order].ranges_num, stats.order[page_ranges_max_order].bytes);
-    }
-
-    for (int order = page_ranges_max_order; order--; ) {
-        if (stats.order[order].ranges_num) {
-            output += osv::sprintf("  %02d %04d %012ld\n",
-               order + 1, stats.order[order].ranges_num, stats.order[order].bytes);
-        }
-    }
-
-    return output;
+    // stats::page_ranges_stats stats;
+    // stats::get_page_ranges_stats(stats);
+    //
+    // std::string output("");
+    // if (stats.order[page_ranges_max_order].ranges_num) {
+    //     output += osv::sprintf("huge %04d %012ld\n", //TODO: Show in GB/MB/KB
+    //        stats.order[page_ranges_max_order].ranges_num, stats.order[page_ranges_max_order].bytes);
+    // }
+    //
+    // for (int order = page_ranges_max_order; order--; ) {
+    //     if (stats.order[order].ranges_num) {
+    //         output += osv::sprintf("  %02d %04d %012ld\n",
+    //            order + 1, stats.order[order].ranges_num, stats.order[order].bytes);
+    //     }
+    // }
+    //
+    // return output;
+    return {};
 }
 
 static int

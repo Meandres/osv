@@ -38,6 +38,9 @@ class llf{
 public:
   /// Initialize llfree
   void init();
+  /// Initialize llfree with custom number of cores. This must be used before
+  /// sched::cpus is populated
+  void init(size_t cores);
 
   /// Returns if llfree is set up
   bool is_ready();
@@ -62,15 +65,14 @@ private:
   llfree_t *self{nullptr};
   /// Whether llfree is ready
   bool ready{false};
-  /// TODO: Remove this as soon as llfree has its own mapping.
-  /// For now this indicates at what offset of the main mapping the llfree managed memory regions begins
-  u64 offset{0};
-  /// Storage of physical memory regions llfree is in charge of
-  std::vector<std::tuple<void*, size_t>> mem_regions;
 
   void* idx_to_virt(u64 idx);
   u64 virt_to_idx(void *virt);
+
+  void block_allocated();
 };
+
+extern llf page_allocator;
 
 void add_llfree_region(void *mem_start, size_t mem_size);
 
