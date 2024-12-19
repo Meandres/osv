@@ -9,9 +9,7 @@
 #define MEMPOOL_HH
 
 #include "osv/llfree.h"
-#include <cstdint>
 #include <functional>
-#include <list>
 #include <boost/intrusive/set.hpp>
 #include <boost/intrusive/list.hpp>
 #include <osv/mutex.h>
@@ -30,8 +28,13 @@ extern "C" void thread_mark_emergency();
 
 namespace memory {
 
-const size_t page_size = 4096;
+// Smallest size to be allocated by page frame allocator
+const size_t page_size = mmu::page_size;
 
+// 4MiB as defined in <osv/llfree_platform.h>
+const size_t llf_max_size = mmu::page_size << 10;
+
+// Sum of all memory regions known to the memory allocator
 extern size_t phys_mem_size;
 
 class llf{
@@ -69,6 +72,9 @@ private:
   void* idx_to_virt(u64 idx);
   u64 virt_to_idx(void *virt);
 
+  // llfree is not aware of different memory regions. To it the memory is contiguous from 0 - <highest physical address>
+  // Here we allocate gaps between memory regions and pages already allocated by the llfree_extern_allocator, so every page
+  // llfree returns after this is valid.
   void block_allocated();
 };
 
