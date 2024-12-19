@@ -889,6 +889,24 @@ void *llf::alloc_page(size_t size, size_t alignment){
     return nullptr;
 }
 
+void *llf::alloc_huge_page(unsigned order){
+   assert(is_ready());
+
+    llfree_result_t page = llfree_get(
+        self,
+        cpuid(),
+        llflags(order)
+    );
+
+    if(llfree_is_ok(page)){
+        return idx_to_virt(page.frame);
+    }
+
+    oom();
+    return nullptr;
+
+}
+
 void *llf::alloc_page_at(size_t frame){
     llfree_result_t page = llfree_get_at(
         self,
@@ -926,6 +944,20 @@ void llf::free_page(void *addr, size_t size){
         cpuid(),
         virt_to_idx(addr),
         llflags(order(size, 0))
+    );
+
+    // TODO remove
+    assert(llfree_is_ok(res));
+}
+
+void llf::free_huge_page(void *addr, unsigned order){
+    assert(is_ready());
+
+    llfree_result_t res = llfree_put(
+        self,
+        cpuid(),
+        virt_to_idx(addr),
+        llflags(order)
     );
 
     // TODO remove
@@ -1051,10 +1083,18 @@ static void* mapped_malloc_large(size_t size, size_t offset)
 
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
-    if(page_allocator.is_ready()){
-        return page_allocator.alloc_page(size, alignment);
-    } else {
-        return llfree_extern_alloc(size, alignment);
+    // handle in contiguous physical memory if possible
+    if(llf::order(size, alignment) <= 10){
+        if(page_allocator.is_ready()){
+            return page_allocator.alloc_page(size, alignment);
+        } else {
+            return llfree_extern_alloc(size, alignment);
+        }
+    }
+
+    if(contiguous){
+        printf("[ERROR]: physically contiguous allocations above 4MiB are not possible\n");
+        abort();
     }
 
     auto requested_size = size;
@@ -1067,47 +1107,6 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     size += offset;
     size = align_up(size, page_size);
 
-    // Use mmap if requested memory greater than "huge page" size
-    // and does not need to be contiguous
-    if (size >= mmu::huge_page_size && !contiguous) {
-        void* obj = mapped_malloc_large(size, offset);
-        trace_memory_malloc_large(obj, requested_size, size, alignment);
-        return obj;
-    }
-
-    // while (true) {
-    //     WITH_LOCK(free_page_ranges_lock) {
-    //         reclaimer_thread.wait_for_minimum_memory();
-    //         page_range* ret_header;
-    //         if (alignment > page_size) {
-    //             ret_header = free_page_ranges.alloc_aligned(size, page_size, alignment);
-    //         } else {
-    //             ret_header = free_page_ranges.alloc(size, contiguous);
-    //         }
-    //         if (ret_header) {
-    //             on_alloc(size);
-    //             void* obj = ret_header;
-    //             obj += offset;
-    //             trace_memory_malloc_large(obj, requested_size, size, alignment);
-    //             return obj;
-    //         } else if (!contiguous) {
-    //             // If we failed to get contiguous memory allocation and
-    //             // the caller does not require one let us use map-based allocation
-    //             // which we do after the loop below
-    //             break;
-    //         }
-    //         if (block)
-    //             reclaimer_thread.wait_for_memory(size);
-    //         else
-    //             return nullptr;
-    //     }
-    // }
-
-    // We are deliberately executing this code here because doing it
-    // in WITH_LOCK section above, would likely lead to a deadlock,
-    // as map_anon() eventually would be pulling memory from free_page_ranges
-    // to satisfy the request and even worse this method might get
-    // called recursively.
     void* obj = mapped_malloc_large(size, offset);
     trace_memory_malloc_large(obj, requested_size, size, alignment);
     return obj;
@@ -1131,7 +1130,7 @@ static sched::cpu::notifier _notifier([]{
     // TODO remove
     
     if(page_allocator.is_ready()){
-        printf("Allocating test page on cpu %d\n", cpuid());
+        // printf("Allocating test page on cpu %d\n", cpuid());
         void *p = alloc_page();
         free_page(p);
     }
@@ -1306,17 +1305,23 @@ void free_page(void* v)
  */
 void* alloc_huge_page(size_t N)
 {
-  // TODO
-  printf("alloc_huge_page called\n");
-  return malloc(N);
+  if(!page_allocator.is_ready()){
+      // TODO
+      printf("[ERROR] alloc_huge_page cannot be called before tls is initialized");
+      abort();
+  }
+
+  return page_allocator.alloc_huge_page(llf::order(N, 0));
 }
 
 void free_huge_page(void* v, size_t N)
 {
-    // TODO
-    printf("free_huge_page called\n");
-    free(v);
-    // free_page_range(v, N);
+  if(!page_allocator.is_ready()){
+      // TODO
+      printf("[ERROR] free_huge_page cannot be called before tls is initialized");
+      abort();
+  }
+  page_allocator.free_huge_page(v, llf::order(N, 0));
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setupp()
@@ -1356,13 +1361,10 @@ static inline void* std_malloc(size_t size, size_t alignment)
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page, memory::alloc_page());
         trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     // TODO refine this else if to support allocations of higher alignments if llf_max_size is small enough
-    } else if (minimum_size <= memory::llf_max_size && alignment <= memory::page_size) {
-        ret = memory::malloc_large(minimum_size, alignment);
-        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
-      // TODO handle mapped allocations
-      ret = llfree_extern_alloc(minimum_size, alignment);
-    }
+        ret = memory::malloc_large(minimum_size, alignment, true, false);
+        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
+    } 
 
 #if CONF_memory_tracker
     memory::tracker_remember(ret, size);
