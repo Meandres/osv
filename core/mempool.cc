@@ -838,11 +838,16 @@ void llf::init(size_t cores) {
     // We initialize llfree with the entire memory even already allocated one.
     // It's therefore important that the allocated pages are set to allocated in OSv before
     // the first actual allocation request comes in.
+    size_t highest{0};
+    for(auto& pr : phys_mem_ranges){
+        size_t cur = reinterpret_cast<size_t>(&pr) + pr.size ;
+        if(cur > highest) highest = cur;
+    }
 
     // This assumes that phys_mem_size doesn't change
     self = llfree_setup(
         cores,
-        phys_mem_size / page_size,
+        (highest - mmu::get_mem_area_base(mmu::mem_area::main)) / page_size,
         LLFREE_INIT_FREE
     );
 
@@ -860,26 +865,18 @@ void llf::init(size_t cores) {
 }
 
 void llf::block_allocated(){
-    printf("expecting frames from 0 to 0x%lx\n", llfree_frames(self));
-    printf("mem: 0x%lx - 0x%lx\n", idx_to_virt(0), idx_to_virt(llfree_frames(self)));
-
     // TODO: improve complexity if possible
     for(size_t frame{0}; frame < llfree_frames(self); ++frame){
         void *addr = idx_to_virt(frame);
-        //TODO remove this if
-        if(addr >= (void *)0x400040000000)
         for(auto& pr : phys_mem_ranges){
             if(addr >= &pr && addr < (static_cast<void *>(&pr) + pr.size)){
                 frame += pr.size / page_size - 1;
                 phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
-                printf("found: 0x%lx.Skipping 0x%lx frames \n",
-                    addr, pr.size / page_size);
                 break;
             }
         }
         if(addr != idx_to_virt(frame))
             continue;
-        // printf("addr: 0x%lx not found\n", addr);
         alloc_page_at(frame, page_size);
     }
 }
@@ -889,7 +886,6 @@ void llf::add_region(void *mem_start, size_t mem_size){
     if(mem_size > 0){
         auto pr = new (mem_start) page_range(mem_size);
         phys_mem_ranges.insert(*pr);
-        printf("insert addr: 0x%lx, size: 0x%lx\n", mem_start, mem_size);
     }
 }
 
@@ -916,13 +912,8 @@ void *llf::alloc_page(size_t size) {
     );
 
     if(llfree_is_ok(page)){
-        if(idx_to_virt(page.frame) < (void *)0x400000000000){
-            printf("0x%lx --> 0x%lx\n", page.frame, idx_to_virt(page.frame));
-            assert(false);
-        }
         return idx_to_virt(page.frame);
     }
-    // TODO: we could try using early_alloc, there might still be some memory there
     printf("llfree ran out of memory\n");
     oom();
     return nullptr;
