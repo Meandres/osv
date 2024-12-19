@@ -820,51 +820,30 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
-void llf::init() {
-    self = llfree_setup(
-        sched::cpus.size(),
-        phys_mem_size / page_size,
-        LLFREE_INIT_FREE
-    );
-    
-    if(self){
-        block_allocated();
-        ready = true;
-    }
-}
-
 void llf::init(size_t cores) {
-    printf("phys_mem_size: 0x%lx\n", phys_mem_size);
-    // We initialize llfree with the entire memory even already allocated one.
-    // It's therefore important that the allocated pages are set to allocated in OSv before
-    // the first actual allocation request comes in.
+    // llfree sees the memory as contiguous, we reserve the gaps and already allocated memory later
     size_t highest{0};
     for(auto& pr : phys_mem_ranges){
         size_t cur = reinterpret_cast<size_t>(&pr) + pr.size ;
         if(cur > highest) highest = cur;
     }
 
-    // This assumes that phys_mem_size doesn't change
     self = llfree_setup(
         cores,
         (highest - mmu::get_mem_area_base(mmu::mem_area::main)) / page_size,
         LLFREE_INIT_FREE
     );
 
-    if(self)
-      printf("llfree init successful\n");
-    else {
+    if(self){
+        reserve_allocated();
+        ready = true;
+    } else {
       printf("llfree init failed\n");
       return;
     }
-
-    if(self){
-        block_allocated();
-        ready = true;
-    }
 }
 
-void llf::block_allocated(){
+void llf::reserve_allocated(){
     // TODO: improve complexity if possible
     for(size_t frame{0}; frame < llfree_frames(self); ++frame){
         void *addr = idx_to_virt(frame);
@@ -897,18 +876,10 @@ bool llf::is_ready(){
 void *llf::alloc_page(size_t size) {
     assert(is_ready());
 
-    // TODO fix order
-    size_t frames = (size - 1) / page_size;
-    unsigned order{0};
-    while(frames){
-        frames /= 2;
-        order++;
-    }
-
     llfree_result_t page= llfree_get(
         self,
         cpuid(),
-        llflags(order)
+        llflags(order(size))
     );
 
     if(llfree_is_ok(page)){
@@ -920,20 +891,11 @@ void *llf::alloc_page(size_t size) {
 }
 
 void *llf::alloc_page_at(u64 frame, u64 size){
-
-    // TODO fix order
-    size_t frames = (size - 1) / page_size;
-    unsigned order{0};
-    while(frames){
-        frames /= 2;
-        order++;
-    }
-
     llfree_result_t page = llfree_get_at(
         self,
         cpuid(),
         frame,
-        llflags(order)
+        llflags(order(size))
     );
 
     if(llfree_is_ok(page))
@@ -946,6 +908,8 @@ void *llf::alloc_page_at(u64 frame, u64 size){
 void llf::free_page(void* addr){
     assert(is_ready());
 
+
+    // TODO: free correct order
     llfree_result_t res = llfree_put(
         self,
         cpuid(),
@@ -968,9 +932,19 @@ u64 llf::virt_to_idx(void *addr){
         addr - mmu::get_mem_area_base(mmu::mem_area::main)) / page_size;
 }
 
-// TODO remove this in favor of free_initial_memory_range
 void add_llfree_region(void *addr, size_t size){
     page_allocator.add_region(addr, size);
+}
+
+unsigned llf::order(size_t size){
+    // TODO fix order
+    size_t frames = (size - 1) / page_size;
+    unsigned order{0};
+    while(frames){
+        frames /= 2;
+        order++;
+    }
+    return order;
 }
 
 void *llfree_extern_alloc(size_t size, size_t alignment) {
