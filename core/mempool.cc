@@ -862,7 +862,6 @@ void *llf::alloc_page() {
     if(llfree_is_ok(page)){
         return idx_to_virt(page.frame);
     }
-    printf("llfree ran out of memory\n");
     oom();
     return nullptr;
 }
@@ -918,7 +917,6 @@ void *llf::alloc_page_at(size_t frame){
     if(llfree_is_ok(page))
         return idx_to_virt(page.frame);
 
-    printf("alloc at failed\n");
     return nullptr;
 }
 
@@ -1025,10 +1023,6 @@ void *llfree_extern_alloc(size_t size, size_t alignment) {
             return reinterpret_cast<void *>(&pr) + offset;
         }
     }
-    printf("extern alloc failed. size: 0x%lx\n", size);
-    for(auto& pr : phys_mem_ranges){
-        printf("  0x%lx + 0x%lx", &pr, pr.size);
-    }
     memory::oom();
     return nullptr;
 }
@@ -1126,14 +1120,6 @@ static sched::cpu::notifier _notifier([]{
     // while(llf_cnt == 0)
     //   if(llf_cnt.compare_exchange_weak(i, 1))
     //       page_allocator.init();
-
-    // TODO remove
-    
-    if(page_allocator.is_ready()){
-        // printf("Allocating test page on cpu %d\n", cpuid());
-        void *p = alloc_page();
-        free_page(p);
-    }
 });
 //
 // Following variables and functions are used to implement simple
@@ -1306,20 +1292,17 @@ void free_page(void* v)
 void* alloc_huge_page(size_t N)
 {
   if(!page_allocator.is_ready()){
-      // TODO
-      printf("[ERROR] alloc_huge_page cannot be called before tls is initialized");
-      abort();
+      // TODO implement huge page allocation for llfree_extern_alloc
+      abort("[ERROR] alloc_huge_page cannot be called before tls is initialized");
   }
-
   return page_allocator.alloc_huge_page(llf::order(N, 0));
 }
 
 void free_huge_page(void* v, size_t N)
 {
   if(!page_allocator.is_ready()){
-      // TODO
-      printf("[ERROR] free_huge_page cannot be called before tls is initialized");
-      abort();
+      // TODO implement huge page free for llfree_extern_alloc
+      abort("[ERROR] free_huge_page cannot be called before tls is initialized");
   }
   page_allocator.free_huge_page(v, llf::order(N, 0));
 }
@@ -1516,7 +1499,6 @@ void* malloc(size_t size, size_t alignment)
         memory::reclaimer_thread.wait_for_minimum_memory();
     }
 
-    printf("THIS SHOULD NEVER BE PRINTED\n");
     // There will be multiple allocations needed to satisfy this allocation; request
     // access to the emergency pool to avoid us holding some lock and then waiting
     // in an internal allocation
