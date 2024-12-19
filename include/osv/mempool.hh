@@ -55,6 +55,9 @@ public:
   /// Allocate a number of pages and return the address with the given alignment
   void *alloc_page(size_t size, size_t alignment);
 
+  /// Allocate a frame of the given order without header information
+  void *alloc_huge_page(unsigned order);
+
   /// Allocate the frame llfree keeps at the given index
   void *alloc_page_at(u64 frame);
 
@@ -66,6 +69,9 @@ public:
 
   /// Free a page of the corresponding order
   void free_page(void *addr, size_t size);
+
+  /// Free a frame at addr with the given order
+  void free_huge_page(void *addr, unsigned order);
 
   static size_t offset(size_t alignment);;
 
