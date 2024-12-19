@@ -39,10 +39,7 @@ extern size_t phys_mem_size;
 
 class llf{
 public:
-  /// Initialize llfree
-  void init();
-  /// Initialize llfree with custom number of cores. This must be used before
-  /// sched::cpus is populated
+  /// Initialize llfree with custom number of cores.
   void init(size_t cores);
 
   /// Returns if llfree is set up
@@ -75,7 +72,9 @@ private:
   // llfree is not aware of different memory regions. To it the memory is contiguous from 0 - <highest physical address>
   // Here we allocate gaps between memory regions and pages already allocated by the llfree_extern_allocator, so every page
   // llfree returns after this is valid.
-  void block_allocated();
+  void reserve_allocated();
+
+  unsigned order(size_t size);
 };
 
 extern llf page_allocator;
