@@ -49,17 +49,28 @@ public:
   /// This function has no effect after llfree is ready
   void add_region(void *mem_start, size_t mem_size);
 
-  /// Allocate a page of the given order with llfree before threads are available
-  void *alloc_page(size_t size = page_size);
+  /// Allocate a page
+  void *alloc_page();
+
+  /// Allocate a number of pages and return the address with the given alignment
+  void *alloc_page(size_t size, size_t alignment);
 
   /// Allocate the frame llfree keeps at the given index
-  void *alloc_page_at(u64 frame, size_t size);
+  void *alloc_page_at(u64 frame);
 
   /// Allocate a page before llfree is initialized
   void *early_alloc_page(size_t size = page_size);
 
-  /// Free a page with llfree. Freeing pages not allocated by llfree will fail
+  /// Free a page with llfree
   void free_page(void *addr);
+
+  /// Free a page of the corresponding order
+  void free_page(void *addr, size_t size);
+
+  static size_t offset(size_t alignment);;
+
+  /// Calculate the order of memory to be allocated
+  static unsigned order(size_t size, size_t offset);;
 private:
   /// The actual llfree instance
   llfree_t *self{nullptr};
@@ -73,8 +84,6 @@ private:
   // Here we allocate gaps between memory regions and pages already allocated by the llfree_extern_allocator, so every page
   // llfree returns after this is valid.
   void reserve_allocated();
-
-  unsigned order(size_t size);
 };
 
 extern llf page_allocator;
