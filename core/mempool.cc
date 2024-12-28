@@ -93,14 +93,17 @@ bi::multiset<page_range,
 // Indicate whether malloc pools are initialized yet
 bool smp_allocator{false};
 
+// llfree page frame allocator
 llf page_allocator
     __attribute__((init_priority((int)init_prio::page_allocator)));
 
 size_t cpuid(){
-    return page_allocator.is_ready() ? sched::cpu::current()->id : 0;
+    return sched::cpu::current() ? sched::cpu::current()->id : 0;
 }
 
-
+// A mutex serializing modifications to phys_mem_ranges.
+// I.e. early allocations and initialization of page frame allocator
+mutex phys_mem_ranges_lock;
 
 #if CONF_memory_tracker
 // Optionally track living allocations, and the call chain which led to each
@@ -782,7 +785,7 @@ static size_t large_object_size(void *obj)
 }
 
 void llf::init(size_t cores) {
-    // llfree sees the memory as contiguous, we reserve the gaps and already allocated memory later
+    // llfree sees the memory as contiguous, we reserve the gaps and already allocated memory below
     size_t highest{0};
     for(auto& pr : phys_mem_ranges){
         size_t cur = reinterpret_cast<size_t>(&pr) + pr.size ;
@@ -800,24 +803,25 @@ void llf::init(size_t cores) {
         ready = true;
     } else {
       printf("llfree init failed\n");
-      return;
     }
 }
 
 void llf::reserve_allocated(){
     // TODO: improve complexity if possible
-    for(size_t frame{0}; frame < llfree_frames(self); ++frame){
-        void *addr = idx_to_virt(frame);
-        for(auto& pr : phys_mem_ranges){
-            if(addr >= &pr && addr < (static_cast<void *>(&pr) + pr.size)){
-                frame += pr.size / page_size - 1;
-                phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
-                break;
+    WITH_LOCK(phys_mem_ranges_lock){
+        for(size_t frame{0}; frame < llfree_frames(self); ++frame){
+            void *addr = idx_to_virt(frame);
+            for(auto& pr : phys_mem_ranges){
+                if(addr >= &pr && addr < (static_cast<void *>(&pr) + pr.size)){
+                    frame += pr.size / page_size - 1;
+                    phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
+                    break;
+                }
             }
+            if(addr != idx_to_virt(frame))
+                continue;
+            alloc_page_at(frame);
         }
-        if(addr != idx_to_virt(frame))
-            continue;
-        alloc_page_at(frame);
     }
 }
 
@@ -842,12 +846,13 @@ void llf::add_region(void *mem_start, size_t mem_size){
     }
 
     auto pr = new (mem_start) page_range(mem_size);
-    phys_mem_ranges.insert(*pr);
+    WITH_LOCK(phys_mem_ranges_lock){
+        phys_mem_ranges.insert(*pr);
+    }
 }
 
 bool llf::is_ready(){
     return ready;
-
 }
 
 void *llf::alloc_page() {
@@ -979,11 +984,13 @@ void add_llfree_region(void *addr, size_t size){
 }
 
 size_t llf::offset(size_t alignment){
+    // TODO remove as soon as we have own mapping
     return align_up(sizeof(page_range), alignment);
 }
 
 unsigned llf::order(size_t size, size_t offset){
     // TODO fix order
+    // TODO change as soon as we have own mapping
     if(size <= page_size)
       return 0;
 
@@ -997,30 +1004,29 @@ unsigned llf::order(size_t size, size_t offset){
 }
 
 void *llfree_extern_alloc(size_t size, size_t alignment) {
-    // TODO: SCOPE_LOCK
-    
+    assert(!page_allocator.is_ready());
+
     size_t offset = size > page_size ? llf::offset(alignment) : 0;
     size = page_size << llf::order(size, offset);
 
-    for(auto& pr : phys_mem_ranges){
-        if(pr.size >= size){
-            auto range = &pr;
-            phys_mem_ranges.erase(
-                phys_mem_ranges.iterator_to(pr));
+    WITH_LOCK(phys_mem_ranges_lock){
+        for(auto& pr : phys_mem_ranges){
+            if(pr.size >= size){
+                auto range = &pr;
+                phys_mem_ranges.erase(
+                    phys_mem_ranges.iterator_to(pr));
 
-            auto& pr = *range;
-            // re-insert the rest of the memory region
-            if(pr.size > size){
-                auto& np = *new (static_cast<void*>(&pr) + size)
-                                page_range(pr.size - size);
-                phys_mem_ranges.insert(np);
+                auto& pr = *range;
+                // re-insert the rest of the memory region
+                if(pr.size > size){
+                    auto& np = *new (static_cast<void*>(&pr) + size)
+                                    page_range(pr.size - size);
+                    phys_mem_ranges.insert(np);
+                }
+
+                pr.size = size;
+                return reinterpret_cast<void *>(&pr) + offset;
             }
-
-            if(page_allocator.is_ready())
-                printf("[WARNING] extern alloc after llfree was initialized. This can cause allocation faults!\n");
-
-            pr.size = size;
-            return reinterpret_cast<void *>(&pr) + offset;
         }
     }
     memory::oom();
@@ -1028,22 +1034,23 @@ void *llfree_extern_alloc(size_t size, size_t alignment) {
 }
 
 void llfree_extern_free(void *obj, size_t size){
-    // TODO: SCOPE_LOCK
-    for(auto& pr : phys_mem_ranges){
-        if(obj + size == &pr){
-            size += pr.size;
-            phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
-            return llfree_extern_free(obj, size);
+    WITH_LOCK(phys_mem_ranges_lock){
+        for(auto& pr : phys_mem_ranges){
+            if(obj + size == &pr){
+                size += pr.size;
+                phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
+                return llfree_extern_free(obj, size);
+            }
+
+            if(static_cast<void *>(&pr) + pr.size == obj){
+                pr.size += size;
+                return;
+            }
         }
 
-        if(static_cast<void *>(&pr) + pr.size == obj){
-            pr.size += size;
-            return;
-        }
+        auto pr = new (obj) page_range(size);
+        phys_mem_ranges.insert(*pr);
     }
-    
-    auto pr = new (obj) page_range(size);
-    phys_mem_ranges.insert(*pr);
 }
 
 static void free_large(void* obj)
@@ -1060,20 +1067,12 @@ static void free_large(void* obj)
 static void* mapped_malloc_large(size_t size, size_t offset)
 {
     //TODO: For now pre-populate the memory, in future consider doing lazy population
+    // TODO: think about changing this
     void* obj = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
     size_t* ret_header = static_cast<size_t*>(obj);
     *ret_header = size;
     return obj + offset;
 }
-
-
-    // if(!page_allocator.is_ready()){
-    //     return llfree_extern_alloc(size, alignment);
-    // } else if (size < llf_max_size && alignment <= page_size){
-    //     return page_allocator.alloc_page(size);
-    // } else if (contiguous) {
-    //     // TODO
-    // }
 
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
@@ -1113,13 +1112,10 @@ static void mapped_free_large(void *object)
     mmu::munmap(object, *ret_header);
 }
 
-// TODO reinit llfree if necessary
 std::atomic<unsigned> llf_cnt{0};
 static sched::cpu::notifier _notifier([]{
-    // unsigned i = 0;
-    // while(llf_cnt == 0)
-    //   if(llf_cnt.compare_exchange_weak(i, 1))
-    //       page_allocator.init();
+    // TODO reinit llfree if necessary
+    // Check smp_allocator init in other branch for how to wait for all threads to be initialized
 });
 //
 // Following variables and functions are used to implement simple
@@ -1307,7 +1303,7 @@ void free_huge_page(void* v, size_t N)
   page_allocator.free_huge_page(v, llf::order(N, 0));
 }
 
-void  __attribute__((constructor(init_prio::mempool))) setupp()
+void  __attribute__((constructor(init_prio::mempool))) setup()
 {
     arch_setup_free_memory();
 }
