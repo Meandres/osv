@@ -223,13 +223,13 @@ void arch_setup_free_memory()
     });
 
     // Initialize llfree with 64 cores on default
-    //  * we don't know how many core we will actually have, but having more
-    //    llfree initialized with more cores doesn't have any performance drawbacks
+    //  * we don't know how many cores we will actually have, but having llfree
+    //    initialized with more cores doesn't have any performance drawbacks
     //  * if we have more than 64 cores, we can update llfrees number of cores in a
     //    lockfree manner, by remapping the page currently holding the llfree local
     //    data into contiguous memory with the appended local data. This only works
     //    for multiple of 64 cores as every core needs 64B of local data 
-    //    => pagesize local data for 64 cores
+    //    => pagesize holds local data for 64 cores
     memory::page_allocator.init(64);
 }
 
