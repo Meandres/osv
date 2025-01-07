@@ -28,6 +28,7 @@ build.out
 modules/java-base/**/dependency-reduced-pom.xml
 modules/java-base/**/*.iml
 modules/java-base/obj/
+modules/java-base/jni/monitor.d
 modules/java-tests/**/*.iml
 modules/java-tests/obj/
 modules/java-isolated/obj/
@@ -49,5 +50,6 @@ modules/libyaml/usr.manifest
 modules/dl_tests/usr.manifest
 .idea
 .cache
+.clang-format
 compile_commands.json
 downloaded_packages
