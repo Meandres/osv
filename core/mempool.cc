@@ -97,7 +97,7 @@ bool smp_allocator{false};
 llf page_allocator
     __attribute__((init_priority((int)init_prio::page_allocator)));
 
-size_t cpuid(){
+size_t mempool_cpuid(){
     return sched::cpu::current() ? sched::cpu::current()->id : 0;
 }
 
@@ -176,7 +176,7 @@ void pool::collect_garbage()
 {
     assert(!sched::preemptable());
 
-    unsigned cpu_id = cpuid();
+    unsigned cpu_id = mempool_cpuid();
 
     for (unsigned i = 0; i < sched::cpus.size(); i++) {
         auto sink = pcpu_free_list[cpu_id][i];
@@ -308,7 +308,7 @@ void pool::add_page()
     WITH_LOCK(preempt_lock) {
         assert(sched::cpus.size());
         page_header* header = new (page) page_header;
-        header->cpu_id = cpuid();
+        header->cpu_id = mempool_cpuid();
         header->owner = this;
         header->nalloc = 0;
         header->local_free = nullptr;
@@ -381,7 +381,7 @@ void pool::free(void* object)
         free_object* obj = static_cast<free_object*>(object);
         page_header* header = to_header(obj);
         unsigned obj_cpu = header->cpu_id;
-        unsigned cur_cpu = cpuid();
+        unsigned cur_cpu = mempool_cpuid();
 
         // TODO consider changing how memory is freed
 
@@ -860,7 +860,7 @@ void *llf::alloc_page() {
 
     llfree_result_t page = llfree_get(
         self,
-        cpuid(),
+        mempool_cpuid(),
         llflags(0)
     );
 
@@ -879,7 +879,7 @@ void *llf::alloc_page(size_t size, size_t alignment){
 
     llfree_result_t page = llfree_get(
         self,
-        cpuid(),
+        mempool_cpuid(),
         llflags(ord)
     );
 
@@ -898,7 +898,7 @@ void *llf::alloc_huge_page(unsigned order){
 
     llfree_result_t page = llfree_get(
         self,
-        cpuid(),
+        mempool_cpuid(),
         llflags(order)
     );
 
@@ -914,7 +914,7 @@ void *llf::alloc_huge_page(unsigned order){
 void *llf::alloc_page_at(size_t frame){
     llfree_result_t page = llfree_get_at(
         self,
-        cpuid(),
+        mempool_cpuid(),
         frame,
         llflags(0)
     );
@@ -930,7 +930,7 @@ void llf::free_page(void *addr){
 
     llfree_result_t res = llfree_put(
         self,
-        cpuid(),
+        mempool_cpuid(),
         virt_to_idx(addr),
         llflags(0)
     );
@@ -944,7 +944,7 @@ void llf::free_page(void *addr, size_t size){
 
     llfree_result_t res = llfree_put(
         self,
-        cpuid(),
+        mempool_cpuid(),
         virt_to_idx(addr),
         llflags(order(size, 0))
     );
@@ -958,7 +958,7 @@ void llf::free_huge_page(void *addr, unsigned order){
 
     llfree_result_t res = llfree_put(
         self,
-        cpuid(),
+        mempool_cpuid(),
         virt_to_idx(addr),
         llflags(order)
     );
