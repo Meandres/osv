@@ -1288,8 +1288,8 @@ void free_page(void* v)
 void* alloc_huge_page(size_t N)
 {
   if(!page_allocator.is_ready()){
-      // TODO implement huge page allocation for llfree_extern_alloc
-      abort("[ERROR] alloc_huge_page cannot be called before tls is initialized");
+      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
+      abort("[ERROR] alloc_huge_page cannot be called before page frame allocator is initialized");
   }
   return page_allocator.alloc_huge_page(llf::order(N, 0));
 }
@@ -1297,8 +1297,8 @@ void* alloc_huge_page(size_t N)
 void free_huge_page(void* v, size_t N)
 {
   if(!page_allocator.is_ready()){
-      // TODO implement huge page free for llfree_extern_alloc
-      abort("[ERROR] free_huge_page cannot be called before tls is initialized");
+      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
+      abort("[ERROR] free_huge_page cannot be called before page frame allocator is initialized");
   }
   page_allocator.free_huge_page(v, llf::order(N, 0));
 }
