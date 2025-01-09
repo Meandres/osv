@@ -29,7 +29,7 @@
 #define LLFREE_MAX_ORDER (LLFREE_HUGE_ORDER + 1u)
 
 /// Num of bits of the larges atomic type of the architecture
-#define LLFREE_ATOMIC_ORDER 6u // TODO shouldn't this be 8?
+#define LLFREE_ATOMIC_ORDER 6u
 #define LLFREE_ATOMIC_SIZE (1u << LLFREE_ATOMIC_ORDER)
 
 /// Number of frames in a child
