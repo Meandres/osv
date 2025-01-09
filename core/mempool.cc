@@ -383,8 +383,6 @@ void pool::free(void* object)
         unsigned obj_cpu = header->cpu_id;
         unsigned cur_cpu = mempool_cpuid();
 
-        // TODO consider changing how memory is freed
-
         if (obj_cpu == cur_cpu) {
             // free from the same CPU this object has been allocated on.
             free_same_cpu(obj, obj_cpu);
@@ -807,7 +805,6 @@ void llf::init(size_t cores) {
 }
 
 void llf::reserve_allocated(){
-    // TODO: improve complexity if possible
     WITH_LOCK(phys_mem_ranges_lock){
         for(size_t frame{0}; frame < llfree_frames(self); ++frame){
             void *addr = idx_to_virt(frame);
