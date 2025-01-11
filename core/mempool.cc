@@ -306,7 +306,6 @@ void pool::add_page()
     arch::ensure_next_stack_page();
 #endif
     WITH_LOCK(preempt_lock) {
-        assert(sched::cpus.size());
         page_header* header = new (page) page_header;
         header->cpu_id = mempool_cpuid();
         header->owner = this;
@@ -496,27 +495,13 @@ void wake_reclaimer()
     reclaimer_thread.wake();
 }
 
+static void on_free(size_t mem) { free_memory.fetch_add(mem); }
+static void on_alloc(size_t mem) { free_memory.fetch_sub(mem); }
+static void on_new_memory(size_t mem) { total_memory.fetch_add(mem); }
+
 namespace stats {
     size_t free() { return free_memory.load(std::memory_order_relaxed); }
     size_t total() { return total_memory.load(std::memory_order_relaxed); }
-
-    size_t max_no_reclaim()
-    {
-        auto total = total_memory.load(std::memory_order_relaxed);
-        return total - watermark_lo;
-    }
-#if CONF_memory_jvm_balloon
-    void on_jvm_heap_alloc(size_t mem)
-    {
-        current_jvm_heap_memory.fetch_add(mem);
-        assert(current_jvm_heap_memory.load() < total_memory);
-    }
-    void on_jvm_heap_free(size_t mem)
-    {
-        current_jvm_heap_memory.fetch_sub(mem);
-    }
-    size_t jvm_heap() { return current_jvm_heap_memory.load(); }
-#endif
 }
 
 void reclaimer::wake()
@@ -862,6 +847,8 @@ void *llf::alloc_page() {
     );
 
     if(llfree_is_ok(page)){
+        on_alloc(page_size);
+
         return idx_to_virt(page.frame);
     }
     oom();
@@ -883,6 +870,7 @@ void *llf::alloc_page(size_t size, size_t alignment){
     if(llfree_is_ok(page)){
         void *addr = idx_to_virt(page.frame);
         reinterpret_cast<page_range *>(addr)->size = page_size << ord;
+        on_alloc(page_size << ord);
         return addr + off;
     }
 
@@ -900,6 +888,7 @@ void *llf::alloc_huge_page(unsigned order){
     );
 
     if(llfree_is_ok(page)){
+        on_alloc(page_size << order);
         return idx_to_virt(page.frame);
     }
 
@@ -916,8 +905,10 @@ void *llf::alloc_page_at(size_t frame){
         llflags(0)
     );
 
-    if(llfree_is_ok(page))
+    if(llfree_is_ok(page)){
+        on_alloc(page_size);
         return idx_to_virt(page.frame);
+    }
 
     return nullptr;
 }
@@ -934,20 +925,26 @@ void llf::free_page(void *addr){
 
     // TODO remove
     assert(llfree_is_ok(res));
+
+    on_free(page_size);
 }
 
 void llf::free_page(void *addr, size_t size){
     assert(is_ready());
 
+    unsigned ord = order(size, 0);
+
     llfree_result_t res = llfree_put(
         self,
         mempool_cpuid(),
         virt_to_idx(addr),
-        llflags(order(size, 0))
+        llflags(ord)
     );
 
     // TODO remove
     assert(llfree_is_ok(res));
+
+    on_free(page_size << ord);
 }
 
 void llf::free_huge_page(void *addr, unsigned order){
@@ -962,6 +959,8 @@ void llf::free_huge_page(void *addr, unsigned order){
 
     // TODO remove
     assert(llfree_is_ok(res));
+
+    on_free(page_size << order);
 }
 
 void *llf::idx_to_virt(u64 idx){
@@ -977,6 +976,9 @@ u64 llf::virt_to_idx(void *addr){
 }
 
 void add_llfree_region(void *addr, size_t size){
+    on_new_memory(size);
+    on_free(size);
+
     page_allocator.add_region(addr, size);
 }
 
@@ -1022,6 +1024,9 @@ void *llfree_extern_alloc(size_t size, size_t alignment) {
                 }
 
                 pr.size = size;
+
+                on_alloc(size);
+
                 return reinterpret_cast<void *>(&pr) + offset;
             }
         }
@@ -1058,6 +1063,7 @@ static void free_large(void* obj)
         page_allocator.free_page(obj, pr->size);
     } else {
         llfree_extern_free(obj, pr->size);
+        on_free(pr->size);
     }
 }
 
@@ -1264,6 +1270,7 @@ static inline void untracked_free_page(void *v)
     trace_memory_page_free(v);
     if (!page_allocator.is_ready()) {
         llfree_extern_free(v, page_size);
+        on_free(page_size);
     } else {
         page_allocator.free_page(v);
     }
