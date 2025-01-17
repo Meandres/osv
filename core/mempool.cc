@@ -83,7 +83,7 @@ namespace memory {
 
 size_t phys_mem_size;
 
-bi::multiset<page_range,
+bi::set<page_range,
    bi::member_hook<page_range,
        bi::set_member_hook<>,
        &page_range::set_hook>,
