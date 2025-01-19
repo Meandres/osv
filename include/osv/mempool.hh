@@ -28,11 +28,10 @@ extern "C" void thread_mark_emergency();
 
 namespace memory {
 
-// Smallest size to be allocated by page frame allocator
-const size_t page_size = mmu::page_size;
+constexpr size_t page_size = mmu::page_size;
 
 // 4MiB as defined in <osv/llfree_platform.h>
-const size_t llf_max_size = mmu::page_size << 10;
+constexpr size_t llf_max_size = page_size << 10;
 
 // Sum of all memory regions known to the memory allocator
 extern size_t phys_mem_size;
@@ -52,31 +51,20 @@ public:
   /// Allocate a page
   void *alloc_page();
 
-  /// Allocate a number of pages and return the address with the given alignment
-  void *alloc_page(size_t size, size_t alignment);
-
   /// Allocate a frame of the given order without header information
   void *alloc_huge_page(unsigned order);
 
   /// Allocate the frame llfree keeps at the given index
   void *alloc_page_at(u64 frame);
 
-  /// Allocate a page before llfree is initialized
-  void *early_alloc_page(size_t size = page_size);
-
   /// Free a page with llfree
   void free_page(void *addr);
 
   /// Free a page of the corresponding order
-  void free_page(void *addr, size_t size);
-
-  /// Free a frame at addr with the given order
-  void free_huge_page(void *addr, unsigned order);
-
-  static size_t offset(size_t alignment);;
+  void free_page(void *addr, unsigned order);
 
   /// Calculate the order of memory to be allocated
-  static unsigned order(size_t size, size_t offset);;
+  static unsigned order(size_t size);;
 private:
   /// The actual llfree instance
   llfree_t *self{nullptr};

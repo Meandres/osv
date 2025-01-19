@@ -188,7 +188,7 @@ void llfree_validate(llfree_t *self);
 
 /// Wrapper for OS-specific allocation.
 /// Used to allocate data structure for llfree
-void *llfree_extern_alloc(size_t size, size_t alignment);
+void *aligned_alloc(size_t alignment, size_t size);
 
 #ifdef __cplusplus
 }

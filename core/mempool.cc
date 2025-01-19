@@ -670,7 +670,7 @@ void reclaimer_waiters::wait(size_t bytes)
 }
 
 reclaimer::reclaimer()
-    : _oom_blocked(), _thread(sched::thread::make([&] { _do_reclaim(); }, sched::thread::attr().detached().name("reclaimer").stack(mmu::page_size)))
+    : _oom_blocked(), _thread(sched::thread::make([&] { _do_reclaim(); }, sched::thread::attr().detached().name("reclaimer").stack(page_size)))
 {
     osv_reclaimer_thread = reinterpret_cast<unsigned char *>(_thread.get());
     _thread->start();
@@ -855,29 +855,6 @@ void *llf::alloc_page() {
     return nullptr;
 }
 
-void *llf::alloc_page(size_t size, size_t alignment){
-    assert(is_ready());
-
-    size_t off = offset(alignment);
-    size_t ord = order(size, off);
-
-    llfree_result_t page = llfree_get(
-        self,
-        mempool_cpuid(),
-        llflags(ord)
-    );
-
-    if(llfree_is_ok(page)){
-        void *addr = idx_to_virt(page.frame);
-        reinterpret_cast<page_range *>(addr)->size = page_size << ord;
-        on_alloc(page_size << ord);
-        return addr + off;
-    }
-
-    oom();
-    return nullptr;
-}
-
 void *llf::alloc_huge_page(unsigned order){
    assert(is_ready());
 
@@ -929,25 +906,7 @@ void llf::free_page(void *addr){
     on_free(page_size);
 }
 
-void llf::free_page(void *addr, size_t size){
-    assert(is_ready());
-
-    unsigned ord = order(size, 0);
-
-    llfree_result_t res = llfree_put(
-        self,
-        mempool_cpuid(),
-        virt_to_idx(addr),
-        llflags(ord)
-    );
-
-    // TODO remove
-    assert(llfree_is_ok(res));
-
-    on_free(page_size << ord);
-}
-
-void llf::free_huge_page(void *addr, unsigned order){
+void llf::free_page(void *addr, unsigned order){
     assert(is_ready());
 
     llfree_result_t res = llfree_put(
@@ -982,18 +941,11 @@ void add_llfree_region(void *addr, size_t size){
     page_allocator.add_region(addr, size);
 }
 
-size_t llf::offset(size_t alignment){
-    // TODO remove as soon as we have own mapping
-    return align_up(sizeof(page_range), alignment);
-}
-
-unsigned llf::order(size_t size, size_t offset){
-    // TODO fix order
-    // TODO change as soon as we have own mapping
+unsigned llf::order(size_t size){
     if(size <= page_size)
       return 0;
 
-    size_t frames = (size + offset - 1) / page_size;
+    size_t frames = (size - 1) / page_size;
     unsigned order{0};
     while(frames){
         frames /= 2;
@@ -1002,11 +954,10 @@ unsigned llf::order(size_t size, size_t offset){
     return order;
 }
 
-void *llfree_extern_alloc(size_t size, size_t alignment) {
+void *early_alloc_pages(unsigned order) {
     assert(!page_allocator.is_ready());
 
-    size_t offset = size > page_size ? llf::offset(alignment) : 0;
-    size = page_size << llf::order(size, offset);
+    size_t size = page_size << order;
 
     WITH_LOCK(phys_mem_ranges_lock){
         for(auto& pr : phys_mem_ranges){
@@ -1027,7 +978,7 @@ void *llfree_extern_alloc(size_t size, size_t alignment) {
 
                 on_alloc(size);
 
-                return reinterpret_cast<void *>(&pr) + offset;
+                return reinterpret_cast<void *>(&pr);
             }
         }
     }
@@ -1035,13 +986,13 @@ void *llfree_extern_alloc(size_t size, size_t alignment) {
     return nullptr;
 }
 
-void llfree_extern_free(void *obj, size_t size){
+void early_free_pages(void *obj, size_t size){
     WITH_LOCK(phys_mem_ranges_lock){
         for(auto& pr : phys_mem_ranges){
             if(obj + size == &pr){
                 size += pr.size;
                 phys_mem_ranges.erase(phys_mem_ranges.iterator_to(pr));
-                return llfree_extern_free(obj, size);
+                return early_free_pages(obj, size);
             }
 
             if(static_cast<void *>(&pr) + pr.size == obj){
@@ -1060,57 +1011,56 @@ static void free_large(void* obj)
     obj = align_down(obj - 1, page_size);
     auto pr = static_cast<page_range *>(obj);
     if(page_allocator.is_ready()){
-        page_allocator.free_page(obj, pr->size);
+        page_allocator.free_page(obj, llf::order(pr->size));
     } else {
-        llfree_extern_free(obj, pr->size);
+        early_free_pages(obj, pr->size);
         on_free(pr->size);
     }
 }
 
-static void* mapped_malloc_large(size_t size, size_t offset)
-{
-    //TODO: For now pre-populate the memory, in future consider doing lazy population
-    // TODO: think about changing this
-    void* obj = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
-    size_t* ret_header = static_cast<size_t*>(obj);
-    *ret_header = size;
-    return obj + offset;
-}
-
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
-    // handle in contiguous physical memory if possible
-    if(llf::order(size, alignment) <= 10){
-        if(page_allocator.is_ready()){
-            return page_allocator.alloc_page(size, alignment);
-        } else {
-            return llfree_extern_alloc(size, alignment);
-        }
-    }
+    assert(size > page_size || alignment > page_size);
 
-    if(contiguous){
-        printf("[ERROR]: physically contiguous allocations above 4MiB are not possible\n");
-        abort();
-    }
-
-    auto requested_size = size;
+    size_t requested_size{size};
     size_t offset;
     if (alignment < page_size) {
         offset = align_up(sizeof(page_range), alignment);
     } else {
         offset = page_size;
     }
+    // Raw size required
     size += offset;
     size = align_up(size, page_size);
 
-    void* obj = mapped_malloc_large(size, offset);
-    trace_memory_malloc_large(obj, requested_size, size, alignment);
-    return obj;
+    void* ret;
+
+    // handle in contiguous physical memory if possible
+    if(size <= llf_max_size){
+        unsigned order = llf::order(size);
+        if(page_allocator.is_ready()){
+            ret = page_allocator.alloc_huge_page(order);
+        } else {
+            ret = early_alloc_pages(order);
+        }
+    // larger memory cannot be allocated contiguously in physical memory
+    } else if (contiguous) {
+        printf("[ERROR]: physically contiguous allocations above 4MiB are not possible\n");
+        abort();
+    // call mmap
+    } else {
+        ret =  mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
+    }
+
+    size_t* ret_header = static_cast<size_t*>(ret);
+    *ret_header = size;
+    trace_memory_malloc_large(ret, requested_size, size, alignment);
+    return ret + offset;
 }
 
 static void mapped_free_large(void *object)
 {
-    object = align_down(object - 1, mmu::page_size);
+    object = align_down(object - 1, page_size);
     size_t* ret_header = static_cast<size_t*>(object);
     mmu::munmap(object, *ret_header);
 }
@@ -1248,7 +1198,7 @@ static void* untracked_alloc_page()
     void* ret;
 
     if (!page_allocator.is_ready()) {
-        ret = llfree_extern_alloc(page_size, page_size);
+        ret = early_alloc_pages(0);
     } else {
         ret = page_allocator.alloc_page();
     }
@@ -1269,7 +1219,7 @@ static inline void untracked_free_page(void *v)
 {
     trace_memory_page_free(v);
     if (!page_allocator.is_ready()) {
-        llfree_extern_free(v, page_size);
+        early_free_pages(v, page_size);
         on_free(page_size);
     } else {
         page_allocator.free_page(v);
@@ -1295,7 +1245,7 @@ void* alloc_huge_page(size_t N)
       // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
       abort("[ERROR] alloc_huge_page cannot be called before page frame allocator is initialized");
   }
-  return page_allocator.alloc_huge_page(llf::order(N, 0));
+  return page_allocator.alloc_huge_page(llf::order(N));
 }
 
 void free_huge_page(void* v, size_t N)
@@ -1304,7 +1254,7 @@ void free_huge_page(void* v, size_t N)
       // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
       abort("[ERROR] free_huge_page cannot be called before page frame allocator is initialized");
   }
-  page_allocator.free_huge_page(v, llf::order(N, 0));
+  page_allocator.free_page(v, llf::order(N));
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setup()
@@ -1337,16 +1287,14 @@ static inline void* std_malloc(size_t size, size_t alignment)
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (!memory::smp_allocator && memory::will_fit_in_early_alloc_page(size,alignment)) {
+    } else if (memory::will_fit_in_early_alloc_page(size,alignment) && !memory::smp_allocator) {
         ret = memory::early_alloc_object(size, alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
-    } else if (minimum_size <= mmu::page_size && alignment <= mmu::page_size) {
+    } else if (minimum_size <= memory::page_size && alignment <= memory::page_size) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page, memory::alloc_page());
-        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
-    // TODO refine this else if to support allocations of higher alignments if llf_max_size is small enough
+        trace_memory_malloc_page(ret, size, memory::page_size, alignment);
     } else {
         ret = memory::malloc_large(minimum_size, alignment, true, false);
-        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } 
 
 #if CONF_memory_tracker
@@ -1391,7 +1339,7 @@ static size_t object_size(void *object)
                 return memory::early_object_size(object);
         }
     case mmu::mem_area::page:
-        return mmu::page_size;
+        return memory::page_size;
     case mmu::mem_area::debug:
         return dbg::object_size(object);
     default:
@@ -1481,8 +1429,8 @@ struct header {
     char fence[16];
     size_t size2;
 };
-static const size_t pad_before = 2 * mmu::page_size;
-static const size_t pad_after = mmu::page_size;
+static const size_t pad_before = 2 * memory::page_size;
+static const size_t pad_after = memory::page_size;
 
 static __thread bool recursed;
 
@@ -1503,16 +1451,16 @@ void* malloc(size_t size, size_t alignment)
     // access to the emergency pool to avoid us holding some lock and then waiting
     // in an internal allocation
     WITH_LOCK(memory::reclaimer_lock) {
-        auto asize = align_up(size, mmu::page_size);
+        auto asize = align_up(size, memory::page_size);
         auto padded_size = pad_before + asize + pad_after;
-        if (alignment > mmu::page_size) {
+        if (alignment > memory::page_size) {
             // Our allocations are page-aligned - might need more
-            padded_size += alignment - mmu::page_size;
+            padded_size += alignment - memory::page_size;
         }
         char* v = free_area.fetch_add(padded_size, std::memory_order_relaxed);
         // change v so that (v + pad_before) is aligned.
         v += align_up(v + pad_before, alignment) - (v + pad_before);
-        mmu::vpopulate(v, mmu::page_size);
+        mmu::vpopulate(v, memory::page_size);
         new (v) header(size);
         v += pad_before;
         mmu::vpopulate(v, asize);
@@ -1533,11 +1481,11 @@ void free(void* v)
     WITH_LOCK(memory::reclaimer_lock) {
         auto h = static_cast<header*>(v - pad_before);
         auto size = h->size;
-        auto asize = align_up(size, mmu::page_size);
+        auto asize = align_up(size, memory::page_size);
         char* vv = reinterpret_cast<char*>(v);
         assert(std::all_of(vv + size, vv + asize, [=](char c) { return c == '$'; }));
         h->~header();
-        mmu::vdepopulate(h, mmu::page_size);
+        mmu::vdepopulate(h, memory::page_size);
         mmu::vdepopulate(v, asize);
         mmu::vcleanup(h, pad_before + asize);
     }
@@ -1664,16 +1612,21 @@ void* alloc_phys_contiguous_aligned(size_t size, size_t align, bool block)
     assert(is_power_of_two(align));
     // make use of the standard large allocator returning properly aligned
     // physically contiguous memory:
-    auto ret = malloc_large(size, align, block, true);
+
+    void *ret;
+    if(size <= page_size && align <= page_size){
+        ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page, alloc_page());
+    }
+    else {
+        ret = malloc_large(size, align, block, true);
+    }
+
     assert (!(reinterpret_cast<uintptr_t>(ret) & (align - 1)));
     return ret;
 }
 
 void free_phys_contiguous_aligned(void* p)
 {
-    // TODO
-    return;
-    // free_large(p);
     free(p);
 }
 
@@ -1703,8 +1656,4 @@ extern "C" void* alloc_contiguous_aligned(size_t size, size_t align)
 extern "C" void free_contiguous_aligned(void* p)
 {
     memory::free_phys_contiguous_aligned(p);
-}
-
-void *llfree_extern_alloc(size_t size, size_t alignment){
-    return memory::llfree_extern_alloc(size, alignment);
 }

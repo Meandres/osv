@@ -73,14 +73,14 @@ static ll_unused bool check_meta(llfree_meta_t meta, llfree_meta_size_t sizes) {
 llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init) {
   assert(cores > 0);
 
-  llfree_t *self = llfree_extern_alloc(sizeof(llfree_t), LLFREE_CACHE_SIZE);
+  llfree_t *self = aligned_alloc(LLFREE_CACHE_SIZE, sizeof(llfree_t));
 
   llfree_meta_size_t m = llfree_metadata_size(cores, frames);
 
   llfree_meta_t meta = {
-      .local = llfree_extern_alloc(m.local, LLFREE_CACHE_SIZE),
-      .trees = llfree_extern_alloc(m.trees, LLFREE_CACHE_SIZE),
-      .lower = llfree_extern_alloc(m.lower, LLFREE_CACHE_SIZE),
+      .local = aligned_alloc(LLFREE_CACHE_SIZE, m.local),
+      .trees = aligned_alloc(LLFREE_CACHE_SIZE, m.trees),
+      .lower = aligned_alloc(LLFREE_CACHE_SIZE, m.lower),
   };
 
   llfree_result_t ret =
