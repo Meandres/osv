@@ -5,8 +5,6 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <iostream>
-#include <osv/benchmark.hh>
 #include <osv/mempool.hh>
 #include <osv/ilog2.hh>
 #include "arch-setup.hh"
@@ -75,13 +73,6 @@ namespace dbg {
 
 static size_t object_size(void* v);
 
-}
-
-uint64_t mempool_bench_start;
-uint64_t mempool_bench_end;
-uint64_t mempool_bench_sum{0};
-void bench::evaluate_mempool(){
-    std::cout << "cycles " << mempool_bench_sum << std::endl;
 }
 
 OSV_LIBSOLARIS_API
