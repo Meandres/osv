@@ -139,6 +139,7 @@ int main(int loader_argc, char **loader_argv)
 {
     smp_initial_find_current_cpu()->init_on_cpu();
     void main_cont(int loader_argc, char** loader_argv);
+    memory::activate_paging();
     sched::init([=] { main_cont(loader_argc, loader_argv); });
 }
 

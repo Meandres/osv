@@ -10,7 +10,6 @@
 #include "arch-setup.hh"
 #include <cassert>
 #include <cstdint>
-#include <new>
 #include <boost/utility.hpp>
 #include <string.h>
 #include <lockfree/unordered-queue-mpsc.hh>
@@ -92,6 +91,8 @@ bi::set<page_range,
 
 // Indicate whether malloc pools are initialized yet
 bool smp_allocator{false};
+
+bool use_linear_map{true};
 
 // llfree page frame allocator
 llf llfree_allocator
@@ -1036,7 +1037,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // handle in contiguous physical memory if possible
-    if(size <= llf_max_size && llfree_allocator.is_ready()){
+    if(size <= llf_max_size && llfree_allocator.is_ready() && (contiguous || use_linear_map)){
         unsigned order = llf::order(size);
         ret = llfree_allocator.alloc_huge_page(order);
     } else if (!llfree_allocator.is_ready()){
