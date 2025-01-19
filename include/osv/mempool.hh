@@ -84,8 +84,6 @@ extern llf page_allocator;
 
 void add_llfree_region(void *mem_start, size_t mem_size);
 
-void setup_free_memory(void* start, size_t bytes);
-
 namespace bi = boost::intrusive;
 
 // Please note that early_page_header and pool:page_header
@@ -240,33 +238,14 @@ private:
     ssize_t bytes_until_normal() { return bytes_until_normal(pressure_level()); }
 };
 
-const unsigned page_ranges_max_order = 16;
-
 namespace stats {
     size_t free();
     size_t total();
-    size_t max_no_reclaim();
 #if CONF_memory_jvm_balloon
     size_t jvm_heap();
     void on_jvm_heap_alloc(size_t mem);
     void on_jvm_heap_free(size_t mem);
 #endif
-
-    struct page_ranges_stats {
-        struct {
-            size_t bytes;
-            size_t ranges_num;
-        } order[page_ranges_max_order + 1];
-    };
-
-    void get_page_ranges_stats(page_ranges_stats &stats);
-
-    struct pool_stats {
-        size_t _max;
-        size_t _nr;
-        size_t _watermark_lo;
-        size_t _watermark_hi;
-    };
 }
 
 class phys_contiguous_memory final {
