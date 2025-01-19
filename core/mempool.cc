@@ -5,6 +5,8 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <iostream>
+#include <osv/benchmark.hh>
 #include <osv/mempool.hh>
 #include <osv/ilog2.hh>
 #include "arch-setup.hh"
@@ -73,6 +75,15 @@ namespace dbg {
 
 static size_t object_size(void* v);
 
+}
+
+uint64_t mempool_bench_start;
+uint64_t mempool_bench_end;
+uint64_t mempool_bench_sum{0};
+uint64_t mempool_ctr{0};
+void bench::evaluate_mempool(){
+    std::cout << "cycles " << (double) mempool_bench_sum / mempool_ctr << std::endl;
+    std::cout << "count  " << mempool_ctr << std::endl << std::flush;
 }
 
 OSV_LIBSOLARIS_API
@@ -1271,6 +1282,7 @@ extern "C" {
 
 static inline void* std_malloc(size_t size, size_t alignment)
 {
+    mempool_bench_start = bench::rdtsc();
     if ((ssize_t)size < 0)
         return libc_error_ptr<void *>(ENOMEM);
     void *ret;
@@ -1299,6 +1311,11 @@ static inline void* std_malloc(size_t size, size_t alignment)
 #if CONF_memory_tracker
     memory::tracker_remember(ret, size);
 #endif
+
+    mempool_bench_end = bench::rdtsc();
+    assert(mempool_bench_sum <= mempool_bench_sum + mempool_bench_end - mempool_bench_start);
+    mempool_bench_sum += mempool_bench_end - mempool_bench_start;
+    ++mempool_ctr;
     return ret;
 }
 
