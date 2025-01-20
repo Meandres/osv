@@ -954,10 +954,10 @@ unsigned llf::order(size_t size){
     return order;
 }
 
-void *early_alloc_pages(unsigned order) {
+void *early_alloc_pages(size_t size) {
     assert(!page_allocator.is_ready());
 
-    size_t size = page_size << order;
+    size = align_up(size, page_size);
 
     WITH_LOCK(phys_mem_ranges_lock){
         for(auto& pr : phys_mem_ranges){
@@ -1036,13 +1036,11 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // handle in contiguous physical memory if possible
-    if(size <= llf_max_size){
+    if(size <= llf_max_size && page_allocator.is_ready()){
         unsigned order = llf::order(size);
-        if(page_allocator.is_ready()){
-            ret = page_allocator.alloc_huge_page(order);
-        } else {
-            ret = early_alloc_pages(order);
-        }
+        ret = page_allocator.alloc_huge_page(order);
+    } else if (!page_allocator.is_ready()){
+        ret = early_alloc_pages(size);
     // larger memory cannot be allocated contiguously in physical memory
     } else if (contiguous) {
         printf("[ERROR]: physically contiguous allocations above 4MiB are not possible\n");
@@ -1198,7 +1196,7 @@ static void* untracked_alloc_page()
     void* ret;
 
     if (!page_allocator.is_ready()) {
-        ret = early_alloc_pages(0);
+        ret = early_alloc_pages(page_size);
     } else {
         ret = page_allocator.alloc_page();
     }
