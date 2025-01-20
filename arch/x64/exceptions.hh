@@ -46,6 +46,24 @@ struct exception_frame {
     unsigned int get_error(void) { return error_code; }
 };
 
+struct page_fault_error_code{
+    union {
+        u16 error_code;
+        struct {
+            u16 present: 1;
+            u16 write: 1;
+            u16 user: 1;
+            u16 reserved_write: 1;
+            u16 instruction_fetch: 1;
+            u16 protection_key: 1;
+            u16 shadow_stack: 1;
+            u16 software_guard_extensions: 1;
+        };
+    };
+    page_fault_error_code() {}
+    page_fault_error_code(u16 error_code): error_code(error_code) {}
+};
+
 extern __thread exception_frame* current_interrupt_frame;
 
 struct shared_vector {

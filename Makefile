@@ -367,12 +367,6 @@ ASFLAGS = -g $(autodepend) -D__ASSEMBLY__
 
 $(out)/fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
 
-ifeq ($(conf_vmcache_ymap), 1)
-$(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w -DVMCACHE_YMAP
-else
-$(out)/drivers/vmcache.o: CXXFLAGS = -std=c++20 $(COMMON) $(cxx-hide-flags) -w
-endif
-
 ifeq ($(conf_nvme_fail), 1)
 NVME_CXXFLAGS = -DNVME_FAIL -DNVME_FAIL_TYPE=$(conf_nvme_fail_type) -DNVME_FAIL_BITFLIP \
 				-DNVME_FAIL_NTH=$(conf_nvme_fail_nth) -DNVME_FAIL_BLOCK=$(conf_nvme_fail_block) \
@@ -896,13 +890,8 @@ ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
 $(out)/drivers/nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
 endif
-ifeq ($(conf_drivers_vmcache),1)
-drivers += drivers/vmcache.o
-CXXFLAGS += -DVMCACHE
-else
 objects += core/cache.o
 objects += core/ymap.o
-endif
 drivers += drivers/driver.o
 
 ifeq ($(arch),x64)

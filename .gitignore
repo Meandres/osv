@@ -29,6 +29,7 @@ build.out
 modules/java-base/**/dependency-reduced-pom.xml
 modules/java-base/**/*.iml
 modules/java-base/obj/
+modules/java-base/jni/monitor.d
 modules/java-tests/**/*.iml
 modules/java-tests/obj/
 modules/java-isolated/obj/
@@ -68,3 +69,5 @@ benchs/vmcache/vmcache_transparent
 benchs/io_test/io_test
 benchs/omp_test/omp_test
 benchs/nvme_test/ioengine_unvme
+benchs/ucache_bench/ucache_bench
+benchs/ucache_bench/mmap_ucache_bench

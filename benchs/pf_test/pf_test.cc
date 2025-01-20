@@ -3,23 +3,12 @@
 #include <vector>
 #include <thread>
 #include <atomic>
-#ifdef OSV
 #include <osv/cache.hh>
-#include <osv/sampler.hh>
-#endif
 #include <sys/mman.h>
 
 using namespace std;
 
-#ifdef LINUX
-uint64_t rdtsc() {
-        uint32_t hi, lo;
-        __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
-        return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
-    }
-#endif
-
-uint64_t envOr(const char* env, uint64_t value) {
+u64 envOr(const char* env, u64 value) {
    if (getenv(env))
       return atof(getenv(env));
    return value;
@@ -54,59 +43,16 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 int main(int argc, char* argv[])
 {
     uint64_t nthreads = envOr("THREADS", 1);
-    uint64_t explicit_control = envOr("EXPLICIT", 0);
-    const bool expli = explicit_control == 1 ? true : false;
-    constexpr int N = 200000; 
-    uint64_t size = nthreads*N*2*4096ULL;
-    uint64_t times[nthreads]={0};
-    #ifdef LINUX
-    char* mem = (char*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if(expli)
-        std::cerr << "vmcache,explicit_control," << nthreads << ",";
-    else
-        std::cerr << "mmap,page_fault," << nthreads << ",";
-    #endif
-    #ifdef OSV
-    CacheManager *cache = createMMIORegion(NULL, size, size, nthreads, 64, expli);
-    //printf("%s\n", mmu::sysfs_linear_maps().c_str());
-    if(expli)
-        std::cerr << "osv,explicit_control," << nthreads << ",";
-    else
-        std::cerr << "osv,page_fault," << nthreads << ",";
-    #endif
-    parallel_for(0, nthreads*N, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-        #ifdef OSV
-        zeroout_measures();
-        cache->registerThread();
-        #endif
+    uint64_t nbPages = envOr("PAGES", 100000);
+    u64 size = nbPages*nthreads*pageSize;
+    CacheManager* cm = createMMIORegion(NULL, size, size, 64);
+    cm->record_time = true;
+    parallel_for(0, nthreads*nbPages, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
         for (uint64_t i = begin; i < end; i++) {
-            //auto start = std::chrono::system_clock::now();
-            if(i%1000==0)
-                printf("tid %lu - %lu\n", worker, i);
-            u64 start = rdtsc();
-            #ifdef OSV
-            if(expli)
-                cache->handleFault(i);
-            else
-                asm volatile("movq $42, (%0)": : "r" (cache->toPtr(i)): "memory");
-            #endif
-            #ifdef LINUX
-            *(mem+i*4096) = 42;
-            #endif
-            //auto end = std::chrono::system_clock::now();
-            u64 end = rdtsc();
-            //times[worker] += chrono::nanoseconds(end-start).count();
-            times[worker] += end-start;
+            cm->begin_pf_time = rdtsc();
+            memset(cm->virtMem+i, 0, pageSize);
         }
-        #ifdef OSV
-        cache->forgetThread();
-        #endif
     });
-    uint64_t sum=0;
-    for(int i=0; i<nthreads; i++){
-        sum+=times[i]/N;
-    }
-    std::cerr << sum / nthreads << std::endl;
-    //print_measures();
+    std::cerr << "pf_time: "<< cm->acc_pf_time / cm->cnt << std::endl;
     return 0;
 }

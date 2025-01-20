@@ -43,14 +43,12 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
-    #ifndef VMCACHE
-    CacheManager* mmr = get_mmr((void*)addr);
-	if(mmr != NULL){
-		cache_handle_page_fault(mmr, (void*)addr);
-        return;
-    }
-    #endif
-        mmu::vm_fault(addr, ef);
+        CacheManager* mmr = get_mmr(addr);
+	      if(mmr != NULL){
+		        cache_handle_page_fault(mmr, addr, ef);
+        }else{
+            mmu::vm_fault(addr, ef);
+        }
     }
 }
 

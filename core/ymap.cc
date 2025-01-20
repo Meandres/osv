@@ -42,6 +42,10 @@ void initYmaps(){
 		assert(bundle->index==0);
 		fullList->put(bundle);
 	}
+	for(u64 i = 0; i<64; i++){
+		PageBundle* bundle = new PageBundle();
+		emptyList->put(bundle);
+	}
 	for(auto c: sched::cpus){
 		auto *py = percpu_ymap.for_cpu(c);
 		*py = new ymap();
@@ -72,8 +76,9 @@ bool ymap_tryMap(void* virtAddr, u64 phys){
 	std::atomic<u64>* ptePtr = walkRef(virtAddr);
 	PTE oldPTE = PTE(ptePtr->load());
   if(oldPTE.phys != 0){
+		printf("error\n");
 		return false;
-  } 
+  }
 	PTE pagePTE(oldPTE.word);
 	pagePTE.present = 1;
 	pagePTE.writable = 1;
@@ -81,15 +86,25 @@ bool ymap_tryMap(void* virtAddr, u64 phys){
 	return ptePtr->compare_exchange_strong(oldPTE.word, pagePTE.word);
 }
 
+void ymap_unmap(void* virt){
+	std::atomic<u64>* ptePtr = walkRef(virt);
+	PTE oldPTE = PTE(ptePtr->load());
+	oldPTE.phys = 0;
+	ptePtr->store(oldPTE.word);
+}
+
 u64 ymap_tryUnmap(void* virt){
 	std::atomic<u64>* ptePtr = walkRef(virt);
 	PTE oldPTE = PTE(ptePtr->load());
+	if(oldPTE.present == 1){
+		printf("should not be happening\n");
+		assert(false);
+	}
 	if(oldPTE.phys == 0)
 		return 0;
 	u64 phys = oldPTE.phys;
 	assert(phys!=0ull);
 	PTE pagePTE(oldPTE.word);
-  pagePTE.user = 1;
 	pagePTE.phys = 0;
 	if(ptePtr->compare_exchange_strong(oldPTE.word, pagePTE.word))
 		return phys;

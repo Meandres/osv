@@ -80,11 +80,10 @@ u64 envOr(const char* env, u64 value){
 }
 
 int main(int argc, char** argv){
-    u64 virtSize = envOr("VIRTGB", 2ull) * 1024 * 1024 * 1024;
-    u64 physSize = envOr("PHYSGB", 2ull) * 1024 * 1024 * 1024;
-    //u64 virtSize = 32768 * 4096;
-    //u64 physSize = 32768 * 4096;
-    int n_threads=envOr("THREADS", 1);
+    //u64 virtSize = envOr("VIRTGB", 2ull) * 1024 * 1024 * 1024;
+    //u64 physSize = envOr("PHYSGB", 2ull) * 1024 * 1024 * 1024;
+    u64 virtSize = 20 * 4096;
+    u64 physSize = 5 * 4096;
     u64 statDiff = 1e8;
     atomic<u64> txProgress(0);
     atomic<bool> keepRunning(true);
@@ -98,18 +97,15 @@ int main(int argc, char** argv){
             float rmb = (cache->readCount.exchange(0)*pageSize)/(1024.0*1024);
             float wmb = (cache->writeCount.exchange(0)*pageSize)/(1024.0*1024);
             u64 prog = txProgress.exchange(0);
-            cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  "," << n_threads << endl;
+            cout << cnt++ << "," << prog << "," << rmb << "," << wmb <<  endl;
         }
         keepRunning = false;
     };
-    cache = createMMIORegion(NULL, virtSize, physSize, n_threads, 64, false);
-    if(cache->explicit_control)
-        cout << "explicit_control " << endl;
+    cache = createMMIORegion(NULL, virtSize, physSize, 2);
     int og = 42;
-    memcpy(cache->virtMem, &og, sizeof(int));
-    int i;
-    memcpy(&i, cache->virtMem, sizeof(int));
-    printf("%u\n", i); 
+    for(int i=0; i<20; i++){
+        memcpy(cache->virtMem+i, &og, sizeof(int));
+    }
     /*loadArray(cache->virtMem, virtSize/4096, n_threads);
     cache->readCount = 0;
     cache->writeCount = 0;

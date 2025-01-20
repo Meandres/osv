@@ -1,75 +1,54 @@
 #include <iostream>
-#include "processor.hh"
-/*#include <sys/time.h>
+#include <chrono>
+#include <thread>
+#include <osv/cache.hh>
+#include <drivers/nvme.hh>
 
 using namespace std;
 
-static double gettime(void) {
-   struct timeval now_tv;
-   gettimeofday (&now_tv,NULL);
-   return ((double)now_tv.tv_sec) + ((double)now_tv.tv_usec)/1000000.0;
-}*/
-
-/*static inline void wrmsr(uint64_t msr, uint64_t value)
-{
-    uint32_t low = value & 0xFFFFFFFF;
-    uint32_t high = value >> 32;
-    asm volatile (
-        "wrmsr"
-        :
-        : "c"(msr), "a"(low), "d"(high)
-    );
-}
-
-static inline uint64_t rdmsr(uint64_t msr)
-{
-    uint32_t low, high;
-    asm volatile (
-        "rdmsr"
-        : "=a"(low), "=d"(high)
-        : "c"(msr)
-    );
-	return ((uint64_t)high << 32) | low;
-}*/
-
-#define XCR_XFEATURE_ENABLED_MASK   0x00000000
-#define XCR_XFEATURE_VALUE 0x00000000000002e7 // this is what Liunx set (on irene)
-
-static inline void xsetbv(uint32_t index, uint64_t value)
-{
-        uint32_t eax = value;
-        uint32_t edx = value >> 32;
-
-        asm volatile("xsetbv" :: "a" (eax), "d" (edx), "c" (index));
-}
-
 int main()
 {
-    /*rdmsrl(MSR_MTRRdefType, msr_deftype);
-    printf("MTRRdefType=%lx\n", msr_deftype);
-    rdmsr(MSR_MTRRcap, msr_cap);
-    printf("MTRRcap=%lx\n", msr_cap);
-    vcnt = (int)(msr_cap & MTRR_VCNT_MASK);
-    for (idx = 0; idx < vcnt; idx += 1) {
-        rdmsr(MSR_IA32_MTRR_PHYSBASE(idx), base);
-        rdmsr(MSR_IA32_MTRR_PHYSMASK(idx), mask);
-        if (!(mask & MTRR_VRRP_MASK_MASK)) continue;
-        start_mfn = base >> 12;
-        num_mfn = (~(mask >> 12) & ((1UL << (phys_addr_size - 12)) - 1)) + 1;
-        mem_type = base & 0xff;
-        printf("===MTTR base=%lx mask=%lx start=%lx num_mfn=%d type=%d\n",
-                base, mask, start_mfn, (int)num_mfn, mem_type);
-    }
-    return 0;*/
-    asm volatile("xsetbv" :: "a" (0x207), "c" (0), "d" (0));
-    printf("xcr0: %lu\n", processor::read_xcr(processor::xcr0));
-    for (uint64_t j=0; j<3000; j++) {
-         //double start = gettime();
-         for (uint64_t jj=0; jj<1000; jj++) {
-            asm volatile("addq $42, %%rax": : : "memory");
-         }
-         //cout << gettime()-start << endl;
-      }
-
-      return 0;
+  CacheManager* cm = createMMIORegion(NULL, 1000*4096, 1000*4096, 64);
+  Page p;
+  memcpy(&p, cm->virtMem, 4096);
+  PTE pte1 = walk(cm->virtMem); 
+  memset(cm->virtMem, 1, 4096);
+  PTE pte2 = walk(cm->virtMem); 
+  atomic<u64>* pteRef = walkRef(cm->virtMem);
+  PTE newPTE = PTE(pte2);
+  newPTE.accessed = 1; newPTE.dirty = 1;
+  pteRef->compare_exchange_strong(pte2.word, newPTE.word);
+  memset(cm->virtMem, 1, 4096);
+  PTE pte3 = walk(cm->virtMem); 
+  printf("accessed: %u, dirty: %u\n", pte1.accessed, pte1.dirty);
+  printf("accessed: %u, dirty: %u\n", pte2.accessed, pte2.dirty);
+  printf("accessed: %u, dirty: %u\n", pte3.accessed, pte3.dirty);
+  /*void *page0=(void*)cm->virtMem, *page1 = (void*)cm->virtMem+4096, *page2 = (void*)cm->virtMem+4096+4096;
+  memset(page0, 1, 4096);
+  memset(page1, 42, 4096);
+  memset(page2, 1000, 4096);
+  const unvme_ns_t* ns = unvme_openq(1, 10);
+  unvme_iod_t iod1 = unvme_awrite(ns, 0, page0, 0, 8);
+  unvme_iod_t iod2 = unvme_awrite(ns, 0, page1, 8, 8);
+  unvme_iod_t iod3 = unvme_awrite(ns, 0, page2, 16, 8);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  nvme_queue_t* qp = reinterpret_cast<unvme_desc_t*>(iod1)->q->nvmeq;
+  cout << "sizeof cqe " << sizeof(nvme_cq_entry_t) << ", phase: " << qp->cq_phase << endl;
+  for(int i=0; i<10; i++){
+    nvme_cq_entry_t* cqe = &qp->cq[i];
+    cout << cqe->p << ", " << cqe->rsvd3 << endl;
+  }
+  cout << "global cq_head: " << qp->cq_head << endl;
+  int stat1, stat2, stat3;
+  int ret2 = nvme_check_completion_ooo(reinterpret_cast<unvme_desc_t*>(iod2)->q->nvmeq, &stat2, NULL, 1);
+  for(int i=0; i<10; i++){
+    nvme_cq_entry_t* cqe = &qp->cq[i];
+    cout << cqe->p << ", " << cqe->rsvd3 << endl;
+  }
+  cout << "global cq_head: " << qp->cq_head << endl;
+  int ret1 = nvme_check_completion(reinterpret_cast<unvme_desc_t*>(iod1)->q->nvmeq, &stat1, NULL);
+  int ret3 = nvme_check_completion(reinterpret_cast<unvme_desc_t*>(iod3)->q->nvmeq, &stat3, NULL);
+  cout << "global cq_head: " << qp->cq_head << endl;
+  cout << "ret1: " << ret1 << ", ret2: " << ret2 << ", ret3: " << ret3 << endl;*/
+  return 0;
 }

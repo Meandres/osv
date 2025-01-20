@@ -162,7 +162,7 @@ void ensure_log_initialized()
         // TODO: examine these defaults. I'm guessing less than 256*mt sized buffers
         // will be subpar, so even if it bloats us on >4 vcpu lets do this for now.
         const size_t size = trace_page_size * std::max(size_t(4096), 1024 / ncpu);
-        //const size_t size = trace_page_size * 32768;
+        //const size_t size = trace_page_size * 256 * ncpu;
         for (auto c : sched::cpus) {
             auto * tbp = percpu_trace_buffer.for_cpu(c);
             *tbp = trace_buf(size);

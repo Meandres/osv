@@ -309,10 +309,57 @@ static int nvme_submit_cmd(nvme_queue_t* q)
  * @param   cqe_cs      CQE command specific DW0 returned
  * @return  the completed command id or -1 if there's no completion.
  */
+int nvme_check_completion_ooo(nvme_queue_t* q, int* stat, u32* cqe_cs, int pos)
+{
+    *stat = 0;
+    nvme_cq_entry_t* cqe = &q->cq[pos];
+    if (cqe->p == q->cq_phase) return -1;
+
+    *stat = cqe->psf & 0xfffe;
+    if(pos == q->cq_head){ // move cq_head
+        if (++q->cq_head == q->size) {
+            q->cq_head = 0;
+            q->cq_phase = !q->cq_phase;
+        }
+        if (cqe_cs) *cqe_cs = cqe->cs;
+            printf("writing, pos: %u, cq_head: %u\n", pos, q->cq_head);
+            w32(q->dev, q->cq_doorbell, q->cq_head);
+    }else
+        (q->cq+pos)->rsvd3 = 1;
+
+#if 0
+    // Some SSD does not advance sq_head properly (e.g. Intel DC D3600)
+    // so let the upper layer detect queue full error condition
+    q->sq_head = cqe->sqhd;
+#endif
+
+    if (*stat == 0) {
+        PDEBUG("q=%d cq=%d sq=%d-%d cid=%#x (C)", q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid);
+    } else {
+        ERROR("q=%d cq=%d sq=%d-%d cid=%#x stat=%#x (dnr=%d m=%d sct=%d sc=%#x) (C)",
+              q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
+    }
+    return cqe->cid;
+}
+
+/**
+ * Check a completion queue and return the completed command id and status.
+ * @param   q           queue
+ * @param   stat        completion status returned
+ * @param   cqe_cs      CQE command specific DW0 returned
+ * @return  the completed command id or -1 if there's no completion.
+ */
 int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 {
     *stat = 0;
-    nvme_cq_entry_t* cqe = &q->cq[q->cq_head];
+    nvme_cq_entry_t* cqe;
+    do{
+        cqe = &q->cq[q->cq_head];
+        if(cqe->rsvd3 == 1){
+            printf("Skipping\n");
+            q->cq_head++;
+        }
+    }while(cqe->rsvd3 == 1); // skip cqe removed ooo
     if (cqe->p == q->cq_phase) return -1;
 
     *stat = cqe->psf & 0xfffe;

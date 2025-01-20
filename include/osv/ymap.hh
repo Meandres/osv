@@ -148,8 +148,78 @@ inline PTE walkHuge(void* virt) {
    return pte;
 }
 
-inline bool get_stored_bit(void *virt){
-    return walk(virt).user==1;
+inline bool trySetPresent(void* addr){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   u64 oldWord = PTE(*pteRef).word;
+   PTE newPTE = PTE(oldWord);
+   if(newPTE.present == 1){
+      return false;
+   }
+   newPTE.present = 1;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool trySetNotPresent(void* addr, u64 oldWord){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   PTE newPTE = PTE(oldWord);
+   assert(newPTE.present == 1);
+   newPTE.present = 0;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool trySetClean(void* addr){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   u64 oldWord = PTE(*pteRef).word;
+   PTE newPTE = PTE(oldWord);
+   if(newPTE.dirty == 0){
+      return false;
+   }
+   newPTE.dirty = 0;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool tryClearAccessed(void* addr, u64 oldWord){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   PTE newPTE = PTE(oldWord);
+   assert(newPTE.accessed == 1);
+   newPTE.accessed = 0;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool trySetReadOnly(void* addr){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   u64 oldWord = PTE(*pteRef).word;
+   PTE newPTE = PTE(oldWord);
+   if(newPTE.writable == 0){
+      return false;
+   }
+   newPTE.writable = 0;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool trySetWritable(void* addr){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   u64 oldWord = PTE(*pteRef).word;
+   PTE newPTE = PTE(oldWord);
+   if(newPTE.writable == 1){
+      return true;
+   }
+   newPTE.writable = 1;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline bool trySetToWrite(void* addr, u64 oldWord){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   PTE newPTE = PTE(oldWord);
+   newPTE.user = 1;
+   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
+}
+
+inline void clearUser(void* addr){
+   std::atomic<u64>* pteRef = walkRef(addr);
+   PTE newPTE = PTE(*pteRef);
+   newPTE.user = 0;
+   pteRef->store(newPTE.word);
 }
 
 struct PageBundle{
@@ -191,8 +261,8 @@ struct BundleList {
       produce_index.store(0);
    }
 
-   bool correct_indexes(u64 oldIndex1, u64 index2){
-      if((oldIndex1 + 1)%list_size == index2)
+   bool correct_indexes(u64 newIndex1, u64 index2){
+      if(newIndex1 == index2)
          return false;
       return true;
    }
@@ -200,9 +270,12 @@ struct BundleList {
    void put(PageBundle* bundle){
       u64 oldIndex, newIndex;
       do{
+         retry:
          oldIndex = produce_index.load();
          newIndex = (oldIndex+1)%list_size;;
-         assert(correct_indexes(oldIndex, consume_index.load()));
+         if(!correct_indexes(newIndex, consume_index.load())){
+            goto retry;
+         }
       }while(!produce_index.compare_exchange_strong(oldIndex, newIndex));
       assert(list[oldIndex] == nullptr);
       list[oldIndex] = bundle;
@@ -211,9 +284,12 @@ struct BundleList {
    PageBundle* get(){
       u64 oldIndex, newIndex;
       do{
+         retry:
          oldIndex = consume_index.load();
          newIndex = (oldIndex+1)%list_size;
-         assert(correct_indexes(oldIndex, produce_index.load()));
+         if(!correct_indexes(newIndex, produce_index.load())){
+            goto retry;
+         }
       }while(!consume_index.compare_exchange_strong(oldIndex, newIndex));
       PageBundle* res = list[oldIndex];
       list[oldIndex] = nullptr;
@@ -232,5 +308,6 @@ u64 ymap_getPage();
 void ymap_putPage(u64 phys);
 bool ymap_tryMap(void* virtAddr, u64 phys);
 u64 ymap_tryUnmap(void* virt);
+void ymap_unmap(void* virt);
 
 #endif

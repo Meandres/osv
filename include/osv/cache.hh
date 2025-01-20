@@ -28,6 +28,7 @@
 #include <drivers/nvme.hh>
 #include <osv/ymap.hh>
 #include <osv/mmu.hh>
+#include <osv/power.hh>
 
 #include <chrono>
 #include <mutex>
@@ -35,9 +36,6 @@
 #ifndef VMCACHE
 
 typedef u64 PID; // page id type
-extern std::atomic<u64> evictCount;
-extern std::atomic<u64> pfCount;
-extern thread_local int __attribute__ ((tls_model ("initial-exec"))) workerThreadId;
 
 const u64 mb = 1024ull * 1024;
 const u64 gb = 1024ull * 1024 * 1024;
@@ -48,365 +46,248 @@ static const int16_t maxQueueSize = 256;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
-static const int NB_VAL = 1;
-typedef struct measure{
-    u64 count;
-    u64 values[NB_VAL];
-} measure_t;
+struct Log {
+    u64 tsc;
+    PID pid;
 
-extern __thread measure_t local_measure __attribute__ ((tls_model ("initial-exec")));
-extern std::mutex measure_mutex;
-extern measure_t global_measure;
-
-inline void zeroout_measures(){
-    for(int i=0; i<NB_VAL; i++){
-        local_measure.values[i] = 0;
-        global_measure.values[i] = 0;
+    Log(PID p){
+        tsc = rdtsc();
+        pid = p;
     }
-    local_measure.count = 0;
-    global_measure.count = 0;
-}
-
-inline void add_measures(){
-    measure_mutex.lock();
-    for(int i=0; i<NB_VAL; i++){
-        global_measure.values[i] += local_measure.values[i];
-    }
-    global_measure.count += local_measure.count;
-    measure_mutex.unlock();
-}
-inline void print_measures(){
-    std::cerr << "Measures: " << std::endl;
-    std::cerr << "Count " << global_measure.count << std::endl;
-    std::cerr << "hanhandleFaultt: " << global_measure.values[0] << ", " << global_measure.values[0]/(global_measure.count+0.0)<< std::endl;
-}
+};
 
 // allocate memory using huge pages
 void* allocHuge(size_t size);
 
+inline void crash_osv(){
+    printf("aborting\n");
+    osv::halt();
+}
+
 // use when lock is not free
 void yield(u64 counter);
 
-struct PagePin {
-    std::atomic<u64> count;
-    void init() { count.store(0); }
-
-    bool hasWaiters(){
-        return count.load() > 0;
-    }
-    
-    void add(){
-        count++;
-    }
-    void decr(){
-        u64 prevVal = count--;
-        assert(prevVal > 0);
-    }
-};
-
 struct PageState {
-   std::atomic<u64> stateAndVersion;
+    std::atomic<u64> stateAndVersion;
 
-   static const u64 Unlocked = 0;
-   static const u64 MaxShared = 251;
-   static const u64 Locked = 253;
-   static const u64 Marked = 254;
-   static const u64 Evicted = 255;
+    static const u64 Unlocked = 0;
+    static const u64 MaxShared = 251;
+    static const u64 Locked = 253;
+    static const u64 Marked = 254;
+    static const u64 Evicted = 255;
 
-   PageState() {}
+    PageState() {}
 
-   void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
-   static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
-   static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
+    void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
+    static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
+    static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
 
     bool tryLockX(u64 oldStateAndVersion) {
         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
     }
 
-   void unlockX() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
-   }
+    void unlockX() {
+        assert(getState() == Locked);
+        stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
+    }
 
-   void unlockXEvicted() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
-   }
+    void unlockXEvicted() {
+        assert(getState() == Locked);
+        stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
+    }
+    
+    void unlockXSameVersion() {
+        assert(getState() == Locked);
+        stateAndVersion.store(sameVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
+    }
 
-   void downgradeLock() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), 1), std::memory_order_release);
-   }
+    void downgradeLock() {
+        assert(getState() == Locked);
+        stateAndVersion.store(nextVersion(stateAndVersion.load(), 1), std::memory_order_release);
+    }
 
-   bool tryLockS(u64 oldStateAndVersion) {
-      u64 s = getState(oldStateAndVersion);
-      if (s<MaxShared)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s+1));
-      if (s==Marked)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
-      return false;
-   }
+    bool tryLockS(u64 oldStateAndVersion) {
+        u64 s = getState(oldStateAndVersion);
+        if (s<MaxShared)
+            return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s+1));
+        if (s==Marked)
+            return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
+        return false;
+    }
 
-   void unlockS() {
-      while (true) {
-         u64 oldStateAndVersion = stateAndVersion.load();
-         u64 state = getState(oldStateAndVersion);
-         assert(state>0 && state<=MaxShared);
-         if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state-1)))
+    void unlockS() {
+        while (true) {
+            u64 oldStateAndVersion = stateAndVersion.load();
+            u64 state = getState(oldStateAndVersion);
+            assert(state>0 && state<=MaxShared);
+            if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state-1)))
+                return;
+        }
+    }
+
+    bool tryMark(u64 oldStateAndVersion) {
+        assert(getState(oldStateAndVersion)==Unlocked);
+        return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Marked));
+    }
+
+    bool tryValidate(u64 oldStateAndVersion){
+        if(getState(oldStateAndVersion)!=Evicted)
+            return false;
+        return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Unlocked));
+    }
+
+    void setToUnlockedIfMarked(){
+        assert(getState() == 0 || getState() >= 254);
+        if(getState() == Evicted)
             return;
-      }
-   }
+        stateAndVersion.store(sameVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
+    }
 
-   bool tryMark(u64 oldStateAndVersion) {
-      assert(getState(oldStateAndVersion)==Unlocked);
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Marked));
-   }
+    static u64 getState(u64 v) { return v >> 56; };
+    u64 getState() { return getState(stateAndVersion.load()); }
 
-   bool tryValidate(u64 oldStateAndVersion){
-       if(getState(oldStateAndVersion)!=Evicted)
-           return false;
-       return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Unlocked));
-   }
-
-   void setToUnlockedIfMarked(){
-       assert(getState() == 0 || getState() >= 254);
-       if(getState() == Evicted)
-           return;
-       stateAndVersion.store(sameVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
-   }
-
-   static u64 getState(u64 v) { return v >> 56; };
-   u64 getState() { return getState(stateAndVersion.load()); }
-
-   void operator=(PageState&) = delete;
+    void operator=(PageState&) = delete;
 };
+
+class CacheManager;
+typedef float (*custom_score_func)(PID);
+struct PageLists{
+    std::vector<PID>* toEvict;
+    std::vector<PID>* toWrite;
+};
+typedef void (*custom_batch_func)(CacheManager*, PID, PageLists*);
+typedef std::vector<PID>* candidate_list;
 
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
 struct ResidentPageSet {
-   static const u64 empty = ~0ull;
-   static const u64 tombstone = (~0ull)-1;
+    static const u64 empty = ~0ull;
+    static const u64 tombstone = (~0ull)-1;
 
-   struct Entry {
-      std::atomic<u64> pid;
-   };
+    struct Entry {
+        std::atomic<u64> pid;
+    };
 
-   Entry* ht;
-   u64 count;
-   u64 mask;
-   std::atomic<u64> clockPos;
+    Entry* ht;
+    u64 count;
+    u64 mask;
+    std::atomic<u64> clockPos;
 
-   ResidentPageSet();
-   void init(u64 maxCount);
-   ~ResidentPageSet();
-   u64 next_pow2(u64 x);
-   u64 hash(u64 k);
+    ResidentPageSet();
+    void init(u64 maxCount);
+    ~ResidentPageSet();
+    u64 next_pow2(u64 x);
+    u64 hash(u64 k);
    
-   bool insert(u64 pid);
-   bool contains(u64 pid);
-   bool remove(u64 pid);
-   template<class Fn> void iterateClockBatch(u64 batch, Fn fn);
+    bool insert(u64 pid);
+    bool contains(u64 pid);
+    bool remove(u64 pid);
+    void print();
+    template<class Fn> void iterateClockBatch(u64 batch, Fn fn, CacheManager* cm, PageLists* pl);
 };
-class CacheManager;
-
-enum cache_opcode {
-    CACHE_OP_PAGEFAULT = 0, // argument : u64 addr -> no return value
-    CACHE_OP_IOERROR = 1, //
-    CACHE_OP_ALLOC = 2, // argument : list of u64 addr, at min addr of the array + size -> no return value (?)
-    CACHE_OP_EVICT = 3,
-};
-extern int nb_cache_op;
-typedef int (*cache_op_func_t)(CacheManager*, u64, int);
 
 class CacheManager {	
     public:
-    const bool explicit_control;
-	// core
+	  // core
    	Page* virtMem;
-	u64 virtSize;
+	  u64 virtSize;
    	u64 physSize;
-   	int n_threads;
-    int nb_queues_used;
-    Page* lastPage;
   
-	// accessory
-	u64 virtCount;
+	  // accessory
+	  u64 virtCount;
    	u64 physCount;
    	u64 batch;
-    std::vector<unvme_iod_t> io_descriptors; // for n_threads * ns->qsize
-	std::unordered_map<int, int> threadMap;
-    std::vector<int> freeIDList;
-    YmapBundle ymapBundle;
-    std::atomic_flag lockFreeIDList = ATOMIC_FLAG_INIT;
 
    	// accounting
-	std::atomic<u64> physUsedCount;
-   	std::atomic<u64> allocCount;
+	  std::atomic<u64> physUsedCount;
    	std::atomic<u64> readCount;
    	std::atomic<u64> writeCount;
+    std::atomic<u64> pfCount;
 
-	// interface <-> application
+	  // interface <-> application
    	PageState* pageState;
    	ResidentPageSet residentSet;
-    Page* emptyPages;
-    PagePin* pagePin;
 
-    // callbacks customization
-    std::vector<cache_op_func_t> handlers;
-    int updateCallback(enum cache_opcode, cache_op_func_t f);
-
-   	CacheManager(u64 virtSize, u64 physSize, int n_threads, int batch, bool ex_cont);
+   	CacheManager(u64 virtSize, u64 physSize, int batch);
    	~CacheManager();
 
    	const unvme_ns_t* ns;
 	
-	// Functions
+	  // Functions
    	PageState& getPageState(PID pid) {
-    	return pageState[pid];
+    	  return pageState[pid];
    	}
 
-    PagePin& getPagePin(PID pid){
-        return pagePin[pid];
+   	bool isValidPtr(uintptr_t page) { 
+        uintptr_t start = reinterpret_cast<uintptr_t>(virtMem);
+        return (page >= start) && (page < (start + virtSize + 16)); 
+    }
+   	PID toPID(void* page) { 
+        if(!isValidPtr(reinterpret_cast<uintptr_t>(page))){
+            crash_osv();
+        }
+        return reinterpret_cast<Page*>(page) - virtMem; 
+    }
+   	Page* toPtr(PID pid) { 
+        if(pid < 0 || pid >= virtCount){
+            crash_osv();
+        }
+        return virtMem + pid; 
     }
 
-   	Page* fixX(PID pid);
-   	void unfixX(PID pid);
-   	Page* fixS(PID pid);
-   	void unfixS(PID pid);
-
-   	bool isValidPtr(void* page) { return (page >= virtMem) && (page < (virtMem + virtSize + 16)); }
-   	PID toPID(void* page) { return reinterpret_cast<Page*>(page) - virtMem; }
-   	Page* toPtr(PID pid) { return virtMem + pid; }
+    void setMemoryToUnwritable(){
+        for(u64 i = 0; i<virtCount; i++){
+            std::atomic<u64> *pteRef = walkRef(toPtr(i));
+            PTE pte = PTE(*pteRef);
+            pte.writable = 0;
+            pteRef->store(pte.word);
+        }
+        mmu::flush_tlb_all();
+    }
 
    	void ensureFreePages();
    	void readPage(PID pid);
     void readPageAt(PID pid, void* virt);
-   	Page* allocPage();
-    u64 getNextPid() { return allocCount++; }
-    void sync(std::vector<PID> pages, int tid);
     
-    int allocate(PID* listStart, int size);
-   	void handleFault(PID pid);
-    void explicitFix(PID pid);
+    void flush(std::vector<PID> toWrite, std::vector<PID>* toEvict);
+    void handleFault(PID pid, exception_frame *ef); // called from the page fault handler
+    void fix(PID pid); // explicit call
    	void evict();
 
-    inline void registerThread(){
-        while(lockFreeIDList.test_and_set(std::memory_order_acquire)){
-            _mm_pause();
-        }
-        assert(freeIDList.size()>=0);
-		//int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
-        if(freeIDList.empty()){
-            printf("Overcommitment of threads. Failing\n");
-            assert(false);
-        }
-        int id = freeIDList.back();
-        workerThreadId = id;
-        //threadMap.insert({tid, id}); 
-        freeIDList.pop_back();
-        //std::cout << "Mapped thread " << tid << " to ID " << id << std::endl;
-        lockFreeIDList.clear(std::memory_order_release);
-        //sched::cpu::current()->disable_load_balancing();
-    }
-    inline void forgetThread(){
-		//int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
-        while(lockFreeIDList.test_and_set(std::memory_order_acquire)){
-            _mm_pause();
-        }
-        /*auto search = threadMap.find(tid);
-        if (search != threadMap.end()){
-			freeIDList.push_back(search->second);
-            threadMap.erase(tid);
-            //std::cout << "Unmapped thread " << tid << std::endl;
-		}*/
-        freeIDList.push_back(workerThreadId);
-        workerThreadId = -1;
-        lockFreeIDList.clear(std::memory_order_release);
-        //sched::cpu::current()->enable_load_balancing();
-    }
-	inline int getTID(){
-        return workerThreadId;
-		/*int tid = std::hash<std::thread::id>()(std::this_thread::get_id());
-        auto search = threadMap.find(tid);
-        if (search != threadMap.end())
-            return search->second;
-        return -1;*/
-	}
+    candidate_list alloc_candidates;
+    candidate_list evict_candidates;
+    custom_score_func allocation_score_func;
+    custom_score_func eviction_score_func;
+    custom_batch_func allocation_batch_func;
+    custom_batch_func eviction_batch_func;
+
 };
 
-// default op handlers
-int default_allocate(CacheManager* cm, u64 listStart, int size);
-int default_handleFault(CacheManager* cm, u64 pid, int);
-int default_evict(CacheManager* cm, u64, int);
+void default_explicit_eviction(CacheManager*, PID, PageLists*);
+void default_transparent_eviction(CacheManager*, PID, PageLists*);
 
 extern std::vector<CacheManager*> mmio_regions;
 
-inline CacheManager* get_mmr(void* addr){
+inline CacheManager* get_mmr(uintptr_t addr){
 	for(CacheManager* mmr: mmio_regions){
 		if(mmr->isValidPtr(addr)){
-            assert(mmr->explicit_control!=true);
 			return mmr;
 		}
 	}
 	return NULL;
 }
 
-inline void cache_handle_page_fault(CacheManager* mmr, void* addr){
-	mmr->handleFault(mmr->toPID(addr));
+void print_backlog(CacheManager *cm, PID page);
+inline void cache_handle_page_fault(CacheManager* mmr, uintptr_t addr, exception_frame *ef){
+	  mmr->handleFault(mmr->toPID((void*)addr), ef);
 }
 
 // TODO: replace with File when we implement it
 // for now we just create one region
 // int createMMAPRegion(void* start, size_t size, void* file, size_t size);
-CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int nb_threads, int batch, bool ex_cont);
+CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int batch);
 void destroyMMIORegion(CacheManager* cache);
 
-/*
-// Base-level primitives
-// Most basic building blocks of the cache (use IO/mm subsystems internally ofc)
-// Those functions are NOT customizable and should be everything the custom handlers need
-
-// create a virtual page of the given size (4KiB, 2MiB or 1GiB) in a region account
-int alloc(void* vma, size_t size);
-// remove a virtual page from a region account
-int free(void* vma); 
-// populate the page table on the range [address, address + size].
-// Does not map the range to physical pages.
-int populatePT(void* vma, size_t size); 
-
-int map(void* vma);
-int unmap(void* vma);
-int map(void* vma, u64 pma);
-
-int read(void* vma, File f, size_t offset);
-int write(void* vma, File f, size_t offset);
-
-// 1st level handlers
-
-// Lock in Exclusive mode
-int lockExclusive(void* vma);
-// Lock in Shared mode.
-int lockShared(void* vma);
-int tryLockExclusive(void* vma);
-int tryLockShared(void* vma);
-// Unlock the page, either decrement the ref count if in shared lock or to Unlocked state if exclusive lock
-int unlock(void* vma);
-
-int fixExclusive(void* vma);
-int fixShared(void* vma);
-int evict(void* vma);
-
-int read(void* vma);
-int write(void* vma);
-int alloc(void* vma);
-int free(void* vma);
-
-// 2nd level handlers
-void handleFault(void* vma);
-void evict();
-void ioError();
-*/
 struct OLCRestartException{};
 
-//extern CacheManager cache;
 #endif
 #endif
