@@ -853,7 +853,7 @@ void main_cont(int loader_argc, char** loader_argv)
         osv::halt();
     } else {
 #endif
-        bench::evaluate_mempool();
+        bench::evaluate_mmu();
         osv::shutdown();
 #if CONF_memory_tracker
     }
