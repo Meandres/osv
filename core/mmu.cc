@@ -45,22 +45,15 @@ extern size_t elf_size;
 
 extern const char text_start[], text_end[];
 
-uint64_t bench_start;
-uint64_t bench_end;
-uint64_t anon_full_start;
-uint64_t anon_full_end;
-uint64_t anon_full_sum{0};
-uint64_t alloc_sum{0};
-uint64_t populate_sum{0};
-uint64_t lock_sum{0};
+uint64_t lines[4] = {0};
 uint64_t ctr{0};
 
 void bench::evaluate_mmu(){
-    std::cout << "total time in map_anon " << (double) anon_full_sum / ctr << std::endl;
-    std::cout << "allocate " << (double) alloc_sum / ctr << std::endl;
-    std::cout << "populate " << (double) populate_sum / ctr << std::endl;
-    std::cout << "locked   " << (double) lock_sum / ctr << std::endl;
-    std::cout << "count " << ctr << std::endl << std::flush;
+  std::cout << "nooverfl " << lines[0] << std::endl;
+  std::cout << "lock     " << lines[1] << std::endl;
+  std::cout << "allocate " << lines[2] << std::endl;
+  std::cout << "populate " << lines[3] << std::endl;
+  std::cout << "count " << ctr << std::endl << std::flush;
 }
 
 namespace mmu {
@@ -1338,35 +1331,47 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
 
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
 {
-    anon_full_start = bench::rdtsc();
-    bool search = !(flags & mmap_fixed);
-    size = align_up(size, mmu::page_size);
-    auto start = reinterpret_cast<uintptr_t>(addr);
-    auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
-    PREVENT_STACK_PAGE_FAULT
-
-    bench_start = bench::rdtsc();
-    SCOPE_LOCK(vma_list_mutex.for_write());
-    bench_end = bench::rdtsc();
-    if (flags & mmap_populate)
-        lock_sum += bench_end - bench_start;
-
-    bench_start = bench::rdtsc();
-    auto v = (void*) allocate(vma, start, size, search);
-    bench_end = bench::rdtsc();
-    if (flags & mmap_populate)
-        alloc_sum += bench_end - bench_start;
-
-    if (flags & mmap_populate) {
-        bench_start = bench::rdtsc();
-        populate_vma(vma, v, size);
-        bench_end = bench::rdtsc();
-        populate_sum = bench_end - bench_start;
+  void *v;
+    if(size == 0x10000 && flags == mmap_populate && !memory::use_linear_map)
+    {
+        bool search;
+        uintptr_t start;
+        anon_vma* vma;
+        search = !(flags & mmap_fixed);
+        size = align_up(size, mmu::page_size);
+        start = reinterpret_cast<uintptr_t>(addr);
+        vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
+        uint64_t s;
+        uint64_t e;
+        uint64_t s2;
+        s = bench::rdtsc();
+        PREVENT_STACK_PAGE_FAULT;
+        e = bench::rdtsc();
+        s2 = bench::rdtsc();
+        SCOPE_LOCK(vma_list_mutex.for_write());
+        lines[1] += bench::rdtsc() - s2;
+        lines[0] += e - s;
+        s = bench::rdtsc();
+        v = (void*) allocate(vma, start, size, search);
+        lines[2] += bench::rdtsc() - s;
+        s = bench::rdtsc();
+        if (flags & mmap_populate) {
+            populate_vma(vma, v, size);
+        }
+        lines[3] += bench::rdtsc() - s;
         ++ctr;
+    } else {
+        bool search = !(flags & mmap_fixed);
+        size = align_up(size, mmu::page_size);
+        auto start = reinterpret_cast<uintptr_t>(addr);
+        auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
+        PREVENT_STACK_PAGE_FAULT
+        SCOPE_LOCK(vma_list_mutex.for_write());
+        v = (void*) allocate(vma, start, size, search);
+        if (flags & mmap_populate) {
+            populate_vma(vma, v, size);
+        }
     }
-    anon_full_end = bench::rdtsc();
-    if (flags & mmap_populate)
-      anon_full_sum += anon_full_end - anon_full_start;
     return v;
 }
 
