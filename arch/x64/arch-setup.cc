@@ -230,7 +230,7 @@ void arch_setup_free_memory()
     //    data into contiguous memory with the appended local data. This only works
     //    for multiple of 64 cores as every core needs 64B of local data 
     //    => pagesize holds local data for 64 cores
-    memory::page_allocator.init(64);
+    memory::llfree_allocator.init(64);
 }
 
 void arch_setup_tls(void *tls, const elf::tls_data& info)
