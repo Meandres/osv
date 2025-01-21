@@ -80,7 +80,7 @@ private:
   void reserve_allocated();
 };
 
-extern llf page_allocator;
+extern llf llfree_allocator;
 
 void add_llfree_region(void *mem_start, size_t mem_size);
 

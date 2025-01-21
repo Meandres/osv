@@ -88,14 +88,14 @@ bi::set<page_range,
        bi::set_member_hook<>,
        &page_range::set_hook>,
    bi::constant_time_size<false>> phys_mem_ranges
-    __attribute__((init_priority((int)init_prio::page_allocator)));
+    __attribute__((init_priority((int)init_prio::llfree_allocator)));
 
 // Indicate whether malloc pools are initialized yet
 bool smp_allocator{false};
 
 // llfree page frame allocator
-llf page_allocator
-    __attribute__((init_priority((int)init_prio::page_allocator)));
+llf llfree_allocator
+    __attribute__((init_priority((int)init_prio::llfree_allocator)));
 
 size_t mempool_cpuid(){
     return sched::cpu::current() ? sched::cpu::current()->id : 0;
@@ -938,7 +938,7 @@ void add_llfree_region(void *addr, size_t size){
     on_new_memory(size);
     on_free(size);
 
-    page_allocator.add_region(addr, size);
+    llfree_allocator.add_region(addr, size);
 }
 
 unsigned llf::order(size_t size){
@@ -955,7 +955,7 @@ unsigned llf::order(size_t size){
 }
 
 void *early_alloc_pages(size_t size) {
-    assert(!page_allocator.is_ready());
+    assert(!llfree_allocator.is_ready());
 
     size = align_up(size, page_size);
 
@@ -1010,8 +1010,8 @@ static void free_large(void* obj)
 {
     obj = align_down(obj - 1, page_size);
     auto pr = static_cast<page_range *>(obj);
-    if(page_allocator.is_ready()){
-        page_allocator.free_page(obj, llf::order(pr->size));
+    if(llfree_allocator.is_ready()){
+        llfree_allocator.free_page(obj, llf::order(pr->size));
     } else {
         early_free_pages(obj, pr->size);
         on_free(pr->size);
@@ -1036,10 +1036,10 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // handle in contiguous physical memory if possible
-    if(size <= llf_max_size && page_allocator.is_ready()){
+    if(size <= llf_max_size && llfree_allocator.is_ready()){
         unsigned order = llf::order(size);
-        ret = page_allocator.alloc_huge_page(order);
-    } else if (!page_allocator.is_ready()){
+        ret = llfree_allocator.alloc_huge_page(order);
+    } else if (!llfree_allocator.is_ready()){
         ret = early_alloc_pages(size);
     // larger memory cannot be allocated contiguously in physical memory
     } else if (contiguous) {
@@ -1195,10 +1195,10 @@ static void* untracked_alloc_page()
 {
     void* ret;
 
-    if (!page_allocator.is_ready()) {
+    if (!llfree_allocator.is_ready()) {
         ret = early_alloc_pages(page_size);
     } else {
-        ret = page_allocator.alloc_page();
+        ret = llfree_allocator.alloc_page();
     }
     trace_memory_page_alloc(ret);
     return ret;
@@ -1216,11 +1216,11 @@ void* alloc_page()
 static inline void untracked_free_page(void *v)
 {
     trace_memory_page_free(v);
-    if (!page_allocator.is_ready()) {
+    if (!llfree_allocator.is_ready()) {
         early_free_pages(v, page_size);
         on_free(page_size);
     } else {
-        page_allocator.free_page(v);
+        llfree_allocator.free_page(v);
     }
 }
 
@@ -1239,20 +1239,20 @@ void free_page(void* v)
  */
 void* alloc_huge_page(size_t N)
 {
-  if(!page_allocator.is_ready()){
+  if(!llfree_allocator.is_ready()){
       // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
       abort("[ERROR] alloc_huge_page cannot be called before page frame allocator is initialized");
   }
-  return page_allocator.alloc_huge_page(llf::order(N));
+  return llfree_allocator.alloc_huge_page(llf::order(N));
 }
 
 void free_huge_page(void* v, size_t N)
 {
-  if(!page_allocator.is_ready()){
+  if(!llfree_allocator.is_ready()){
       // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
       abort("[ERROR] free_huge_page cannot be called before page frame allocator is initialized");
   }
-  page_allocator.free_page(v, llf::order(N));
+  llfree_allocator.free_page(v, llf::order(N));
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setup()

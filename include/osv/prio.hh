@@ -14,7 +14,7 @@ enum {
     console,
     sort,
     cpus,
-    page_allocator,
+    llfree_allocator,
     pt_root,
     vma_range_set,
     linear_vma_set,
