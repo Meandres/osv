@@ -1037,11 +1037,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // handle in contiguous physical memory if possible
-<<<<<<< HEAD
     if(size <= llf_max_size && llfree_allocator.is_ready() && (contiguous || use_linear_map)){
-=======
-    if((contiguous || use_linear_map) && size <= llf_max_size){
->>>>>>> ee60a62d (make benchmarks work with non-linear mapping)
         unsigned order = llf::order(size);
         ret = llfree_allocator.alloc_huge_page(order);
     } else if (!llfree_allocator.is_ready()){
