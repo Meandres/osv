@@ -27,6 +27,7 @@ enum {
     psci,
     acpi,
     vma_list,
+    superblocks,
     reclaimer,
     sched,
     clock,
