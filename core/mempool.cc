@@ -495,8 +495,8 @@ void wake_reclaimer()
     reclaimer_thread.wake();
 }
 
-static void on_free(size_t mem) { free_memory.fetch_add(mem); }
-static void on_alloc(size_t mem) { free_memory.fetch_sub(mem); }
+static void on_free(size_t mem) { /* free_memory.fetch_add(mem); */ }
+static void on_alloc(size_t mem) { /* free_memory.fetch_sub(mem); */ }
 static void on_new_memory(size_t mem) { total_memory.fetch_add(mem); }
 
 namespace stats {
