@@ -992,6 +992,7 @@ void *early_alloc_pages(size_t size) {
             }
         }
     }
+    std::cout << "size: " << size << std::endl << std::flush;
     memory::oom();
     return nullptr;
 }
