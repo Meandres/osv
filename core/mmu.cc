@@ -234,30 +234,36 @@ class superblock_manager {
     generate_owner_list(uintptr_t start, u64 size){
         // If the entire region is outside the superblock area
         // we don't have to waste time below
-        if(start + size < superblock_area_base || start >= main_mem_area_base)
-            return {std::make_tuple(start, size, owner(start))};
+        if(start + size < superblock_area_base || start >= main_mem_area_base){
+           return {std::make_tuple(start, size, owner(start))};
+        }
 
         std::vector<std::tuple<uintptr_t, u64, uint8_t>> res;
         uint8_t prev_owner = 255;
-        for(u64 i{0}; i < size;  i = (i + superblock_size) % superblock_size){
-            uint8_t cur_owner = owner(start+i);
+        u64 size_in_superblock = 0;
+        for(u64 i{0}; i < size;  i += size_in_superblock){
+            uint8_t cur_owner = owner(start + i);
+
+            u64 next_barrier = std::min(align_up(start + i + 1, superblock_size), start+size);
+            size_in_superblock = next_barrier - (start + i);
+
             if(prev_owner == cur_owner){
                 auto& prev = res[res.size()-1];
                 prev = std::make_tuple(
                     std::get<0>(prev),
-                    std::get<1>(prev) + std::min(superblock_size, size -i),
+                    std::get<1>(prev) + std::min(superblock_size, size - i),
                     cur_owner
                 );
+
             } else {
                 res.push_back(std::make_tuple(
                     start + i,
-                    std::min(superblock_size, size -i),
+                    std::min(superblock_size, size - i),
                     cur_owner
                 ));
             }
             prev_owner = cur_owner;
         }
-        printf("res has %d elements\n", res.size());
         return res;
     }
 
