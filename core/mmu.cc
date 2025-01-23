@@ -135,7 +135,7 @@ public:
 
 class superblock_manager {
     // 64 workers for superblock segments, 1 worker for outside segments
-    std::array<superblock_worker, 65> workers;
+    std::array<superblock_worker, sched::max_cpus + 1> workers;
     std::array<std::atomic_uint8_t, superblock_len> superblocks;
 
     uint8_t cpu_id(){
