@@ -1253,6 +1253,19 @@ static error protect(const void *addr, size_t size, unsigned int perm)
     return no_error();
 }
 
+ulong evacuate(vma& dead){
+    auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+#if CONF_memory_jvm_balloon
+    if (dead.has_flags(mmap_jvm_heap)) {
+        memory::stats::on_jvm_heap_free(size);
+    }
+#endif
+    sb_mgr->erase(dead);
+    WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()) {
+        sb_mgr->free_range(dead.start(), dead.size());
+    }
+    return size;
+}
 
 ulong evacuate(uintptr_t start, uintptr_t end)
 {
@@ -1262,22 +1275,10 @@ ulong evacuate(uintptr_t start, uintptr_t end)
         i->split(end);
         i->split(start);
         if (contains(start, end, *i)) {
-            auto& dead = *i--;
-            auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-            ret += size;
-#if CONF_memory_jvm_balloon
-            if (dead.has_flags(mmap_jvm_heap)) {
-                memory::stats::on_jvm_heap_free(size);
-            }
-#endif
-            sb_mgr->erase(dead);
-            WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()) {
-                sb_mgr->free_range(dead.start(), dead.size());
-            }
+            ret += evacuate(*i--);
         }
     }
     return ret;
-    // FIXME: range also indicates where we can insert a new anon_vma, use it
 }
 
 static void unmap(const void* addr, size_t size)
