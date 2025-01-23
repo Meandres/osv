@@ -1023,6 +1023,18 @@ static void free_large(void* obj)
 
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
+    void* ret;
+
+    // Use mapped memory is possible
+    if(!contiguous && (!use_linear_map || size > llf_max_size)){
+        ret = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
+        trace_memory_malloc_large(ret, size, size, page_size);
+        return ret;
+    } else if (size > llf_max_size){
+        printf("[ERROR]: physically contiguous allocations above 0x%lxB are not possible\n", llf_max_size);
+        abort();
+    }
+
     size_t requested_size{size};
     size_t offset;
     if (alignment < page_size) {
@@ -1034,21 +1046,14 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     size += offset;
     size = align_up(size, page_size);
 
-    void* ret;
 
-    // handle in contiguous physical memory if possible
+    // handle in linearly mapped, contiguous physical memory.
+    // Additional space for a header needs to be allocated in this case
     if(size <= llf_max_size && llfree_allocator.is_ready() && (contiguous || use_linear_map)){
         unsigned order = llf::order(size);
         ret = llfree_allocator.alloc_huge_page(order);
-    } else if (!llfree_allocator.is_ready()){
-        ret = early_alloc_pages(size);
-    // larger memory cannot be allocated contiguously in physical memory
-    } else if (contiguous) {
-        printf("[ERROR]: physically contiguous allocations above 4MiB are not possible\n");
-        abort();
-    // call mmap
     } else {
-        ret =  mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
+        ret = early_alloc_pages(size);
     }
 
     size_t* ret_header = static_cast<size_t*>(ret);
@@ -1059,9 +1064,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
 
 static void mapped_free_large(void *object)
 {
-    object = align_down(object - 1, page_size);
-    size_t* ret_header = static_cast<size_t*>(object);
-    mmu::munmap(object, *ret_header);
+    mmu::munmap(object);
 }
 
 std::atomic<unsigned> llf_cnt{0};

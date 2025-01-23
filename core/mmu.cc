@@ -256,7 +256,7 @@ class superblock_manager {
         return res;
     }
 
-    vma_list_type::iterator find_intersecting_vma(uintptr_t addr){
+    vma_list_type::iterator find_intersecting_vma(const uintptr_t addr){
     auto& my_vma_list = workers[owner(addr)].vma_list;
 
     auto vma = my_vma_list.lower_bound(addr, addr_compare());
@@ -2261,6 +2261,24 @@ error mprotect(const void *addr, size_t len, unsigned perm)
     }
 
     return protect(addr, len, perm);
+}
+
+/*
+ * Like munmap but it gets the size from the intersecting vma.
+ * I.e. this will remove the entirety of the vma containing the specified address.
+ * Keep in mind that operations like mprotect sometimes split vmas when using this function.
+ */
+error munmap(const void* addr)
+{
+    u64 size;
+    auto virt = reinterpret_cast<uintptr_t>(addr);
+    WITH_LOCK(sb_mgr->vma_lock(virt).for_read()){
+        auto v = sb_mgr->find_intersecting_vma(virt);
+        if(v == sb_mgr->vma_end_iterator(virt))
+            return make_error(EINVAL);
+        size = v->size();
+    }
+    return munmap(addr, size);
 }
 
 error munmap(const void *addr, size_t length)
