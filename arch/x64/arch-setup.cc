@@ -167,6 +167,8 @@ void arch_setup_free_memory()
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
 
+    // Initialize superblock allocator so we can linearly map the rest of the memory
+    mmu::initialize_superblocks();
 
     for (auto&& area : mmu::identity_mapped_areas) {
         auto base = reinterpret_cast<void*>(get_mem_area_base(area));

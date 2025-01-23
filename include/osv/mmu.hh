@@ -373,6 +373,8 @@ unsigned long all_vmas_size();
 
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);
+
+void initialize_superblocks();
 }
 
 #endif /* MMU_HH */

@@ -19,7 +19,6 @@ enum {
     vma_range_set,
     linear_vma_set,
     mempool,
-    superblocks,
     routecache,
     pagecache,
     threadlist,
