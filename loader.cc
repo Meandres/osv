@@ -5,7 +5,6 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <osv/benchmark.hh>
 #include <osv/drivers_config.h>
 #include <osv/kernel_config.h>
 #include "fs/fs.hh"
@@ -853,7 +852,6 @@ void main_cont(int loader_argc, char** loader_argv)
         osv::halt();
     } else {
 #endif
-        bench::evaluate_mmu();
         osv::shutdown();
 #if CONF_memory_tracker
     }

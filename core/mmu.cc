@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
-#include <osv/benchmark.hh>
 #include <osv/mmu.hh>
 #include <osv/mempool.hh>
 #include "processor.hh"
@@ -46,17 +45,6 @@ extern void* elf_start;
 extern size_t elf_size;
 
 extern const char text_start[], text_end[];
-
-uint64_t lines[4] = {0};
-uint64_t ctr{0};
-
-void bench::evaluate_mmu(){
-  std::cout << "nooverfl " << lines[0] << std::endl;
-  std::cout << "lock     " << lines[1] << std::endl;
-  std::cout << "allocate " << lines[2] << std::endl;
-  std::cout << "populate " << lines[3] << std::endl;
-  std::cout << "count " << ctr << std::endl << std::flush;
-}
 
 namespace mmu {
 
@@ -176,7 +164,6 @@ class superblock_manager {
         for(u64 i{start}; i < start + n; ++i){
             superblocks[i].compare_exchange_weak(cpuid, 255, std::memory_order_acq_rel);
         }
-        printf("[%d] released superblocks: %d + %d\n",cpuid, start, n-1);
     }
 
     u64 allocate_superblocks(unsigned n){
@@ -195,7 +182,6 @@ class superblock_manager {
                     return allocate_superblocks(n);
                 } else break;
             }
-            printf("[%d] allocated superblocks: %d + %d\n", cpu_id(), i-n+1, n-1);
             return i-n+1;
             }
 
