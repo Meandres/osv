@@ -481,10 +481,10 @@ phys virt_to_phys(void *virt)
     }
 #endif
 
-    // For now, only allow non-mmaped areas.  Later, we can either
-    // bounce such addresses, or lock them in memory and translate
-    assert(virt >= phys_mem);
-    return reinterpret_cast<uintptr_t>(virt) & (mem_area_size - 1);
+    uintptr_t addr = reinterpret_cast<uintptr_t>(virt);
+    if(addr >= main_mem_area_base)
+        return addr & (mem_area_size - 1);
+    return virt_to_phys_pt(virt);
 }
 
 template <int N, typename MakePTE>

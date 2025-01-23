@@ -1023,8 +1023,6 @@ static void free_large(void* obj)
 
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
-    assert(size > page_size || alignment > page_size);
-
     size_t requested_size{size};
     size_t offset;
     if (alignment < page_size) {
@@ -1291,7 +1289,7 @@ static inline void* std_malloc(size_t size, size_t alignment)
     } else if (memory::will_fit_in_early_alloc_page(size,alignment) && !memory::smp_allocator) {
         ret = memory::early_alloc_object(size, alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
-    } else if (minimum_size <= memory::page_size && alignment <= memory::page_size) {
+    } else if (minimum_size <= memory::page_size && alignment <= memory::page_size && memory::use_linear_map) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page, memory::alloc_page());
         trace_memory_malloc_page(ret, size, memory::page_size, alignment);
     } else {
