@@ -1260,10 +1260,10 @@ ulong evacuate(vma& dead){
         memory::stats::on_jvm_heap_free(size);
     }
 #endif
-    sb_mgr->erase(dead);
     WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()) {
         sb_mgr->free_range(dead.start(), dead.size());
     }
+    sb_mgr->erase(dead);
     return size;
 }
 
@@ -2268,17 +2268,17 @@ error mprotect(const void *addr, size_t len, unsigned perm)
  * I.e. this will remove the entirety of the vma containing the specified address.
  * Keep in mind that operations like mprotect sometimes split vmas when using this function.
  */
-error munmap(const void* addr)
+error munmap_anon(const void* addr)
 {
-    u64 size;
     auto virt = reinterpret_cast<uintptr_t>(addr);
-    WITH_LOCK(sb_mgr->vma_lock(virt).for_read()){
-        auto v = sb_mgr->find_intersecting_vma(virt);
-        if(v == sb_mgr->vma_end_iterator(virt))
-            return make_error(EINVAL);
-        size = v->size();
-    }
-    return munmap(addr, size);
+    auto& vma_lock = sb_mgr->vma_lock(virt);
+    SCOPE_LOCK(vma_lock.for_write());
+    auto v = sb_mgr->find_intersecting_vma(virt);
+    if(v == sb_mgr->vma_end_iterator(virt))
+        return make_error(EINVAL);
+    evacuate(*v);
+
+    return no_error();
 }
 
 error munmap(const void *addr, size_t length)

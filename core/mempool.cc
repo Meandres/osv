@@ -1064,7 +1064,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
 
 static void mapped_free_large(void *object)
 {
-    mmu::munmap(object);
+    mmu::munmap_anon(object);
 }
 
 std::atomic<unsigned> llf_cnt{0};
