@@ -191,7 +191,8 @@ class superblock_manager {
     return 0;
     }
 
-    boost::optional<std::map<uintptr_t, u64>::iterator> prev_range(uintptr_t addr, std::map<uintptr_t, u64>& fr){
+    // Returns the iterator with the largest key less or equal than addr.
+    boost::optional<std::map<uintptr_t, u64>::iterator> leq_range(uintptr_t addr, std::map<uintptr_t, u64>& fr){
         auto it = fr.upper_bound(addr);
         if(it != fr.begin())
             return boost::make_optional(--it);
@@ -316,26 +317,32 @@ class superblock_manager {
     void allocate_range(uintptr_t addr, u64 size){
         uint8_t i = owner(addr);
         auto& my_free_ranges = workers[i].free_ranges;
+        auto opt = leq_range(addr, my_free_ranges);
 
-        auto opt = prev_range(addr, my_free_ranges);
+        // We assume that the range was free, in which case the optional will hold a value
         assert(opt.has_value());
-        auto it = opt.get();
-        assert(it->second >= size);
+        auto range = opt.get();
+        assert(range->second >= size);
 
         // We allocate the beginning of a free range
-        if(it->first == addr){
-            u64 s = it->second;
-            my_free_ranges.erase(it);
+        if(range->first == addr){
+            u64 s = range->second;
+            my_free_ranges.erase(range);
             if(s > size){
                 my_free_ranges.insert({addr + size, s - size});
             }
         // We allocate the middle or end of a free range 
         } else {
-            u64 offset = addr - it->first;
-            u64 s = it->second - offset;
-            my_free_ranges[it->first] = offset;
-            if(s > size){
-                my_free_ranges.insert({addr + offset + size, s - size});
+            u64 offset = addr - range->first;
+            u64 tail_size = range->second - offset - size;
+
+            // adjust size of preceding range
+            range->second = offset;
+
+
+            // insert new range behind newly allocated region
+            if(tail_size){
+                my_free_ranges.insert({addr + size, tail_size});
             }
             
         }
@@ -349,34 +356,27 @@ class superblock_manager {
   
     // Frees the given range by adding it to the free range map
     void free_range(uintptr_t addr, u64 size, uint8_t owner){
-        auto& my_free_ranges = workers[owner].free_ranges;
-        auto opt = prev_range(addr, my_free_ranges);
-        std::map<uintptr_t, u64>::iterator it;
+        auto& my = workers[owner];
 
+        my.free_ranges.insert({addr, size});
+        // auto opt = leq_range(addr, my.free_ranges);
+        //
+        // // Merge with preceding free range
+        // if(opt.has_value() && opt.value()->first + opt.value()->second == addr){
+        //     opt.get()->second += size;
+        // } else {
+        //     my.free_ranges.insert({addr, size});
+        // }
 
-        // Merge with preceding free range
-        if(opt.has_value() && opt.get()->first + opt.get()->second == addr){
-            it = opt.get();
-            it->second += size;
-        } else {
-            it = my_free_ranges.insert({addr, size}).first;
-        }
-
-        auto next = std::next(it);
-
-        // Merge with following free range
-        if(next != my_free_ranges.end() && next->first == addr + size){
-            it->second += next->second;
-            my_free_ranges.erase(next);
-        }
-
-        // TODO think about returning superblocks
+        // FIXME: Think about merging with the next range as well. Keep in mind that inserting an element
+        // into a map might cause another malloc, i.e. require another mmap call that will end up here.
     }
 
     // Frees the given range by adding it to the free range map. Requires the addr to be owned
-    void free_range(uintptr_t addr,u64 size){
+    void free_range(uintptr_t addr, u64 size){
         uint8_t i = owner(addr);
         assert(i < workers.size());
+        assert(workers[i].free_ranges_mutex.wowned());
         free_range(addr, size, i);
     }
 
@@ -441,7 +441,6 @@ class superblock_manager {
         return output;
 
     }
-
 };
 
 // Array of all superblocks available
@@ -1286,7 +1285,7 @@ ulong evacuate(vma& dead){
         memory::stats::on_jvm_heap_free(size);
     }
 #endif
-    WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()) {
+    WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()){
         sb_mgr->free_range(dead.start(), dead.size());
     }
     sb_mgr->erase(dead);
