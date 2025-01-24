@@ -469,7 +469,6 @@ mutex free_page_ranges_lock;
 // Updates to total should be fairly rare. We only expect updates upon boot,
 // and eventually hotplug in an hypothetical future
 static std::atomic<size_t> total_memory(0);
-static std::atomic<size_t> free_memory(0);
 static size_t watermark_lo(0);
 #if CONF_memory_jvm_balloon
 static std::atomic<size_t> current_jvm_heap_memory(0);
@@ -495,12 +494,19 @@ void wake_reclaimer()
     reclaimer_thread.wake();
 }
 
-static void on_free(size_t mem) { /* free_memory.fetch_add(mem); */ }
-static void on_alloc(size_t mem) { /* free_memory.fetch_sub(mem); */ }
 static void on_new_memory(size_t mem) { total_memory.fetch_add(mem); }
 
 namespace stats {
-    size_t free() { return free_memory.load(std::memory_order_relaxed); }
+    size_t free() {
+        if(llfree_allocator.is_ready())
+            return llfree_allocator.free_memory();
+
+        size_t ret{0};
+        for(auto& r : phys_mem_ranges) {
+            ret += r.size;
+        }
+        return ret;
+    }
     size_t total() { return total_memory.load(std::memory_order_relaxed); }
 }
 
@@ -807,6 +813,10 @@ void llf::reserve_allocated(){
     }
 }
 
+size_t llf::free_memory(){
+    return llfree_free_frames(self) * page_size;
+}
+
 void llf::add_region(void *mem_start, size_t mem_size){
     assert(!is_ready());
 
@@ -846,11 +856,9 @@ void *llf::alloc_page() {
         llflags(0)
     );
 
-    if(llfree_is_ok(page)){
-        on_alloc(page_size);
-
+    if(llfree_is_ok(page))
         return idx_to_virt(page.frame);
-    }
+
     oom();
     return nullptr;
 }
@@ -865,7 +873,6 @@ void *llf::alloc_huge_page(unsigned order){
     );
 
     if(llfree_is_ok(page)){
-        on_alloc(page_size << order);
         return idx_to_virt(page.frame);
     }
 
@@ -883,7 +890,6 @@ void *llf::alloc_page_at(size_t frame){
     );
 
     if(llfree_is_ok(page)){
-        on_alloc(page_size);
         return idx_to_virt(page.frame);
     }
 
@@ -900,10 +906,7 @@ void llf::free_page(void *addr){
         llflags(0)
     );
 
-    // TODO remove
     assert(llfree_is_ok(res));
-
-    on_free(page_size);
 }
 
 void llf::free_page(void *addr, unsigned order){
@@ -916,10 +919,7 @@ void llf::free_page(void *addr, unsigned order){
         llflags(order)
     );
 
-    // TODO remove
     assert(llfree_is_ok(res));
-
-    on_free(page_size << order);
 }
 
 void *llf::idx_to_virt(u64 idx){
@@ -936,7 +936,6 @@ u64 llf::virt_to_idx(void *addr){
 
 void add_llfree_region(void *addr, size_t size){
     on_new_memory(size);
-    on_free(size);
 
     llfree_allocator.add_region(addr, size);
 }
@@ -976,8 +975,6 @@ void *early_alloc_pages(size_t size) {
 
                 pr.size = size;
 
-                on_alloc(size);
-
                 return reinterpret_cast<void *>(&pr);
             }
         }
@@ -1014,7 +1011,6 @@ static void free_large(void* obj)
         llfree_allocator.free_page(obj, llf::order(pr->size));
     } else {
         early_free_pages(obj, pr->size);
-        on_free(pr->size);
     }
 }
 
@@ -1218,7 +1214,6 @@ static inline void untracked_free_page(void *v)
     trace_memory_page_free(v);
     if (!llfree_allocator.is_ready()) {
         early_free_pages(v, page_size);
-        on_free(page_size);
     } else {
         llfree_allocator.free_page(v);
     }

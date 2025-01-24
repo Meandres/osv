@@ -65,6 +65,9 @@ public:
 
   /// Calculate the order of memory to be allocated
   static unsigned order(size_t size);;
+
+  // returns the currently free memory in bytes
+  size_t free_memory();
 private:
   /// The actual llfree instance
   llfree_t *self{nullptr};
