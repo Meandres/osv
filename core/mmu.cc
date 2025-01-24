@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <iostream>
 #include <osv/mmu.hh>
 #include <osv/mempool.hh>
 #include "processor.hh"
@@ -192,6 +191,14 @@ class superblock_manager {
     return 0;
     }
 
+    boost::optional<std::map<uintptr_t, u64>::iterator> prev_range(uintptr_t addr, std::map<uintptr_t, u64>& fr){
+        auto it = fr.upper_bound(addr);
+        if(it != fr.begin())
+            return boost::make_optional(--it);
+        else
+            return boost::none;
+    }
+
   public:
     superblock_manager(){
       for(auto& a : superblocks){
@@ -310,10 +317,9 @@ class superblock_manager {
         uint8_t i = owner(addr);
         auto& my_free_ranges = workers[i].free_ranges;
 
-        // Get the largest iterator less or equal addr
-        auto it = my_free_ranges.upper_bound(addr);
-        assert(it != my_free_ranges.begin());
-        --it;
+        auto opt = prev_range(addr, my_free_ranges);
+        assert(opt.has_value());
+        auto it = opt.get();
         assert(it->second >= size);
 
         // We allocate the beginning of a free range
@@ -343,8 +349,28 @@ class superblock_manager {
   
     // Frees the given range by adding it to the free range map
     void free_range(uintptr_t addr, u64 size, uint8_t owner){
-        // TODO: merge with neighboring ranges
-        workers[owner].free_ranges.insert({addr, size});
+        auto& my_free_ranges = workers[owner].free_ranges;
+        auto opt = prev_range(addr, my_free_ranges);
+        std::map<uintptr_t, u64>::iterator it;
+
+
+        // Merge with preceding free range
+        if(opt.has_value() && opt.get()->first + opt.get()->second == addr){
+            it = opt.get();
+            it->second += size;
+        } else {
+            it = my_free_ranges.insert({addr, size}).first;
+        }
+
+        auto next = std::next(it);
+
+        // Merge with following free range
+        if(next != my_free_ranges.end() && next->first == addr + size){
+            it->second += next->second;
+            my_free_ranges.erase(next);
+        }
+
+        // TODO think about returning superblocks
     }
 
     // Frees the given range by adding it to the free range map. Requires the addr to be owned
