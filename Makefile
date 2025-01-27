@@ -892,6 +892,13 @@ $(out)/drivers/nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
 endif
 objects += core/cache.o
 objects += core/ymap.o
+objects += core/llfree/bitfield.o
+objects += core/llfree/llfree.o
+objects += core/llfree/child.o
+objects += core/llfree/local.o
+objects += core/llfree/lower.o
+objects += core/llfree/tree.o
+
 drivers += drivers/driver.o
 
 ifeq ($(arch),x64)

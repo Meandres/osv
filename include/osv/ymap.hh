@@ -12,6 +12,7 @@
 #include <bitset>
 #include "drivers/rdtsc.h"
 #include <osv/percpu.hh>
+#include <osv/llfree.h>
 
 typedef u64 PID;
 struct alignas(4096) Page {
@@ -27,6 +28,7 @@ constexpr uintptr_t get_mem_area_base(u64 area)
 
 extern u64 startPhysRegion;
 extern u64 sizePhysRegion;
+extern llfree_t* llfree_allocator;
 
 inline Page* phys_to_virt(u64 phys) {
    return ((Page*)get_mem_area_base(0)) + phys;
@@ -304,8 +306,8 @@ extern BundleList* emptyList;
 static u64 constexpr pageSize = 4096;
 
 void initYmaps();
-u64 ymap_getPage();
-void ymap_putPage(u64 phys);
+u64 ymap_getPage(int order);
+void ymap_putPage(u64 phys, int order);
 bool ymap_tryMap(void* virtAddr, u64 phys);
 u64 ymap_tryUnmap(void* virt);
 void ymap_unmap(void* virt);

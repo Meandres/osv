@@ -82,8 +82,8 @@ u64 envOr(const char* env, u64 value){
 int main(int argc, char** argv){
     //u64 virtSize = envOr("VIRTGB", 2ull) * 1024 * 1024 * 1024;
     //u64 physSize = envOr("PHYSGB", 2ull) * 1024 * 1024 * 1024;
-    u64 virtSize = 20 * 4096;
-    u64 physSize = 5 * 4096;
+    u64 virtSize = 4096 * 4096;
+    u64 physSize = 256 * 4096;
     u64 statDiff = 1e8;
     atomic<u64> txProgress(0);
     atomic<bool> keepRunning(true);
@@ -101,9 +101,12 @@ int main(int argc, char** argv){
         }
         keepRunning = false;
     };
-    cache = createMMIORegion(NULL, virtSize, physSize, 2);
+    cache = createMMIORegion(NULL, virtSize, physSize, 32);
     int og = 42;
-    for(int i=0; i<20; i++){
+    for(int i=0; i<512; i++){
+        if(i%32 == 0){
+            printf("i: %u\n", i);
+        }
         memcpy(cache->virtMem+i, &og, sizeof(int));
     }
     /*loadArray(cache->virtMem, virtSize/4096, n_threads);

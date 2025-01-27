@@ -44,9 +44,9 @@ struct IOtoolkit {
     Page* tempPage;
     int id;
     unvme_iod_t io_descriptors[maxQueueSize];
-    Log* write_logs;
+    /*Log* write_logs;
     u64 wlindex;
-    u64 size_log;
+    u64 size_log;*/
 
     IOtoolkit(int i){
         tempPage = (Page*) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -58,9 +58,9 @@ struct IOtoolkit {
             io_descriptors[i] = nullptr;
         }
         id = i;
-        size_log = 10000000;
-        write_logs = (Log*)malloc(sizeof(Log) * size_log);
-        wlindex = 0;
+        //size_log = 10000000;
+        //write_logs = (Log*)malloc(sizeof(Log) * size_log);
+        //wlindex = 0;
     };
 };
 
@@ -85,7 +85,7 @@ void* allocHuge(size_t size) {
    return p;
 }
 
-void print_backlog(CacheManager* cm, PID page){
+/*void print_backlog(CacheManager* cm, PID page){
     smp_crash_other_processors();
     for(sched::cpu* cpu: sched::cpus){
         bool printed = false;
@@ -110,7 +110,7 @@ void print_backlog(CacheManager* cm, PID page){
             printf("The frame is mapped to multiple pages: %lu\n", i);
         }
     }
-}
+}*/
 
 // use when lock is not free
 void yield(u64 counter) {
@@ -270,8 +270,7 @@ CacheManager::~CacheManager(){};
 void CacheManager::handleFault(PID pid, exception_frame *ef){
     trace_cache_pf();
     atomic<u64> *pteRef = walkRef(toPtr(pid));
-    //new (get_IOtoolkit().write_logs+(get_IOtoolkit().wlindex++)) Log(pid);
-    //assert(get_IOtoolkit().wlindex<get_IOtoolkit().size_log);
+    //printf("pf: %lu\n", pid);
     u64 phys;
 
     if(ef != NULL){
@@ -314,7 +313,7 @@ void CacheManager::handleFault(PID pid, exception_frame *ef){
     }
 
     // get a physical frame
-    phys =  ymap_getPage();
+    phys =  ymap_getPage(0);
     assert(ymap_tryMap(get_IOtoolkit().tempPage, phys));
     readPageAt(pid, get_IOtoolkit().tempPage);
     if(ymap_tryMap(toPtr(pid), phys)){ //thread that won the race
@@ -323,7 +322,7 @@ void CacheManager::handleFault(PID pid, exception_frame *ef){
         physUsedCount++;
         assert(residentSet.insert(pid));
     }else{
-        ymap_putPage(phys); // put back unused candidates
+        ymap_putPage(phys, 0); // put back unused candidates
     }
     ymap_unmap(get_IOtoolkit().tempPage);
     invalidateTLBEntry(get_IOtoolkit().tempPage);
@@ -332,6 +331,7 @@ exit:
     if(walk(toPtr(pid)).present == 1){
         assert(walk(toPtr(pid)).phys != 0);
     }
+    //cout << "frame " << bitset<64>(walk(toPtr(pid)).phys) << endl;
     trace_cache_pf_ret();
 }
 
@@ -446,7 +446,7 @@ void CacheManager::evict(){
         if(walk(toPtr(pid)).present == 0){ // no other thread remapped the page in the mean time
             u64 phys = ymap_tryUnmap(virtMem + pid);
             assert(phys != 0); // this evictor owns the eviction so no chance of concurrent eviction
-            ymap_putPage(phys); // send back the physical page to the pool
+            ymap_putPage(phys, 0); // send back the physical page to the pool
             // after this point the page has completely left the cache and any access will trigger 
             // a whole new allocation
             actuallyEvicted++;
@@ -545,7 +545,7 @@ void CacheManager::readPageAt(PID pid, void* virt) {
 void CacheManager::fix(PID pid){
     physUsedCount++;
     ensureFreePages();
-    u64 phys = ymap_getPage();
+    u64 phys = ymap_getPage(0);
     assert(ymap_tryMap(toPtr(pid), phys));
     readPage(pid);
     pfCount++;
