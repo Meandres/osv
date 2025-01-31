@@ -10,7 +10,7 @@
 ARG DIST_VERSION=39
 FROM fedora:${DIST_VERSION}
 
-RUN yum install -y git python3 file which
+RUN yum install -y git python3 file which libevent vim openssl1.1
 
 #
 # PREPARE ENVIRONMENT

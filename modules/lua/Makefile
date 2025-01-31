@@ -12,7 +12,8 @@ LUA_DIR=upstream/$(LUA)
 LUA_ROCKS=upstream/luarocks-3.1.1-linux-x86_64/luarocks
 
 MODULES_DIR=install/lua_modules
-LUA_ROCKS_INSTALL_MODULE := $(LUA_ROCKS) --lua-dir=$(LUA_DIR) install --no-doc --tree $(MODULES_DIR)
+LUA_ROCKS_INSTALL_MODULE := $(LUA_ROCKS) --lua-dir=$(LUA_DIR) install OPENSSL_DIR=$(OPENSSL_DIR) --no-doc --tree $(MODULES_DIR)
+
 
 LDIR=install/lua_modules/lib/lua/5.3
 CDIR=install/lua_modules/share/lua/5.3
