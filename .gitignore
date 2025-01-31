@@ -50,3 +50,9 @@ modules/dl_tests/usr.manifest
 .idea
 compile_commands.json
 downloaded_packages
+
+.cache
+modules/java-base/jni/monitor.d
+docker_build
+.clang-format
+
