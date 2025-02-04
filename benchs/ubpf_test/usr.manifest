@@ -1,2 +1,0 @@
-/ubpf_test: ${MODULE_DIR}/ubpf_test
-/ebpf_prog.o: ${MODULE_DIR}/ebpf_prog.o
