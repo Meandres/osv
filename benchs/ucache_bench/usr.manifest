@@ -1,1 +1,3 @@
-/ucache_bench: ${MODULE_DIR}/ucache_bench
+/ucache_bench_4kib: ${MODULE_DIR}/ucache_bench_4kib
+/ucache_bench_16kib: ${MODULE_DIR}/ucache_bench_16kib
+/ucache_bench_64kib: ${MODULE_DIR}/ucache_bench_64kib

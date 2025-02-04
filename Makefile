@@ -55,7 +55,7 @@ include conf/$(mode).mk
 # But also allow the user to specify a cross-compiled target architecture
 # by setting either "ARCH" or "arch" in the make command line, or the "ARCH"
 # environment variable.
-HOST_CXX := c++
+HOST_CXX := g++
 
 detect_arch = $(word 1, $(shell { echo "x64        __x86_64__";  \
                                   echo "aarch64    __aarch64__"; \
@@ -891,7 +891,7 @@ drivers += drivers/nvme.o
 $(out)/drivers/nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
 endif
 objects += core/cache.o
-objects += core/ymap.o
+objects += core/ymap.o 
 objects += core/llfree/bitfield.o
 objects += core/llfree/llfree.o
 objects += core/llfree/child.o

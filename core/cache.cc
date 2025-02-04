@@ -1,66 +1,36 @@
 #include <atomic>
 #include <algorithm>
 #include <cassert>
-#include <csignal>
-#include <exception>
-#include <fcntl.h>
 #include <functional>
 #include <iostream>
-#include <mutex>
-#include <numeric>
-#include <set>
-#include <thread>
 #include <vector>
-#include <span>
 
-#include <libaio.h>
 #include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
 
 #include <osv/mmu.hh>
 #include <osv/cache.hh>
-#include <osv/trace.hh>
 #include <smp.hh>
 
 using namespace std;
 
-TRACEPOINT(trace_cache_pf, "");
-TRACEPOINT(trace_cache_pf_ret, "");
-TRACEPOINT(trace_cache_evict, "");
-TRACEPOINT(trace_cache_evict_ret, "");
-TRACEPOINT(trace_cache_fixX, "");
-TRACEPOINT(trace_cache_fixX_ret, "");
-TRACEPOINT(trace_cache_fixS, "");
-TRACEPOINT(trace_cache_fixS_ret, "");
+uCache* uCacheManager;
 
 // contains objects necessary to do IO operations
 // a single structure is easier to do PERCPU/__thread depending
 struct IOtoolkit {
-    Page* tempPage;
+    void* tempPage;
     int id;
     unvme_iod_t io_descriptors[maxQueueSize];
-    /*Log* write_logs;
-    u64 wlindex;
-    u64 size_log;*/
 
     IOtoolkit(int i){
-        tempPage = (Page*) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        memset(tempPage, 0, pageSize);
-        madvise(tempPage, pageSize, MADV_DONTNEED);
-        std::atomic<u64> *ptePtr = walkRef(tempPage);
-        ptePtr->store(0ull);
+        tempPage = zeroInitVM(sizeHugePage);
         for(int i=0; i<maxQueueSize; i++){
             io_descriptors[i] = nullptr;
         }
         id = i;
-        //size_log = 10000000;
-        //write_logs = (Log*)malloc(sizeof(Log) * size_log);
-        //wlindex = 0;
     };
 };
 
@@ -85,41 +55,9 @@ void* allocHuge(size_t size) {
    return p;
 }
 
-/*void print_backlog(CacheManager* cm, PID page){
-    smp_crash_other_processors();
-    for(sched::cpu* cpu: sched::cpus){
-        bool printed = false;
-        IOtoolkit *iotk = *(percpu_IOtoolkit.for_cpu(cpu));
-        for(u64 i=0; i<iotk->size_log; i++){
-            if((iotk->write_logs+i)->pid == page){
-                if(!printed){
-                    cout << "core: " << cpu->id << endl;
-                    printed = true;
-                }
-                cout << (iotk->write_logs+i)->tsc << " ";
-            }
-        }
-        if(printed)
-            cout << endl;
-    }
-    u64 phys = walk(cm->toPtr(page)).phys;
-    cout << "phys: " << phys << endl;
-    assert(phys != 0);
-    for(u64 i=0; i<cm->virtCount; i++){
-        if(walk(cm->toPtr(i)).phys == phys){
-            printf("The frame is mapped to multiple pages: %lu\n", i);
-        }
-    }
-}*/
-
-// use when lock is not free
-void yield(u64 counter) {
-   _mm_pause();
-}
 ResidentPageSet::ResidentPageSet(){}
 
 void ResidentPageSet::init(u64 maxCount){
-	//count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
 	count = next_pow2(maxCount * 1.5);
 	mask = count-1;
 	clockPos = 0;
@@ -194,7 +132,7 @@ bool ResidentPageSet::remove(u64 pid) {
       }
    }
 
-template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn, CacheManager* cm, PageLists *pl) {
+template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn, PageLists *pl) {
       u64 pos, newPos;
       do {
          pos = clockPos.load();
@@ -204,12 +142,9 @@ template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn, Cac
       for (u64 i=0; i<batch; i++) {
          u64 curr = ht[pos].pid.load();
          if ((curr != tombstone) && (curr != empty))
-            fn(cm, curr, pl);
+            fn(curr, pl);
          pos = (pos + 1) & mask;
       }
-      /*if(pl->dirty != 0 || pl->rest != 0 || pl->failed_to_remove != 0){
-        printf("clearA: %u, dirty: %u, rest: %u, failed to remove: %u\n", pl->clearA, pl->dirty, pl->rest, pl->failed_to_remove);
-      }*/
    }
 
 void ResidentPageSet::print(){
@@ -220,391 +155,261 @@ void ResidentPageSet::print(){
     }
 }
 
-CacheManager::CacheManager(u64 virtSize, u64 physSize, int batch) : virtSize(virtSize), physSize(physSize), virtCount(virtSize / pageSize), physCount(physSize / pageSize), batch(batch) {
-   	residentSet.init(physCount);
-   	assert(virtSize>=physSize);
-   	u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
+uCache::uCache(u64 physSize, int batch) : totalPhysSize(physSize), batch(batch){
+    // if all pages are mapped on the 4th level of the PT
+    u64 maxPhysCount = physSize/sizeSmallPage;
+   	residentSet.init(maxPhysCount);
+    vmaTree = new VMATree();
 
-   	pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-   	for (u64 i=0; i<virtCount; i++){
-    	  pageState[i].init();
-    }
-    
    	ns = unvme_openq(sched::cpus.size(), maxQueueSize);
     initIOtoolkits();
     initYmaps();
-
-   	// Initialize virtual pages
-   	virtMem = (Page*) mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-   	madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-   	if (virtMem == MAP_FAILED){
-    	cerr << "mmap failed" << endl;
-      assert(false);
-    }
-
-    PTE pte = PTE(0ull);
-    pte.writable=1;
-    for(u64 i=0; i<virtCount; i++){
-	      memset(virtMem+i, 0, pageSize);	
-		    madvise(virtMem+i, pageSize, MADV_DONTNEED);
-		    // install zeroPages
-		    atomic<u64>* ptePtr = walkRef(virtMem+i);
-		    ptePtr->store(pte.word);
-   	}
-   	invalidateTLB();
-    for(u64 i=0; i<virtCount; i++){
-        assert(walk(virtMem+i).word == pte.word);
-    }
    
-   	physUsedCount = 0;
-   	readCount = 0;
-   	writeCount = 0;
+   	usedPhysSize = 0;
+   	readSize = 0;
+   	writeSize = 0;
     pfCount = 0;
     eviction_batch_func = default_transparent_eviction;
 
-    cout << "MMIO Region initialized at "<< virtMem <<" with virtmem size : " << virtSize/gb << " GB, physmem size : " << physSize/gb << " GB" << endl;
+    cout << "uCache initialized with " << physSize/(1024ull*1024*1024) << " GB of physical memory available" << endl;
 }
 
-CacheManager::~CacheManager(){};
+uCache::~uCache(){};
 
-void CacheManager::handleFault(PID pid, exception_frame *ef){
-    trace_cache_pf();
-    atomic<u64> *pteRef = walkRef(toPtr(pid));
-    //printf("pf: %lu\n", pid);
+void uCache::addVMA(u64 virtSize, u64 pageSize){
+    VMA* vma = new VMA(virtSize, pageSize);
+    vmaTree->addVMA(vma);
+    cout << "Added a vm_area @ " << vma->start << " of size: " << virtSize/(1024ull*1024*1024) << "GB, with pageSize: " << pageSize << endl;
+}
+
+bool uCache::handleFault(void* faultingAddr, exception_frame *ef){
+    VMA* vma = vmaTree->getVMA(faultingAddr);
+    if(vma == NULL){
+        return false;
+    }
+    void* basePage = alignPage(faultingAddr, vma->pageSize);
+    int indexFaultingPage = (int)((u64)faultingAddr - (u64)basePage)/vma->pageSize;
+    Buffer buffer(basePage, vma->pageSize);
+    if(buffer.snapshotState == BufferState::Inconsistent){
+        for(int i = 0; i<buffer.nb; i++){
+            cout << bitset<64>(buffer.snapshot[i].word) << endl;
+        }
+        crash_osv();
+        return false;
+    }
     u64 phys;
 
-    if(ef != NULL){
+    /*if(ef != NULL){
         page_fault_error_code ec = page_fault_error_code(ef->error_code);
-        if(ec.write == 1 && PTE(*pteRef).present == 1){
-            //cout << bitset<64>(PTE(*pteRef).word) << endl;
+        if(ec.write == 1 && bundle.getPresent() == bundle.nb){
             printf("write access to unwritable page\n");
             crash_osv();
         }
+    }*/
+
+    // another core already solved the fault -> early exit
+    if(buffer.at(indexFaultingPage).present==1){
+        assert(buffer.basePTE().phys != 0);
+        return true;
+    }
+    
+    if(buffer.snapshotState == BufferState::SoftUnmapped){
+    // if the basePTE is still mapped to a frame 
+    // try to handle softfault before handling hardfault
+    // tryHandleSoftFault returns true if the goal has been reached (by this thread or another)
+    // if a concurrent evictor won the race, then fall back to handling a hard fault 
+        if(buffer.tryHandlingSoftFault())
+            return true;
     }
 
-    if(PTE(*pteRef).present==1){
-        if(PTE(*pteRef).phys == 0){
-            printf("present 1 but phys 0. before softfault\n");
-            assert(false);
-        }
-        goto exit;
-    }
-    if(PTE(*pteRef).present == 0){
-        /*while(PTE(*pteRef).user == 1){
-            _mm_pause();
-        }*/
-        if(PTE(*pteRef).user == 1){
-            return; // TODO: should we spin here or simply return ?
-        }
-        if(PTE(*pteRef).phys != 0){ // soft page fault
-            trySetPresent(toPtr(pid)); // if another thread already resolved the soft fault its good too
-            goto exit;
-        }
-    }
-
-    ensureFreePages();
-
-    if(PTE(*pteRef).present==1){
-        if(PTE(*pteRef).phys == 0){
-            printf("present 1 but phys 0. after softfault\n");
-            assert(false);
-        }
-        goto exit;
+    ensureFreePages(vma->pageSize);
+    buffer.updateSnapshot();
+    
+    // another core solved the fault while we were evicting
+    if(buffer.at(indexFaultingPage).present==1){
+        // note: this condition is slightly relaxed compared to the BufferState checks
+        // the tryMapPhys function can be ongoing and we still take this path if the required page fault has been resolved
+        assert(buffer.basePTE().phys != 0);
+        return true;
     }
 
     // get a physical frame
-    phys =  ymap_getPage(0);
-    assert(ymap_tryMap(get_IOtoolkit().tempPage, phys));
-    readPageAt(pid, get_IOtoolkit().tempPage);
-    if(ymap_tryMap(toPtr(pid), phys)){ //thread that won the race
-        readCount++;
+    // computeOrder cannot fail since we check vma->pageSize at creation
+    phys = ymap_getPage(computeOrder(vma->pageSize));
+    Buffer tempBuffer(get_IOtoolkit().tempPage, vma->pageSize);
+    tempBuffer.map(phys);
+    readPageAt(basePage, get_IOtoolkit().tempPage, vma->pageSize);
+    if(buffer.tryMapPhys(phys)){ // thread that won the race
+        readSize+=vma->pageSize;
         pfCount++;
-        physUsedCount++;
-        assert(residentSet.insert(pid));
+        usedPhysSize+=vma->pageSize;
+        assert(residentSet.insert(vma->getPID(basePage)));
     }else{
-        ymap_putPage(phys, 0); // put back unused candidates
+        ymap_putPage(phys, computeOrder(vma->pageSize)); // put back unused candidates
     }
-    ymap_unmap(get_IOtoolkit().tempPage);
-    invalidateTLBEntry(get_IOtoolkit().tempPage);
-exit:
-    assert(walk(toPtr(pid)).user == 0);
-    if(walk(toPtr(pid)).present == 1){
-        assert(walk(toPtr(pid)).phys != 0);
-    }
-    //cout << "frame " << bitset<64>(walk(toPtr(pid)).phys) << endl;
-    trace_cache_pf_ret();
+    // no need to unmap since we will only R/W from it after overwriting the frame
+    tempBuffer.invalidateTLBEntries();
+    return true;
 }
 
-void default_explicit_eviction(CacheManager* cm, PID pid, PageLists* pl) {
-    PageState& ps = cm->getPageState(pid);
-    u64 v = ps.stateAndVersion;
-    switch (PageState::getState(v)) {
-        case PageState::Marked:
-            if (cm->virtMem[pid].dirty) {
-                if (ps.tryLockS(v))
-                    pl->toWrite->push_back(pid);
-            } else {
-                pl->toEvict->push_back(pid);
-            }
-            break;
-        case PageState::Unlocked:
-            ps.tryMark(v);
-            break;
-        default:
-            break; // skip
-    };
-}
-
-void default_transparent_eviction(CacheManager* cm, PID pid, PageLists* pl){
-    PTE oldPTE = walk(cm->virtMem+pid);
-    if(oldPTE.accessed == 0){ // if not accessed since it was cleared
-        if(oldPTE.present == 0){
-            if(cm->residentSet.remove(pid)){ // remove it from the RS to take "ownership" of the eviction
-                if (oldPTE.dirty == 1){
-                    if(trySetToWrite(cm->toPtr(pid), oldPTE.word)){ // if dirty soft unmap + set user
-                        pl->toWrite->push_back(pid);
-                        return;
+void default_transparent_eviction(PID pid, PageLists* pl){
+    VMA* vma = uCacheManager->vmaTree->vma;
+    Buffer buffer(uCacheManager->toPtr(pid), vma->pageSize); // TODO: this only works with a single VMA
+    if(buffer.getAccessed() == 0){ // if not accessed since it was cleared
+        //printf("not accessed\n");
+        if(buffer.snapshotState == BufferState::SoftUnmapped){
+            //printf("not present\n");
+            if(uCacheManager->residentSet.remove(pid)){ // remove it from the RS to take "ownership" of the eviction
+                //printf("removed %lu\n", pid);
+                u16 writeBitset = buffer.getDirty();
+                //std::cout << std::bitset<16>(writeBitset) << std::endl;
+                for(int i=0; i<buffer.nb; i++){
+                    u16 mask = 1 << i;
+                    if((writeBitset & mask) != 0){
+                        pl->toWrite->push_back(buffer.baseVirt+i*sizeSmallPage);
                     }
-                    assert(cm->residentSet.insert(pid));
-                    return;
-                }else{
-                    pl->toEvict->push_back(pid);
-                    return;
                 }
+                pl->toEvict->push_back(pid);
+                return;
             }else{
                 return;
             // if the removal failed just return
             }
         }else{ // present == 1
-            trySetNotPresent(cm->toPtr(pid), oldPTE.word);
+            buffer.trySoftUnmap(); // don't care if it fails
         }
     }else{ // accessed == 1
-        if(tryClearAccessed(cm->virtMem+pid, oldPTE.word)){
-        }
-        return;
-        // does not matter if it fails
+        buffer.tryClearAccessed(); // don't care if it fails
     }
 }
 
-void CacheManager::evict(){
-    trace_cache_evict();
-    vector<PID> toEvict;
-    vector<void*> toEvictAddresses;
-    vector<void*> toFlushAddresses;
+void uCache::evict(){
+    vector<PID> toEvict; // TODO: should this be a list of bundle ? we reconstruct the bundles at least twice during the execution
     toEvict.reserve(batch);
-    toEvictAddresses.reserve(batch);
-    toFlushAddresses.reserve(batch);
-    vector<PID> toWrite;
-    toWrite.reserve(batch);
+    vector<PID> aborted;
+    aborted.reserve(batch);
+    vector<void*> toWrite;
+    toWrite.reserve(batch*vmaTree->vma->pageSize);
 
     PageLists pl;
     pl.toEvict = &toEvict;
     pl.toWrite = &toWrite;
     // 0. find candidates, lock dirty ones in shared mode
-    while (toEvict.size()+toWrite.size() < batch) {
-        residentSet.iterateClockBatch(batch, eviction_batch_func, this, &pl);
+    while (toEvict.size() < batch) {
+        residentSet.iterateClockBatch(batch, eviction_batch_func, &pl);
+        //printf("size: %lu\n", toEvict.size());
     }
 
-    // pages in toEvict and toWrite are soft unmapped
+    // write single pages that are dirty.
+    assert(toWrite.size() <= maxQueueSize);
+    flush(toWrite, &aborted);
+    // toWrite now contains only the pages that have been written
     
     // checking if the page have been remapped only improve performance
     // we need to settle on which pages to flush from the TLB at some point anyway
     // since we need to batch TLB eviction
+    u64 indexAborted = 0; // toWrite were inserted in the same order as toEvict so aborted will be also
+    vector<void*> toEvictAddresses;
+    toEvictAddresses.reserve(toEvict.size() * vmaTree->vma->pageSize);
     toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
-        if(walk(toPtr(pid)).present == 1){
+        if(indexAborted < aborted.size() && aborted.at(indexAborted) == pid){
+            indexAborted++;
+            return true; // the page is already in the RS
+        }
+        Buffer buffer(vmaTree->vma->getPtr(pid), vmaTree->vma->pageSize);
+        if(buffer.snapshotState == BufferState::Mapped){
             assert(residentSet.insert(pid)); // return the page to the RS
             return true;
         }else{
-            toFlushAddresses.push_back(virtMem+pid);
+            for(int i=0; i<buffer.nb; i++){
+                //void* addr = buffer.huge ? buffer.baseVirt+i*sizeHugePage : buffer.baseVirt+i*sizeSmallPage;
+                toEvictAddresses.push_back(buffer.baseVirt+i*sizeSmallPage);
+            }
             return false;
         }
     }), toEvict.end());
-    toWrite.erase(std::remove_if(toWrite.begin(), toWrite.end(), [&](PID pid) {
-        if(walk(toPtr(pid)).present == 1){
-            assert(residentSet.insert(pid)); // return the page to the RS
-            return true;
-        }else{
-            toFlushAddresses.push_back(virtMem+pid);
-            return false;
-        }
-    }), toWrite.end()); 
+    assert(indexAborted == aborted.size()); // make sure we consume everything in aborted
 
-    if(toFlushAddresses.size() < 33){
+    if(toEvictAddresses.size() < 64){
         mmu::invlpg_tlb_all(toEvictAddresses);
     }else{
         mmu::flush_tlb_all();
     }
 
     // now all accesses will trigger a page fault 
-    
-    assert(toWrite.size() <= maxQueueSize);
-    // write dirty pages and add them to the toEvict list 
-    flush(toWrite, &toEvict);
-    
-    u64 actuallyEvicted = 0;
+     
+    u64 actuallyEvictedSize = 0;
     for(PID pid: toEvict){
-        if(walk(toPtr(pid)).present == 0){ // no other thread remapped the page in the mean time
-            u64 phys = ymap_tryUnmap(virtMem + pid);
-            assert(phys != 0); // this evictor owns the eviction so no chance of concurrent eviction
-            ymap_putPage(phys, 0); // send back the physical page to the pool
-            // after this point the page has completely left the cache and any access will trigger 
-            // a whole new allocation
-            actuallyEvicted++;
+        Buffer buffer(vmaTree->vma->getPtr(pid), vmaTree->vma->pageSize);
+        if(buffer.snapshotState == BufferState::SoftUnmapped){ // no other thread remapped the page in the mean time
+            u64 phys = buffer.tryUnmapPhys();
+            if(phys != 0){
+                // after this point the page has completely left the cache and any access will trigger 
+                // a whole new allocation
+                ymap_putPage(phys, computeOrder(vmaTree->vma->pageSize)); // send back the physical page to the pool
+                actuallyEvictedSize += vmaTree->vma->pageSize;
+            }else{
+                assert(residentSet.insert(pid));
+            }
         }else{
             assert(residentSet.insert(pid)); // return the page to the RS
         }
     }
-    physUsedCount -= actuallyEvicted;
-    /*// 2. try to lock clean page candidates
-    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
-        PageState& ps = getPageState(pid);
-        u64 v = ps.stateAndVersion;
-        return (walk(virtMem+pid).accessed == 1 || !ps.tryLockX(v)); // remove if another accessed it since last time or if it was locked
-    }), toEvict.end());
-
-
-    // 3. try to upgrade lock for dirty page candidates
-    for (auto& pid : toWrite) {
-        PageState& ps = getPageState(pid);
-        u64 v = ps.stateAndVersion;
-        if(walk(virtMem+pid).accessed == 0 && PageState::getState(v) == 1 && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-            toEvict.push_back(pid);
-        else
-            ps.unlockS(); 
-    }*/
-    
-    /*std::vector<PID> markedNotPresent;
-    for(u64& pid: toEvict){
-        if(walk(virtMem+pid).accessed == 0){
-            if(trySetNotPresent(virtMem+pid)){
-                markedNotPresent.push_back(pid);
-                toEvictAddresses.push_back(virtMem+pid);
-            }else{ // couldn't soft unmap the page
-                PageState& ps = getPageState(pid);
-                ps.unlockX();
-            }
-        }else{ // page was accessed in the mean time
-            PageState& ps = getPageState(pid);
-            ps.unlockX();
-        }
-    }
-
-    if(markedNotPresent.size() < 33){
-        mmu::invlpg_tlb_all(toEvictAddresses);
-    }else{
-        mmu::flush_tlb_all();
-    }
-    
-    for(auto& pid: toWrite){
-        PageState& ps = getPageState(pid);
-        ps.unlockS();
-    }
-
-    std::vector<PID> actuallyEvicted;
-    // 4. remove from page table
-    for (u64& pid : markedNotPresent){
-        if(walk(virtMem+pid).accessed == 0 && walk(virtMem+pid).present == 0){ // no thread re-accessed since we flushed the TLB
-            u64 phys = ymap_tryUnmap(virtMem + pid);
-            if(phys){ // this thread got to remove the phys addr
-                actuallyEvicted.push_back(pid);
-                ymap_putPage(phys);
-            }
-        }else{ // page stays in the cache so unlock it
-            PageState& ps = getPageState(pid);
-            ps.unlockX();
-        }
-    }
-
-    // 5. remove from hash table and unlock
-    for (u64& pid : actuallyEvicted) {
-        bool succ = residentSet.remove(pid);
-        assert(succ);
-        getPageState(pid).unlockXEvicted();
-        clearUser(toPtr(pid));
-    }
-
-    physUsedCount -= actuallyEvicted.size();*/
-    trace_cache_evict_ret();
+    usedPhysSize -= actuallyEvictedSize;
 }
 
-void CacheManager::ensureFreePages() {
-    if (physUsedCount >= physCount*0.95)
+void uCache::ensureFreePages(u64 additionalSize) {
+    if (usedPhysSize+additionalSize >= totalPhysSize*0.95)
         evict();
 }
 
-void CacheManager::readPage(PID pid) {
-    readPageAt(pid, toPtr(pid));
-    readCount++;
+void uCache::readPage(void* addr, u64 size) {
+    readPageAt(addr, addr, size);
+    readSize+=size;
 }
 
-void CacheManager::readPageAt(PID pid, void* virt) {
-    int ret = unvme_read(ns, get_IOtoolkit().id, virt, pid*(pageSize/blockSize), pageSize/blockSize);
+void uCache::readPageAt(void* addr, void* virt, u64 size) {
+    int ret = unvme_read(ns, get_IOtoolkit().id, virt, vmaTree->getStorageLocation(addr), size/blockSize);
     assert(ret==0);
 }
 
-void CacheManager::fix(PID pid){
-    physUsedCount++;
-    ensureFreePages();
-    u64 phys = ymap_getPage(0);
-    assert(ymap_tryMap(toPtr(pid), phys));
-    readPage(pid);
+void uCache::fix(PID pid){
+    VMA* vma = vmaTree->vma;
+    void* addr = vma->getPtr(pid);
+    Buffer buffer(addr, vma->pageSize);
+    ensureFreePages(vma->pageSize);
+    u64 phys = ymap_getPage(computeOrder(vma->pageSize));
+    assert(buffer.tryMapPhys(phys));
+    readPage(addr, vma->pageSize);
     pfCount++;
     residentSet.insert(pid);
+    usedPhysSize += vma->pageSize;
 }
 
-void CacheManager::flush(std::vector<PID> toWrite, std::vector<PID>* toEvict){
+void uCache::flush(std::vector<void*> toWrite, std::vector<PID>* aborted){
     int iod_used=0;
-    std::vector<PID> copy;
-    toWrite.erase(std::remove_if(toWrite.begin(), toWrite.end(), [&](PID pid){
-        copy.push_back(pid);
-        if(trySetClean(reinterpret_cast<void*>(virtMem+pid))){
-            get_IOtoolkit().io_descriptors[iod_used] = unvme_awrite(ns, get_IOtoolkit().id, toPtr(pid), pid*(pageSize/blockSize), pageSize/blockSize);
+    toWrite.erase(std::remove_if(toWrite.begin(), toWrite.end(), [&](void* addr){
+        if(trySetClean(addr)){
+            get_IOtoolkit().io_descriptors[iod_used] = unvme_awrite(ns, get_IOtoolkit().id, addr, vmaTree->getStorageLocation(addr), sizeSmallPage/blockSize);
             assert(get_IOtoolkit().io_descriptors[iod_used]);
             iod_used++;
-            toEvict->push_back(pid);
             return false;
         }else{
             // abort writing
-            clearUser(toPtr(pid));
-            assert(residentSet.insert(pid)); // return the page to the RS
+            u64 pid = vmaTree->vma->getPID(addr);
+            if(aborted->size() == 0 || pid != aborted->at(aborted->size()-1)){
+                assert(residentSet.insert(pid)); // return the page to the RS
+                aborted->push_back(pid);
+            }
             return true;
         }
     }), toWrite.end());
     for(int i=0; i<iod_used; i++){
-        int ret=unvme_apoll(get_IOtoolkit().io_descriptors[i], 3);
+        int ret=unvme_apoll(get_IOtoolkit().io_descriptors[i], 16);
         if(ret!=0){
             std::cout << "IO error, writing with ret " << ret << ", queue: " << get_IOtoolkit().id << ", i " << i << ", pid " << toWrite.at(i) << std::endl;
         }
         assert(ret==0);
-        clearUser(toPtr(toWrite.at(i)));
     }
-    for(PID pid: copy){
-        if(walk(toPtr(pid)).user == 1){
-            printf("Should not happen\n");
-            crash_osv();
-        }
-    }
-    writeCount += iod_used;
-}
-
-std::vector<CacheManager*> mmio_regions;
-
-CacheManager* createMMIORegion(void* start, u64 virtSize, u64 physSize, int batch){
-    assert(virtSize % pageSize == 0);
-    CacheManager* cache = new CacheManager(virtSize, physSize, batch);
-    mmio_regions.push_back(cache);
-    return cache;
-}
-
-void destroyMMIORegion(CacheManager* cache){
-    int i=0;
-    for(CacheManager* mmr: mmio_regions){
-        if(mmr == cache)
-            break;
-        i++;
-    }
-    mmio_regions.erase(mmio_regions.begin()+i);
-    free(cache->pageState);
-    free(cache->virtMem);
-    delete cache;
+    writeSize += iod_used*sizeSmallPage;
 }

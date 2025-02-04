@@ -199,6 +199,7 @@ public:
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
               fileref file, f_offset offset);
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
+void* map_anon_aligned(size_t size, size_t alignment);
 
 error munmap(const void* addr, size_t size);
 error mprotect(const void *addr, size_t size, unsigned int perm);

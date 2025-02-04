@@ -5,9 +5,11 @@
 #ifdef OSV
 #include <osv/cache.hh>
 #endif
-#ifdef MMAP
+
 // note: as mmap can evict transparently pages, this only denotes the state the buffer cache wants
 // and not what is actually in the mmap region.
+//
+// uCache can be made to enforce this state via custom eviction policy 
 struct PageState {
     std::atomic<u64> stateAndVersion;
 
@@ -52,59 +54,67 @@ struct PageState {
 
     void operator=(PageState&) = delete;
 };
-#endif
+
+struct Stats{
+   u64 readSize;
+   u64 writeSize;
+   u64 pfCount;
+};
 
 struct BufferManager {
-   #ifdef OSV
-   CacheManager *cm; 
-   #endif
-   #ifdef MMAP
    PageState* pageState;
-   #endif
    Page* mem;
    u64 size;
    std::atomic<u64> allocCount;
-   std::atomic<u64>* readCount;
-   std::atomic<u64>* writeCount;
-   std::atomic<u64>* pfCount;
-   u64* batch;
 
-   PageState& getPageState(PID pid) {
+   void getStats(Stats* stats){
       #ifdef OSV
-      return cm->getPageState(pid);
-      #endif
+      stats->readSize = uCacheManager->readSize.exchange(0);
+      stats->writeSize = uCacheManager->writeSize.exchange(0);
+      stats->pfCount = uCacheManager->pfCount.exchange(0);
+      #endif 
       #ifdef MMAP
-      return pageState[pid];
+      stats->readSize = 0;
+      stats->writeSize = 0;
+      stats->pfCount = 0;
       #endif
    }
 
-   BufferManager() {
+   void resetStats(){
       #ifdef OSV
-      cm = createMMIORegion(NULL, envOr("VIRTGB", 16)*gb, envOr("PHYSGB", 4)*gb, 64);
-      readCount = &cm->readCount;
-      writeCount = &cm->writeCount;
-      pfCount = &cm->pfCount;
-      batch = &cm->batch;
-      mem = cm->virtMem;
-      size = cm->virtSize;
+      uCacheManager->readSize.store(0);
+      uCacheManager->writeSize.store(0);
+      uCacheManager->pfCount.store(0);
+      #endif
+   }
+
+   PageState& getPageState(PID pid) {
+      return pageState[pid];
+   }
+
+   BufferManager() {
+
+      #ifdef OSV
+      createCache(envOr("PHYSGB", 4)*gb, 64);
+      uCacheManager->addVMA(envOr("VIRTGB", 16)*gb, pageSize);
+      mem = reinterpret_cast<Page*>(uCacheManager->vmaTree->vma->start);
+      size = uCacheManager->vmaTree->vma->size; // TODO: to change when multiple vmas
       #endif
       #ifdef MMAP
       if(!getenv("BLOCK")){ printf("Please specify a block device\n"); exit(0); }
       int blockfd = open(getenv("BLOCK"), O_RDWR, S_IRWXU);
       assert(blockfd != -1);
-      size = envOr("VIRTGB", 16) * 1024*1024*1024;
-      u64 virtCount = size / 4096;
+      size = envOr("VIRTGB", 16) * gb;
       u64 virtAllocSize = size + (1<<16);
       mem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, blockfd, 0);
       madvise(mem, virtAllocSize, MADV_NOHUGEPAGE);
+      #endif
+      u64 virtCount = size / pageSize;
       pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(pageState, virtCount * sizeof(PageState), MADV_HUGEPAGE);
-      readCount = new std::atomic<u64>();
-      writeCount = new std::atomic<u64>();
-      pfCount = new std::atomic<u64>();
-      batch = (u64*)malloc(sizeof(u64));
-      *batch = 64;
-      #endif
+      for(int i=0; i<virtCount; i++){
+         pageState[i].init();
+      }
       allocCount = 1; // pid 0 reserved for meta data
    }
 
@@ -115,15 +125,15 @@ struct BufferManager {
       u64 stateAndVersion = getPageState(pid).stateAndVersion;
       bool succ = getPageState(pid).tryLockX(stateAndVersion);
       assert(succ);
-      Page* newPage = mem+pid;
+      Page* newPage = offset(mem, pid);
       faultAt(pid);
       return newPage;
    }
 
    void faultAt(PID pid) {
-      Page* page = mem+pid;
+      Page* page = offset(mem, pid);
       #ifdef OSV
-      cm->handleFault(pid, NULL);
+      uCacheManager->handleFault(reinterpret_cast<void*>(page), NULL);
       #endif
       #ifdef MMAP
       page->dirty &= true; // faults the page without changing the state
@@ -134,22 +144,10 @@ struct BufferManager {
       PageState& ps = getPageState(pid);
       for (u64 repeatCounter=0; ; repeatCounter++) {
          u64 stateAndVersion = ps.stateAndVersion.load();
-         switch (PageState::getState(stateAndVersion)) {
-            #ifdef OSV
-            case PageState::Evicted: {
-               if (ps.tryLockX(stateAndVersion)) {
-                  cm->fix(pid);
-                  return mem + pid;
-               }
-               break;
-            }
-            case PageState::Marked: 
-            #endif
-            case PageState::Unlocked: {
-               if (ps.tryLockX(stateAndVersion))
-                  return mem + pid;
-               break;
-            }
+         if(PageState::getState(stateAndVersion) == PageState::Unlocked){
+            if (ps.tryLockX(stateAndVersion))
+               return offset(mem, pid);
+            break;
          }
          yield(repeatCounter);
       }
@@ -162,17 +160,9 @@ struct BufferManager {
          switch (PageState::getState(stateAndVersion)) {
             case PageState::Locked:
                break;
-            #ifdef OSV
-            case PageState::Evicted:
-               if (ps.tryLockX(stateAndVersion)) {
-                  cm->fix(pid);
-                  ps.unlockX();
-               }
-               break;
-            #endif
             default:
                if (ps.tryLockS(stateAndVersion))
-                  return mem + pid;
+                  return offset(mem, pid);
          }
          yield(repeatCounter);
       }
@@ -186,29 +176,14 @@ struct BufferManager {
       getPageState(pid).unlockX();
    }
 
-   bool isValidPtr(void* page) {
-      #ifdef OSV
-      return cm->isValidPtr(reinterpret_cast<uintptr_t>(page)); 
-      #endif
-      #ifdef MMAP
+   /*bool isValidPtr(void* page) {
       return (void*)mem <= page && (void*)mem + size > page; 
-      #endif
-   }
+   }*/
    PID toPID(void* page) { 
-      #ifdef OSV
-      return cm->toPID(page); 
-      #endif
-      #ifdef MMAP
-      return reinterpret_cast<Page*>(page) - mem;
-      #endif
+      return divise(mem, (Page*)page);
    }
    Page* toPtr(PID pid) { 
-      #ifdef OSV
-      return cm->toPtr(pid); 
-      #endif
-      #ifdef MMAP
-      return mem+pid;
-      #endif
+      return offset(mem, pid);
    }
 };
 #endif

@@ -14,13 +14,6 @@
 #include <osv/percpu.hh>
 #include <osv/llfree.h>
 
-typedef u64 PID;
-struct alignas(4096) Page {
-	bool dirty;
-};
-
-const bool debugTime = false;
-
 constexpr uintptr_t get_mem_area_base(u64 area)
 {
     return 0x400000000000 | uintptr_t(area) << 44;
@@ -30,9 +23,9 @@ extern u64 startPhysRegion;
 extern u64 sizePhysRegion;
 extern llfree_t* llfree_allocator;
 
-inline Page* phys_to_virt(u64 phys) {
-   return ((Page*)get_mem_area_base(0)) + phys;
-}
+static const u64 sizeSmallPage = 4096;
+static const u64 sizeHugePage = 2 * 1024 * 1024;
+static const u64 maxPageSize = sizeHugePage;
 
 constexpr int page_size_shift = 12; // log2(page_size)
 constexpr uint8_t rsvd_bits_used = 1;
@@ -65,16 +58,6 @@ inline void write_cr4(ulong r) {
 inline void invalidateTLB() {
    write_cr3(read_cr3());
 }
-
-inline void __invpcid(unsigned pcid, void* addr, unsigned type) {
-   struct { u64 d; void* p; } desc = { pcid, addr };
-   asm volatile("invpcid %[desc], %[type]" :: [desc] "m" (desc), [type] "r" (type) : "memory");
-}
-
-inline void invpcidFlushOne(unsigned pcid, void* addr) { __invpcid(pcid, addr, 0); }
-inline void invpcidFlushContext(unsigned pcid) { __invpcid(pcid, 0, 1); }
-inline void invpcidFlushAll() { __invpcid(0, 0, 2); }
-inline void invpcidFlushAllNonGlobal() { __invpcid(0, 0, 3); }
 
 constexpr uint64_t pte_addr_mask(bool large = false) {
     return ((1ull << max_phys_bits) - 1) & ~(0xfffull) & ~(uint64_t(large) << page_size_shift);
@@ -111,6 +94,19 @@ inline u64* ptepToPtr(u64 ptep) {
    return (u64*) (get_mem_area_base(0) | (ptep & pte_addr_mask(false)));
 }
 
+inline u64* getPTERef(void* virt) {
+   u64 ptr = (u64)virt;
+   u64 i0 = (ptr>>(12+9+9+9)) & 511;
+   u64 i1 = (ptr>>(12+9+9)) & 511;
+   u64 i2 = (ptr>>(12+9)) & 511;
+   u64 i3 = (ptr>>(12)) & 511;
+
+   u64 l0 = ptepToPtr(ptRoot)[i0];
+   u64 l1 = ptepToPtr(l0)[i1];
+   u64 l2 = ptepToPtr(l1)[i2];
+   return reinterpret_cast<u64*>(&ptepToPtr(l2)[i3]);
+}
+
 inline std::atomic<u64>* walkRef(void* virt) {
    u64 ptr = (u64)virt;
    u64 i0 = (ptr>>(12+9+9+9)) & 511;
@@ -133,7 +129,7 @@ inline u64* ptepToPtrHuge(u64 ptep) {
    return (u64*) (get_mem_area_base(0) | (ptep & pte_addr_mask(true)));
 }
 
-inline u64* walkRefHuge(void* virt) {
+inline std::atomic<u64>* walkRefHuge(void* virt) {
    u64 ptr = (u64)virt;
    u64 i0 = (ptr>>(12+9+9+9)) & 511;
    u64 i1 = (ptr>>(12+9+9)) & 511;
@@ -141,32 +137,13 @@ inline u64* walkRefHuge(void* virt) {
 
    u64 l0 = ptepToPtr(ptRoot)[i0];
    u64 l1 = ptepToPtr(l0)[i1];
-   return &ptepToPtr(l1)[i2];
+   return reinterpret_cast<std::atomic<u64>*>(&ptepToPtr(l1)[i2]);
 }
 
 inline PTE walkHuge(void* virt) {
-   PTE pte = *walkRefHuge(virt);
+   PTE pte = PTE(*walkRefHuge(virt));
    assert(pte.huge_page_null == 1);
    return pte;
-}
-
-inline bool trySetPresent(void* addr){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   u64 oldWord = PTE(*pteRef).word;
-   PTE newPTE = PTE(oldWord);
-   if(newPTE.present == 1){
-      return false;
-   }
-   newPTE.present = 1;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
-}
-
-inline bool trySetNotPresent(void* addr, u64 oldWord){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   PTE newPTE = PTE(oldWord);
-   assert(newPTE.present == 1);
-   newPTE.present = 0;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
 }
 
 inline bool trySetClean(void* addr){
@@ -180,136 +157,92 @@ inline bool trySetClean(void* addr){
    return pteRef->compare_exchange_strong(oldWord, newPTE.word);
 }
 
-inline bool tryClearAccessed(void* addr, u64 oldWord){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   PTE newPTE = PTE(oldWord);
-   assert(newPTE.accessed == 1);
-   newPTE.accessed = 0;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
-}
-
-inline bool trySetReadOnly(void* addr){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   u64 oldWord = PTE(*pteRef).word;
-   PTE newPTE = PTE(oldWord);
-   if(newPTE.writable == 0){
-      return false;
-   }
-   newPTE.writable = 0;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
-}
-
-inline bool trySetWritable(void* addr){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   u64 oldWord = PTE(*pteRef).word;
-   PTE newPTE = PTE(oldWord);
-   if(newPTE.writable == 1){
-      return true;
-   }
-   newPTE.writable = 1;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
-}
-
-inline bool trySetToWrite(void* addr, u64 oldWord){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   PTE newPTE = PTE(oldWord);
-   newPTE.user = 1;
-   return pteRef->compare_exchange_strong(oldWord, newPTE.word);
-}
-
-inline void clearUser(void* addr){
-   std::atomic<u64>* pteRef = walkRef(addr);
-   PTE newPTE = PTE(*pteRef);
-   newPTE.user = 0;
-   pteRef->store(newPTE.word);
-}
-
-struct PageBundle{
-   int index; // index of the first available page
-              // 0 is full, 512 is empty
-   u64 pages[512];
-
-   PageBundle(){
-      index=512;
-   }
-
-   void insert(u64 phys){
-      assert(index>0);
-      index--;
-      pages[index] = phys;
-   }
-
-   u64 retrieve(){
-      assert(index<512);
-      u64 phys = pages[index];
-      index++;
-      return phys;
-   }
+/* Possible transitions
+ * Mapped -> SoftUnmapped (with trySoftUnmap()) races with itself
+ * SoftUnmapped -> Mapped (with tryHandlingSoftFault()) races with itself and SU->HU
+ * SoftUnmapped -> HardUnmapped (with tryUnmapPhys()) races with itself and SU->M
+ * HardUnmapped -> Mapped (with tryMapPhys()) races with itself
+ */
+enum BufferState{
+   Mapped, // phys != 0 and present == 1
+   SoftUnmapped, // phys != 0 and present == 0
+   //CandidateEviction, // same as softunmapped + removed from resident set
+   //Clean, // same as candidateeviction + synchronized with storage
+   HardUnmapped, // phys == 0 and present == 0
+   Inconsistent, // fail
+   TBD // just something to work with
 };
 
-struct BundleList {
-   PageBundle** list;
-   u64 list_size;
-   std::atomic<u64> consume_index __attribute__ ((aligned (8)));
-   std::atomic<u64> produce_index __attribute__ ((aligned (8)));
+struct Buffer{
+   std::atomic<u64>* pteRefs[16]; 
+   PTE snapshot[16];
+   BufferState snapshotState;
+   void* baseVirt;
+   int nb; // max 16 for 64KiB max size (+ 2MiB)
+   // overhead (max for buffer size == sizeSmallPage) => 8+8+4+8+4 = 32B = 0.78%
 
-   BundleList(u64 nbEle){
-      list_size = nbEle;
-      list = (PageBundle**)malloc(nbEle * sizeof(PageBundle*));
-      for(u64 i=0; i<nbEle; i++){
-         list[i] = nullptr;
+   Buffer(void* addr, u64 size);
+   ~Buffer(){}
+
+   PTE at(int index) { return snapshot[index]; }
+
+   PTE basePTE(){
+      return snapshot[0];
+   }
+
+   void updateSnapshot(){
+      snapshotState = BufferState::TBD;
+      for(int i = 0; i < nb; i++){
+         snapshot[i] = PTE(*pteRefs[i]);
+         if(snapshotState == BufferState::Inconsistent){
+            continue; // skip since we already reached an inconsistent state
+         }
+         if(snapshot[i].phys != 0){
+            if(snapshot[i].present == 1){ // phys != 0 && present == 1
+               if(snapshotState == BufferState::Mapped || snapshotState == BufferState::TBD)
+                  snapshotState = BufferState::Mapped;
+               else
+                  snapshotState = BufferState::Inconsistent; 
+            }else{ // phys != 0 && present == 0
+               if(snapshotState == BufferState::SoftUnmapped || snapshotState == BufferState::TBD)
+                  snapshotState = BufferState::SoftUnmapped;
+               else
+                  if(snapshotState != BufferState::HardUnmapped){ // phys != 0 && present == 0 is inconsistent only for the first page
+                             // since we only remove the frame address for the first page
+                     snapshotState = BufferState::Inconsistent;
+                  }
+            }
+         }else{
+            if(snapshot[i].present == 0){ // phys == 0 && present == 0
+               if(snapshotState == BufferState::HardUnmapped || snapshotState == BufferState::TBD)
+                  snapshotState = BufferState::HardUnmapped;
+               else
+                  snapshotState = BufferState::Inconsistent;
+            }else // phys == 0 && present == 1
+               snapshotState = BufferState::Inconsistent;
+         }
       }
-      consume_index.store(0);
-      produce_index.store(0);
    }
 
-   bool correct_indexes(u64 newIndex1, u64 index2){
-      if(newIndex1 == index2)
-         return false;
-      return true;
-   }
+   void tryClearAccessed();
 
-   void put(PageBundle* bundle){
-      u64 oldIndex, newIndex;
-      do{
-         retry:
-         oldIndex = produce_index.load();
-         newIndex = (oldIndex+1)%list_size;;
-         if(!correct_indexes(newIndex, consume_index.load())){
-            goto retry;
-         }
-      }while(!produce_index.compare_exchange_strong(oldIndex, newIndex));
-      assert(list[oldIndex] == nullptr);
-      list[oldIndex] = bundle;
-   }
+   bool tryHandlingSoftFault();
+   bool trySoftUnmap();
 
-   PageBundle* get(){
-      u64 oldIndex, newIndex;
-      do{
-         retry:
-         oldIndex = consume_index.load();
-         newIndex = (oldIndex+1)%list_size;
-         if(!correct_indexes(newIndex, produce_index.load())){
-            goto retry;
-         }
-      }while(!consume_index.compare_exchange_strong(oldIndex, newIndex));
-      PageBundle* res = list[oldIndex];
-      list[oldIndex] = nullptr;
-      return res;
-   }
+   bool tryMapPhys(u64 phys);
+   u64 tryUnmapPhys();
+
+   int getPresent();
+   int getAccessed();
+   u16 getDirty();
+
+   // for non-concurrent scenarios
+   void map(u64 phys);
+   void invalidateTLBEntries();
 
 };
-
-extern BundleList* fullList;
-extern BundleList* emptyList;
-
-static u64 constexpr pageSize = 4096;
 
 void initYmaps();
 u64 ymap_getPage(int order);
 void ymap_putPage(u64 phys, int order);
-bool ymap_tryMap(void* virtAddr, u64 phys);
-u64 ymap_tryUnmap(void* virt);
-void ymap_unmap(void* virt);
-
 #endif

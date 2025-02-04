@@ -1055,6 +1055,44 @@ uintptr_t find_hole(uintptr_t start, uintptr_t size)
     throw make_error(ENOMEM);
 }
 
+uintptr_t find_hole_aligned(uintptr_t start, uintptr_t size, size_t alignment)
+{
+    bool small = size < huge_page_size;
+    uintptr_t good_enough = 0;
+
+    SCOPE_LOCK(vma_range_set_mutex.for_read());
+    //Find first vma range which starts before the start parameter or is the 1st one
+    auto p = std::lower_bound(vma_range_set.begin(), vma_range_set.end(), start, vma_range_addr_compare());
+    if (p != vma_range_set.begin()) {
+        --p;
+    }
+    auto n = std::next(p);
+    while (n->start() <= upper_vma_limit) { //we only go up to the upper mmap vma limit
+        //See if desired hole fits between p and n vmas
+        if (start >= p->end() && start + size <= n->start()) {
+            return start;
+        }
+        //See if shifting start to the end of p makes desired hole fit between p and n
+        if (p->end() >= start && n->start() - p->end() >= size) {
+            good_enough = p->end();
+            if (small) {
+                return good_enough;
+            }
+            //See if huge hole fits between p and n
+            if (n->start() - align_up(good_enough, alignment) >= size) {
+                return align_up(good_enough, alignment);
+            }
+        }
+        //If nothing worked move next in the list
+        p = n;
+        ++n;
+    }
+    if (good_enough) {
+        return good_enough;
+    }
+    throw make_error(ENOMEM);
+}
+
 ulong evacuate(uintptr_t start, uintptr_t end)
 {
     auto range = find_intersecting_vmas(addr_range(start, end));
@@ -1221,6 +1259,20 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     return start;
 }
 
+uintptr_t allocate_aligned(vma *v, size_t size, size_t alignment)
+{
+    uintptr_t start = 0x200000000000ul;
+    start = find_hole_aligned(start, size, alignment);
+    v->set(start, start+size);
+
+    vma_list.insert(*v);
+    WITH_LOCK(vma_range_set_mutex.for_write()) {
+        vma_range_set.insert(vma_range(v));
+    }
+
+    return start;
+}
+
 inline bool in_vma_range(void* addr)
 {
     return reinterpret_cast<long>(addr) >= 0;
@@ -1328,6 +1380,18 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
     if (flags & mmap_populate) {
         populate_vma(vma, v, size);
     }
+    return v;
+}
+
+void* map_anon_aligned(size_t size, size_t alignment)
+{
+    unsigned perm = perm_rw;
+    size = align_up(size, alignment);
+    uintptr_t start = 0;
+    auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, 0);
+    PREVENT_STACK_PAGE_FAULT
+    SCOPE_LOCK(vma_list_mutex.for_write());
+    auto v = (void*) allocate_aligned(vma, size, alignment);
     return v;
 }
 

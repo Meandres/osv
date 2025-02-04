@@ -73,26 +73,8 @@ struct GuardO {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          u64 v = ps.stateAndVersion.load();
          switch (PageState::getState(v)) {
-            #ifdef OSV
-            case PageState::Marked: {
-               u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-               if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                  version = newV;
-                  return;
-               }
-               break;
-            }
-            #endif
             case PageState::Locked:
                break;
-            #ifdef OSV
-            case PageState::Evicted:
-               //if (ps.tryLockX(v)) {
-               bm.faultAt(pid);
-                  /*bm.unfixX(pid);
-               }*/
-               break;
-            #endif
             default:
                version = v;
                return;
@@ -129,11 +111,6 @@ struct GuardO {
             u64 state = PageState::getState(stateAndVersion);
             if (state <= PageState::MaxShared)
                return; // ignore shared locks
-         #ifdef OSV
-            if (state == PageState::Marked)
-               if (ps.stateAndVersion.compare_exchange_weak(stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
-                  return; // mark cleared
-         #endif
          }
          if (std::uncaught_exceptions()==0)
             throw OLCRestartException();
@@ -169,7 +146,6 @@ struct GuardX {
    // constructor
    explicit GuardX(u64 pid) : pid(pid) {
       ptr = reinterpret_cast<T*>(bm.fixX(pid));
-      //ptr->dirty = true;
    }
 
    explicit GuardX(GuardO<T>&& other) {
@@ -180,16 +156,10 @@ struct GuardX {
          if ((stateAndVersion<<8) != (other.version<<8))
             throw OLCRestartException();
          u64 state = PageState::getState(stateAndVersion);
-         #ifdef OSV
-         if ((state == PageState::Unlocked) || (state == PageState::Marked)) {
-         #endif
-         #ifdef MMAP
          if (state == PageState::Unlocked) {
-         #endif
             if (ps.tryLockX(stateAndVersion)) {
                pid = other.pid;
                ptr = other.ptr;
-               //ptr->dirty = true;
                other.pid = moved;
                other.ptr = nullptr;
                return;
@@ -1240,7 +1210,6 @@ int main(int argc, char** argv) {
    #endif
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
-   bool with_guard = envOr("GUARD", 1);
 
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
@@ -1248,15 +1217,14 @@ int main(int argc, char** argv) {
    auto systemName = "osv";
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,page_fault_nb,system,threads,datasize,workload,batch" << endl;
+      cout << "ts,tx,rmb,wmb,page_fault_nb,system,threads,datasize,workload" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
-         float rmb = (bm.readCount->exchange(0)*pageSize)/(1024.0*1024);
-         float wmb = (bm.writeCount->exchange(0)*pageSize)/(1024.0*1024);
-         u64 pfNb = bm.pfCount->exchange(0);
+         Stats stats;
+         bm.getStats(&stats);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << pfNb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << *(bm.batch) << endl;
+         cout << cnt++ << "," << prog << "," << stats.readSize/(0.0+mb) << "," << stats.writeSize/(0.0+mb) << "," << stats.pfCount << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << endl;
       }  
       keepRunning = false;
    };
@@ -1272,6 +1240,8 @@ int main(int argc, char** argv) {
             workerThreadId = worker;
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
+               /*if(i%1000000 == 0)
+                  printf("i: %lu\n", i);*/
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
                rte_memcpy(payload.data(), k1, sizeof(u64));
@@ -1281,9 +1251,7 @@ int main(int argc, char** argv) {
       }
       cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)gb << " GB " << endl;
 
-      bm.readCount->store(0);
-      bm.writeCount->store(0);
-      bm.pfCount->store(0);
+      bm.resetStats();
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
@@ -1296,22 +1264,9 @@ int main(int argc, char** argv) {
 
             array<u8, 120> payload;
             bool succ;
-            #ifdef OSV
-            if(with_guard){
-               succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-                  rte_memcpy(payload.data(), p.data(), p.size());
-               });
-            }else{
-               succ = bt.lookup_wg({k1, sizeof(u64)}, [&](span<u8> p) {
-                  rte_memcpy(payload.data(), p.data(), p.size());
-               });
-            }
-            #endif
-            #ifdef MMAP
             succ = bt.lookup_wg({k1, sizeof(u64)}, [&](span<u8> p) {
                rte_memcpy(payload.data(), p.data(), p.size());
             });
-            #endif
             assert(succ);
             assert(rte_memcmp(k1, payload.data(), sizeof(u64))==0);
 
@@ -1365,8 +1320,7 @@ int main(int argc, char** argv) {
    }
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)gb << " GB " << endl;
 
-   bm.readCount->store(0);
-   bm.writeCount->store(0);
+   bm.resetStats();
    thread statThread(statFn);
 
     parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {

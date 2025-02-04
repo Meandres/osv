@@ -69,5 +69,7 @@ benchs/vmcache/vmcache_transparent
 benchs/io_test/io_test
 benchs/omp_test/omp_test
 benchs/nvme_test/ioengine_unvme
-benchs/ucache_bench/ucache_bench
+benchs/ucache_bench/ucache_bench_4kib
+benchs/ucache_bench/ucache_bench_16kib
+benchs/ucache_bench/ucache_bench_64kib
 benchs/ucache_bench/mmap_ucache_bench
