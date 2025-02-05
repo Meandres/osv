@@ -1544,6 +1544,16 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
     return total;
 }
 
+size_t vma_size(const void* addr){
+    auto start = reinterpret_cast<uintptr_t>(addr);
+    WITH_LOCK(sb_mgr->vma_lock(start).for_read()){
+        auto v = sb_mgr->find_intersecting_vma(start);
+        assert(v != sb_mgr->vma_end_iterator(start));
+        return v->size();
+    }
+    return 0;
+}
+
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
 {
   bool search = !(flags & mmap_fixed);
@@ -2293,7 +2303,7 @@ error mprotect(const void *addr, size_t len, unsigned perm)
  * I.e. this will remove the entirety of the vma containing the specified address.
  * Keep in mind that operations like mprotect sometimes split vmas when using this function.
  */
-error munmap_anon(const void* addr)
+error munmap_vma(const void* addr)
 {
     auto virt = reinterpret_cast<uintptr_t>(addr);
     auto& vma_lock = sb_mgr->vma_lock(virt);

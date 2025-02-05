@@ -1064,7 +1064,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
 
 static void mapped_free_large(void *object)
 {
-    mmu::munmap_anon(object);
+    mmu::munmap_vma(object);
 }
 
 std::atomic<unsigned> llf_cnt{0};
@@ -1323,9 +1323,7 @@ void* calloc(size_t nmemb, size_t size)
 static size_t object_size(void *object)
 {
     if (!mmu::is_linear_mapped(object, 0)) {
-        size_t offset = memory::large_object_offset(object);
-        size_t* ret_header = static_cast<size_t*>(object);
-        return *ret_header - offset;
+        return mmu::vma_size(object);
     }
 
     switch (mmu::get_mem_area(object)) {
