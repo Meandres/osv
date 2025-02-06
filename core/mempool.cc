@@ -1545,6 +1545,12 @@ size_t malloc_usable_size(void* obj)
     return object_size(obj);
 }
 
+// We dont have a heap
+OSV_LIBC_API
+int malloc_trim(size_t pad){
+  return 0;
+}
+
 // posix_memalign() and C11's aligned_alloc() return an aligned memory block
 // that can be freed with an ordinary free().
 
