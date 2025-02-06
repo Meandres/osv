@@ -139,7 +139,6 @@ int main(int loader_argc, char **loader_argv)
 {
     smp_initial_find_current_cpu()->init_on_cpu();
     void main_cont(int loader_argc, char** loader_argv);
-    memory::activate_paging();
     sched::init([=] { main_cont(loader_argc, loader_argv); });
 }
 
@@ -783,6 +782,8 @@ void main_cont(int loader_argc, char** loader_argv)
         printf("Too many cpus, can't boot with greater than %u cpus.\n", sched::max_cpus);
         poweroff();
     }
+
+    memory::activate_paging();
 
 #if CONF_tracepoints
     if (opt_list_tracepoints) {

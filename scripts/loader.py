@@ -329,14 +329,6 @@ class osv(gdb.Command):
         gdb.Command.__init__(self, 'osv',
                              gdb.COMMAND_USER, gdb.COMPLETE_COMMAND, True)
 
-class osv_heap(gdb.Command):
-    def __init__(self):
-        gdb.Command.__init__(self, 'osv heap',
-                             gdb.COMMAND_USER, gdb.COMPLETE_NONE)
-    def invoke(self, arg, from_tty):
-        for page_range in free_page_ranges():
-            print('%s 0x%016x' % (page_range, page_range['size']))
-
 class osv_memory(gdb.Command):
     def __init__(self):
         gdb.Command.__init__(self, 'osv memory',
