@@ -1022,11 +1022,11 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // Use mapped memory is possible
-    if(!contiguous && (!use_linear_map || size > llf_max_size)){
+    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size))){
         ret = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
         trace_memory_malloc_large(ret, size, size, page_size);
         return ret;
-    } else if (size > llf_max_size){
+    } else if (llfree_allocator.is_ready() && size > llf_max_size){
         printf("[ERROR]: physically contiguous allocations above 0x%lxB are not possible\n", llf_max_size);
         abort();
     }
@@ -1239,7 +1239,7 @@ void free_page(void* v)
 void* alloc_huge_page(size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      return early_alloc_pages(N / page_size);
+      return early_alloc_pages(N);
   }
   return llfree_allocator.alloc_huge_page(llf::order(N));
 }
@@ -1247,7 +1247,7 @@ void* alloc_huge_page(size_t N)
 void free_huge_page(void* v, size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      early_free_pages(v, N / page_size);
+      early_free_pages(v, N);
   } else {
       llfree_allocator.free_page(v, llf::order(N));
   }
