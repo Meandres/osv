@@ -296,9 +296,12 @@ static inline void untracked_free_page(void *v);
 
 void pool::add_page()
 {
-    // FIXME: this function allocated a page and set it up but on rare cases
-    // we may add this page to the free list of a different cpu, due to the
-    // enablement of preemption
+    // FIXME: This allocates a map from the linear mapping
+    // Changing this breaks mmu's superblock_manager::free_range if
+    //   * The free range can be merged with the next one and
+    //   * The pool in which the node of the following range was allocated gets freed frees the page and
+    //   * The page was allocated by the same core that calld free range in the beginning
+    //   As this would then causes a recursive call into free_range. Is is therefore kept unmapped for now
     void* page = untracked_alloc_page();
 
 #if CONF_lazy_stack_invariant
