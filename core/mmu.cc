@@ -1454,23 +1454,15 @@ public:
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
     if (search) {
-        // search for unallocated hole around start
-        if (!start) {
-            start = 0x200000000000ul;
-        }
         start = sb_mgr->reserve_range(size);
     } else {
         // we don't know if the given range is free, need to evacuate it first
-        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-            evacuate(start, start+size);
-        }
-        sb_mgr->allocate_range(start, size);
+        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ evacuate(start, start+size); }
+        WITH_LOCK(sb_mgr->free_ranges_lock(start).for_write()){ sb_mgr->allocate_range(start, size); }
     }
     v->set(start, start+size);
 
-    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-        sb_mgr->insert(v);
-    }
+    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ sb_mgr->insert(v); }
 
     return start;
 }
