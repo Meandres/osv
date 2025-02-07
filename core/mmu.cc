@@ -181,10 +181,10 @@ class superblock_manager {
                         // Someone else was faster, we have to start over
                         release_superblocks(i-n, j-i-n);
                         return allocate_superblocks(n);
-                    } else break;
+                    };
                 }
                 return i-n+1;
-                }
+            }
 
         }
 
@@ -410,28 +410,34 @@ class superblock_manager {
     // This function is threadsafe and already allocates the memory
     // from free_ranges
     uintptr_t reserve_range(u64 size){
+        assert(size > 0);
+
         uint8_t cpuid = cpu_id();
         auto &my = workers[cpuid];
 
-        SCOPE_LOCK(my.free_ranges_mutex.for_write());
-
         // Try to find a large enough free range (first fit).
-        for(auto& r : my.free_ranges){
-            if(r.second > size){
-                r.second -= size;
-                return r.first + r.second;
-            } else if (r.second == size){
-                uintptr_t res = r.first;
-                my.free_ranges.erase(r.first);
-                return res;
+        if(size <= superblock_size){
+            WITH_LOCK(my.free_ranges_mutex.for_write()){
+                for(auto& r : my.free_ranges){
+                    if(r.second > size){
+                        r.second -= size;
+                        return r.first + r.second;
+                    } else if (r.second == size){
+                        uintptr_t res = r.first;
+                        my.free_ranges.erase(r.first);
+                        return res;
+                    }
+                }
             }
         }
 
         // There is no fitting free range we can draw from, so we need to get a new superblock
-        u64 s = allocate_superblocks(1);
-        uintptr_t ret = superblock_ptr(s);
-        free_range(ret+size, superblock_size - size, cpuid);
-        return ret;
+        unsigned n = (size-1) / superblock_size + 1;
+        unsigned remainder = (n*superblock_size) - size;
+        u64 s = allocate_superblocks(n);
+        uintptr_t ptr = superblock_ptr(s);
+        WITH_LOCK(my.free_ranges_mutex.for_write()){ free_range(ptr, remainder, cpuid); }
+        return ptr + remainder;
     }
 
     u64 all_vmas_size(){
