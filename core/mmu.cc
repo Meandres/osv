@@ -166,29 +166,32 @@ class superblock_manager {
     }
 
     u64 allocate_superblocks(unsigned n){
-    // Indicator a virtual memory segment is free
-    uint8_t free_idx{255};
+        assert(n > 0);
+        // Indicator a virtual memory segment is free
+        uint8_t free_idx{255};
 
-    unsigned k{0};
-    for(unsigned i{0}; i < superblock_len; ++i){
-        if(superblocks[i].load() != free_idx) k = 0;
-        else if(++k == n) {
-            // We found n free segments in a row. Now lets see if we can reserve them before someone else does
-            for(unsigned j{i-n+1}; j <= i; ++j){
-                if(!superblocks[j].compare_exchange_weak(free_idx, cpu_id(), std::memory_order_acq_rel)){
-                    // Someone else was faster, we have to start over
-                    release_superblocks(i-n, j-i-n);
-                    return allocate_superblocks(n);
-                } else break;
-            }
-            return i-n+1;
-            }
+        unsigned k{0};
+        for(unsigned i{0}; i < superblock_len; ++i){
+            if(superblocks[i].load() != free_idx) {
+              k = 0;
+            } else if(++k == n) {
+                // We found n free segments in a row. Now lets see if we can reserve them before someone else does
+                for(unsigned j{i-n+1}; j <= i; ++j){
+                    if(!superblocks[j].compare_exchange_weak(free_idx, cpu_id(), std::memory_order_acq_rel)){
+                        // Someone else was faster, we have to start over
+                        release_superblocks(i-n, j-i-n);
+                        return allocate_superblocks(n);
+                    } else break;
+                }
+                return i-n+1;
+                }
 
         }
 
-    // TODO This error isn't thrown correctly
-    throw make_error(ENOMEM);
-    return 0;
+        printf("couldn't allocate superblock\n");
+        // TODO This error isn't thrown correctly
+        throw make_error(ENOMEM);
+        return 0;
     }
 
     // Returns the iterator with the largest key less or equal than addr.
@@ -356,20 +359,43 @@ class superblock_manager {
   
     // Frees the given range by adding it to the free range map
     void free_range(uintptr_t addr, u64 size, uint8_t owner){
+        if(size == 0) return;
+
         auto& my = workers[owner];
 
-        my.free_ranges.insert({addr, size});
-        // auto opt = leq_range(addr, my.free_ranges);
-        //
-        // // Merge with preceding free range
-        // if(opt.has_value() && opt.value()->first + opt.value()->second == addr){
-        //     opt.get()->second += size;
-        // } else {
-        //     my.free_ranges.insert({addr, size});
-        // }
+        // Get the previous range if there is one
+        auto opt = leq_range(addr, my.free_ranges);
 
-        // FIXME: Think about merging with the next range as well. Keep in mind that inserting an element
-        // into a map might cause another malloc, i.e. require another mmap call that will end up here.
+        bool inplace{false};
+
+        if(opt.has_value()) {
+            auto prev = opt.get();
+
+            assert(prev->first + prev->second <= addr);
+
+            // Check if we can merge them
+            if(prev->first + prev->second == addr) {
+                prev->second += size;
+                addr = prev->first;
+                size = prev->second;
+                inplace = true;
+            }
+        }
+
+        // Get the next range
+        auto next = my.free_ranges.upper_bound(addr);
+
+        // We cannot merge with next element
+        if(next == my.free_ranges.end() || next->first != addr + size){
+            if(!inplace)
+                my.free_ranges.insert({addr, size});
+            return;
+        }
+
+        // We can merge with next range
+        size += next->second;
+        my.free_ranges.erase(next);
+        my.free_ranges.insert({addr, size});
     }
 
     // Frees the given range by adding it to the free range map. Requires the addr to be owned
@@ -1428,23 +1454,15 @@ public:
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
     if (search) {
-        // search for unallocated hole around start
-        if (!start) {
-            start = 0x200000000000ul;
-        }
         start = sb_mgr->reserve_range(size);
     } else {
         // we don't know if the given range is free, need to evacuate it first
-        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-            evacuate(start, start+size);
-        }
-        sb_mgr->allocate_range(start, size);
+        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ evacuate(start, start+size); }
+        WITH_LOCK(sb_mgr->free_ranges_lock(start).for_write()){ sb_mgr->allocate_range(start, size); }
     }
     v->set(start, start+size);
 
-    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-        sb_mgr->insert(v);
-    }
+    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ sb_mgr->insert(v); }
 
     return start;
 }
