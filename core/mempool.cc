@@ -1235,8 +1235,7 @@ void free_page(void* v)
 void* alloc_huge_page(size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
-      abort("[ERROR] alloc_huge_page cannot be called before page frame allocator is initialized");
+      return early_alloc_pages(N / page_size);
   }
   return llfree_allocator.alloc_huge_page(llf::order(N));
 }
@@ -1244,10 +1243,10 @@ void* alloc_huge_page(size_t N)
 void free_huge_page(void* v, size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
-      abort("[ERROR] free_huge_page cannot be called before page frame allocator is initialized");
+      early_free_pages(v, N / page_size);
+  } else {
+      llfree_allocator.free_page(v, llf::order(N));
   }
-  llfree_allocator.free_page(v, llf::order(N));
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setup()
