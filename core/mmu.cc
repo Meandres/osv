@@ -1317,8 +1317,10 @@ ulong evacuate(vma& dead){
         memory::stats::on_jvm_heap_free(size);
     }
 #endif
-    WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()){
-        sb_mgr->free_range(dead.start(), dead.size());
+    DROP_LOCK( sb_mgr->vma_lock(dead.start()).for_write()){
+        WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()){
+            sb_mgr->free_range(dead.start(), dead.size());
+        }
     }
     sb_mgr->erase(dead);
     return size;
