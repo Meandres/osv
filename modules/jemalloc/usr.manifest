@@ -1,0 +1,2 @@
+[manifest]
+/usr/lib/libjemalloc.so: ${MODULE_DIR}/upstream/jemalloc/lib/libjemalloc.so
