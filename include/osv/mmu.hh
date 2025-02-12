@@ -202,12 +202,14 @@ public:
     virtual bool put_page(void *addr, uintptr_t offset, hw_ptep<1> ptep) override;
 };
 
+size_t vma_size(const void* addr);
+
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
               fileref file, f_offset offset);
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
 
 error munmap(const void* addr, size_t size);
-error munmap_anon(const void* addr);
+error munmap_vma(const void* addr);
 error mprotect(const void *addr, size_t size, unsigned int perm);
 error msync(const void* addr, size_t length, int flags);
 error mincore(const void *addr, size_t length, unsigned char *vec);

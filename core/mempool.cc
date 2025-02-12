@@ -296,9 +296,12 @@ static inline void untracked_free_page(void *v);
 
 void pool::add_page()
 {
-    // FIXME: this function allocated a page and set it up but on rare cases
-    // we may add this page to the free list of a different cpu, due to the
-    // enablement of preemption
+    // FIXME: This allocates a map from the linear mapping
+    // Changing this breaks mmu's superblock_manager::free_range if
+    //   * The free range can be merged with the next one and
+    //   * The pool in which the node of the following range was allocated gets freed frees the page and
+    //   * The page was allocated by the same core that calld free range in the beginning
+    //   As this would then causes a recursive call into free_range. Is is therefore kept unmapped for now
     void* page = untracked_alloc_page();
 
 #if CONF_lazy_stack_invariant
@@ -471,7 +474,6 @@ mutex free_page_ranges_lock;
 // Updates to total should be fairly rare. We only expect updates upon boot,
 // and eventually hotplug in an hypothetical future
 static std::atomic<size_t> total_memory(0);
-static std::atomic<size_t> free_memory(0);
 static size_t watermark_lo(0);
 #if CONF_memory_jvm_balloon
 static std::atomic<size_t> current_jvm_heap_memory(0);
@@ -497,12 +499,19 @@ void wake_reclaimer()
     reclaimer_thread.wake();
 }
 
-static void on_free(size_t mem) { /* free_memory.fetch_add(mem); */ }
-static void on_alloc(size_t mem) { /* free_memory.fetch_sub(mem); */ }
 static void on_new_memory(size_t mem) { total_memory.fetch_add(mem); }
 
 namespace stats {
-    size_t free() { return free_memory.load(std::memory_order_relaxed); }
+    size_t free() {
+        if(llfree_allocator.is_ready())
+            return llfree_allocator.free_memory();
+
+        size_t ret{0};
+        for(auto& r : phys_mem_ranges) {
+            ret += r.size;
+        }
+        return ret;
+    }
     size_t total() { return total_memory.load(std::memory_order_relaxed); }
 }
 
@@ -809,6 +818,10 @@ void llf::reserve_allocated(){
     }
 }
 
+size_t llf::free_memory(){
+    return llfree_free_frames(self) * page_size;
+}
+
 void llf::add_region(void *mem_start, size_t mem_size){
     assert(!is_ready());
 
@@ -848,11 +861,9 @@ void *llf::alloc_page() {
         llflags(0)
     );
 
-    if(llfree_is_ok(page)){
-        on_alloc(page_size);
-
+    if(llfree_is_ok(page))
         return idx_to_virt(page.frame);
-    }
+
     oom();
     return nullptr;
 }
@@ -867,7 +878,6 @@ void *llf::alloc_huge_page(unsigned order){
     );
 
     if(llfree_is_ok(page)){
-        on_alloc(page_size << order);
         return idx_to_virt(page.frame);
     }
 
@@ -885,7 +895,6 @@ void *llf::alloc_page_at(size_t frame){
     );
 
     if(llfree_is_ok(page)){
-        on_alloc(page_size);
         return idx_to_virt(page.frame);
     }
 
@@ -902,10 +911,7 @@ void llf::free_page(void *addr){
         llflags(0)
     );
 
-    // TODO remove
     assert(llfree_is_ok(res));
-
-    on_free(page_size);
 }
 
 void llf::free_page(void *addr, unsigned order){
@@ -918,10 +924,7 @@ void llf::free_page(void *addr, unsigned order){
         llflags(order)
     );
 
-    // TODO remove
     assert(llfree_is_ok(res));
-
-    on_free(page_size << order);
 }
 
 void *llf::idx_to_virt(u64 idx){
@@ -938,7 +941,6 @@ u64 llf::virt_to_idx(void *addr){
 
 void add_llfree_region(void *addr, size_t size){
     on_new_memory(size);
-    on_free(size);
 
     llfree_allocator.add_region(addr, size);
 }
@@ -978,8 +980,6 @@ void *early_alloc_pages(size_t size) {
 
                 pr.size = size;
 
-                on_alloc(size);
-
                 return reinterpret_cast<void *>(&pr);
             }
         }
@@ -1017,7 +1017,6 @@ static void free_large(void* obj)
         llfree_allocator.free_page(obj, llf::order(pr->size));
     } else {
         early_free_pages(obj, pr->size);
-        on_free(pr->size);
     }
 }
 
@@ -1026,11 +1025,11 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
 
     // Use mapped memory is possible
-    if(!contiguous && (!use_linear_map || size > llf_max_size)){
+    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size))){
         ret = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
         trace_memory_malloc_large(ret, size, size, page_size);
         return ret;
-    } else if (size > llf_max_size){
+    } else if (llfree_allocator.is_ready() && size > llf_max_size){
         printf("[ERROR]: physically contiguous allocations above 0x%lxB are not possible\n", llf_max_size);
         abort();
     }
@@ -1064,7 +1063,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
 
 static void mapped_free_large(void *object)
 {
-    mmu::munmap_anon(object);
+    mmu::munmap_vma(object);
 }
 
 std::atomic<unsigned> llf_cnt{0};
@@ -1222,7 +1221,6 @@ static inline void untracked_free_page(void *v)
     trace_memory_page_free(v);
     if (!llfree_allocator.is_ready()) {
         early_free_pages(v, page_size);
-        on_free(page_size);
     } else {
         llfree_allocator.free_page(v);
     }
@@ -1244,8 +1242,7 @@ void free_page(void* v)
 void* alloc_huge_page(size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
-      abort("[ERROR] alloc_huge_page cannot be called before page frame allocator is initialized");
+      return early_alloc_pages(N);
   }
   return llfree_allocator.alloc_huge_page(llf::order(N));
 }
@@ -1253,10 +1250,10 @@ void* alloc_huge_page(size_t N)
 void free_huge_page(void* v, size_t N)
 {
   if(!llfree_allocator.is_ready()){
-      // For now only implemented in llfree. Consider implementing huge page allocation for llfree_extern_alloc
-      abort("[ERROR] free_huge_page cannot be called before page frame allocator is initialized");
+      early_free_pages(v, N);
+  } else {
+      llfree_allocator.free_page(v, llf::order(N));
   }
-  llfree_allocator.free_page(v, llf::order(N));
 }
 
 void  __attribute__((constructor(init_prio::mempool))) setup()
@@ -1323,9 +1320,7 @@ void* calloc(size_t nmemb, size_t size)
 static size_t object_size(void *object)
 {
     if (!mmu::is_linear_mapped(object, 0)) {
-        size_t offset = memory::large_object_offset(object);
-        size_t* ret_header = static_cast<size_t*>(object);
-        return *ret_header - offset;
+        return mmu::vma_size(object);
     }
 
     switch (mmu::get_mem_area(object)) {
@@ -1545,6 +1540,12 @@ size_t malloc_usable_size(void* obj)
         return 0;
     }
     return object_size(obj);
+}
+
+// We dont have a heap
+OSV_LIBC_API
+int malloc_trim(size_t pad){
+  return 0;
 }
 
 // posix_memalign() and C11's aligned_alloc() return an aligned memory block

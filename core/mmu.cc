@@ -166,29 +166,32 @@ class superblock_manager {
     }
 
     u64 allocate_superblocks(unsigned n){
-    // Indicator a virtual memory segment is free
-    uint8_t free_idx{255};
+        assert(n > 0);
+        // Indicator a virtual memory segment is free
+        uint8_t free_idx{255};
 
-    unsigned k{0};
-    for(unsigned i{0}; i < superblock_len; ++i){
-        if(superblocks[i].load() != free_idx) k = 0;
-        else if(++k == n) {
-            // We found n free segments in a row. Now lets see if we can reserve them before someone else does
-            for(unsigned j{i-n+1}; j <= i; ++j){
-                if(!superblocks[j].compare_exchange_weak(free_idx, cpu_id(), std::memory_order_acq_rel)){
-                    // Someone else was faster, we have to start over
-                    release_superblocks(i-n, j-i-n);
-                    return allocate_superblocks(n);
-                } else break;
-            }
-            return i-n+1;
+        unsigned k{0};
+        for(unsigned i{0}; i < superblock_len; ++i){
+            if(superblocks[i].load() != free_idx) {
+              k = 0;
+            } else if(++k == n) {
+                // We found n free segments in a row. Now lets see if we can reserve them before someone else does
+                for(unsigned j{i-n+1}; j <= i; ++j){
+                    if(!superblocks[j].compare_exchange_weak(free_idx, cpu_id(), std::memory_order_acq_rel)){
+                        // Someone else was faster, we have to start over
+                        release_superblocks(i-n, j-i-n);
+                        return allocate_superblocks(n);
+                    };
+                }
+                return i-n+1;
             }
 
         }
 
-    // TODO This error isn't thrown correctly
-    throw make_error(ENOMEM);
-    return 0;
+        printf("couldn't allocate superblock\n");
+        // TODO This error isn't thrown correctly
+        throw make_error(ENOMEM);
+        return 0;
     }
 
     // Returns the iterator with the largest key less or equal than addr.
@@ -356,20 +359,43 @@ class superblock_manager {
   
     // Frees the given range by adding it to the free range map
     void free_range(uintptr_t addr, u64 size, uint8_t owner){
+        if(size == 0) return;
+
         auto& my = workers[owner];
 
-        my.free_ranges.insert({addr, size});
-        // auto opt = leq_range(addr, my.free_ranges);
-        //
-        // // Merge with preceding free range
-        // if(opt.has_value() && opt.value()->first + opt.value()->second == addr){
-        //     opt.get()->second += size;
-        // } else {
-        //     my.free_ranges.insert({addr, size});
-        // }
+        // Get the previous range if there is one
+        auto opt = leq_range(addr, my.free_ranges);
 
-        // FIXME: Think about merging with the next range as well. Keep in mind that inserting an element
-        // into a map might cause another malloc, i.e. require another mmap call that will end up here.
+        bool inplace{false};
+
+        if(opt.has_value()) {
+            auto prev = opt.get();
+
+            assert(prev->first + prev->second <= addr);
+
+            // Check if we can merge them
+            if(prev->first + prev->second == addr) {
+                prev->second += size;
+                addr = prev->first;
+                size = prev->second;
+                inplace = true;
+            }
+        }
+
+        // Get the next range
+        auto next = my.free_ranges.upper_bound(addr);
+
+        // We cannot merge with next element
+        if(next == my.free_ranges.end() || next->first != addr + size){
+            if(!inplace)
+                my.free_ranges.insert({addr, size});
+            return;
+        }
+
+        // We can merge with next range
+        size += next->second;
+        my.free_ranges.erase(next);
+        my.free_ranges.insert({addr, size});
     }
 
     // Frees the given range by adding it to the free range map. Requires the addr to be owned
@@ -384,28 +410,34 @@ class superblock_manager {
     // This function is threadsafe and already allocates the memory
     // from free_ranges
     uintptr_t reserve_range(u64 size){
+        assert(size > 0);
+
         uint8_t cpuid = cpu_id();
         auto &my = workers[cpuid];
 
-        SCOPE_LOCK(my.free_ranges_mutex.for_write());
-
         // Try to find a large enough free range (first fit).
-        for(auto& r : my.free_ranges){
-            if(r.second > size){
-                r.second -= size;
-                return r.first + r.second;
-            } else if (r.second == size){
-                uintptr_t res = r.first;
-                my.free_ranges.erase(r.first);
-                return res;
+        if(size <= superblock_size){
+            WITH_LOCK(my.free_ranges_mutex.for_write()){
+                for(auto& r : my.free_ranges){
+                    if(r.second > size){
+                        r.second -= size;
+                        return r.first + r.second;
+                    } else if (r.second == size){
+                        uintptr_t res = r.first;
+                        my.free_ranges.erase(r.first);
+                        return res;
+                    }
+                }
             }
         }
 
         // There is no fitting free range we can draw from, so we need to get a new superblock
-        u64 s = allocate_superblocks(1);
-        uintptr_t ret = superblock_ptr(s);
-        free_range(ret+size, superblock_size - size, cpuid);
-        return ret;
+        unsigned n = (size-1) / superblock_size + 1;
+        unsigned remainder = (n*superblock_size) - size;
+        u64 s = allocate_superblocks(n);
+        uintptr_t ptr = superblock_ptr(s);
+        WITH_LOCK(my.free_ranges_mutex.for_write()){ free_range(ptr, remainder, cpuid); }
+        return ptr + remainder;
     }
 
     u64 all_vmas_size(){
@@ -1285,8 +1317,10 @@ ulong evacuate(vma& dead){
         memory::stats::on_jvm_heap_free(size);
     }
 #endif
-    WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()){
-        sb_mgr->free_range(dead.start(), dead.size());
+    DROP_LOCK( sb_mgr->vma_lock(dead.start()).for_write()){
+        WITH_LOCK(sb_mgr->free_ranges_lock(dead.start()).for_write()){
+            sb_mgr->free_range(dead.start(), dead.size());
+        }
     }
     sb_mgr->erase(dead);
     return size;
@@ -1428,23 +1462,15 @@ public:
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
     if (search) {
-        // search for unallocated hole around start
-        if (!start) {
-            start = 0x200000000000ul;
-        }
         start = sb_mgr->reserve_range(size);
     } else {
         // we don't know if the given range is free, need to evacuate it first
-        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-            evacuate(start, start+size);
-        }
-        sb_mgr->allocate_range(start, size);
+        WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ evacuate(start, start+size); }
+        WITH_LOCK(sb_mgr->free_ranges_lock(start).for_write()){ sb_mgr->allocate_range(start, size); }
     }
     v->set(start, start+size);
 
-    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){
-        sb_mgr->insert(v);
-    }
+    WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ sb_mgr->insert(v); }
 
     return start;
 }
@@ -1542,6 +1568,16 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
     }
 
     return total;
+}
+
+size_t vma_size(const void* addr){
+    auto start = reinterpret_cast<uintptr_t>(addr);
+    WITH_LOCK(sb_mgr->vma_lock(start).for_read()){
+        auto v = sb_mgr->find_intersecting_vma(start);
+        assert(v != sb_mgr->vma_end_iterator(start));
+        return v->size();
+    }
+    return 0;
 }
 
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
@@ -2293,7 +2329,7 @@ error mprotect(const void *addr, size_t len, unsigned perm)
  * I.e. this will remove the entirety of the vma containing the specified address.
  * Keep in mind that operations like mprotect sometimes split vmas when using this function.
  */
-error munmap_anon(const void* addr)
+error munmap_vma(const void* addr)
 {
     auto virt = reinterpret_cast<uintptr_t>(addr);
     auto& vma_lock = sb_mgr->vma_lock(virt);

@@ -42,6 +42,7 @@ int rand (void);
 void srand (unsigned);
 
 void *malloc (size_t);
+int malloc_trim (size_t);
 void *calloc (size_t, size_t);
 void *realloc (void *, size_t);
 void free (void *);
