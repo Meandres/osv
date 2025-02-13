@@ -1,0 +1,13 @@
+diff --git a/src/jemalloc.c b/src/jemalloc.c
+index 7655de4..68f2833 100644
+--- a/src/jemalloc.c
++++ b/src/jemalloc.c
+@@ -150,7 +150,7 @@ bool	opt_xmalloc = false;
+ bool	opt_experimental_infallible_new = false;
+ bool	opt_zero = false;
+ unsigned	opt_narenas = 0;
+-fxp_t		opt_narenas_ratio = FXP_INIT_INT(4);
++fxp_t		opt_narenas_ratio = FXP_INIT_INT(1);
+ 
+ unsigned	ncpus;
+ 
