@@ -254,8 +254,9 @@ private:
     using hw_ptep_base<N>::x;
 };
 
+constexpr unsigned long superblock_bits = 30;
 // Size of one superblock. Must evenly divide superblock_area_base
-constexpr unsigned long superblock_size = 1ul << 30;
+constexpr unsigned long superblock_size = 1ul << superblock_bits;
 // Start address of superblocks
 constexpr unsigned long superblock_area_base = 0x200000000000ul;
 // Number of superblocks

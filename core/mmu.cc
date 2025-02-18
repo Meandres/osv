@@ -115,7 +115,7 @@ struct vma_list_type : vma_list_base {
     }
 };
 
-struct superblock_worker {
+struct superblock_bucket {
   vma_list_type vma_list;
   rwlock_t vma_list_mutex;
   std::map<uintptr_t, u64> free_ranges;
@@ -134,7 +134,7 @@ public:
 
 class superblock_manager {
     // 64 workers for superblock segments, 1 worker for outside segments
-    std::array<superblock_worker, sched::max_cpus + 1> workers;
+    std::array<superblock_bucket, sched::max_cpus + 1> workers;
     std::array<std::atomic_uint8_t, superblock_len> superblocks;
 
     uint8_t cpu_id(){
@@ -142,12 +142,12 @@ class superblock_manager {
     }
 
     u64 superblock_index(const uintptr_t addr){
-        return (addr - superblock_area_base) / superblock_size;
+        return (addr - superblock_area_base) >> superblock_bits;
     }
     u64 superblock_index(const void* addr){ return superblock_index(reinterpret_cast<uintptr_t>(addr)); }
 
     uintptr_t superblock_ptr(const u64 superblock){
-        return superblock * superblock_size + superblock_area_base;
+        return (superblock << superblock_bits) + superblock_area_base;
     }
 
     uint8_t owner(const uintptr_t addr){
