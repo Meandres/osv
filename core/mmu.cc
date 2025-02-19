@@ -115,10 +115,35 @@ struct vma_list_type : vma_list_base {
     }
 };
 
+struct vm_range : public bi::set_base_hook<> {
+    uintptr_t addr;
+    uint64_t size;
+
+    vm_range(uintptr_t addr, uint64_t size) : addr(addr), size(size) {}
+
+    bool operator<(const vm_range& other) const {
+        return addr < other.addr;
+    }
+};
+
+struct vm_range_compare {
+    bool operator()(const vm_range& a, const vm_range& b) const {
+        return a.addr < b.addr;
+    }
+};
+
+using vm_range_set = bi::set<vm_range, bi::compare<vm_range_compare>, bi::optimize_size<true>>;
+
+struct vm_range_type : vm_range_set {
+    vm_range_type() {
+
+    }
+};
+
 struct superblock_bucket {
   vma_list_type vma_list;
   rwlock_t vma_list_mutex;
-  std::map<uintptr_t, u64> free_ranges;
+  vm_range_set free_ranges;
   rwlock_t free_ranges_mutex;
   char padding[40];
 };
@@ -196,12 +221,12 @@ class superblock_manager {
     }
 
     // Returns the iterator with the largest key less or equal than addr.
-    boost::optional<std::map<uintptr_t, u64>::iterator> leq_range(uintptr_t addr, std::map<uintptr_t, u64>& fr){
+    vm_range_set::iterator leq_range(vm_range addr, vm_range_set& fr){
         auto it = fr.upper_bound(addr);
         if(it != fr.begin())
-            return boost::make_optional(--it);
+            return --it;
         else
-            return boost::none;
+            return fr.end();
     }
 
   public:
@@ -209,8 +234,11 @@ class superblock_manager {
       for(auto& a : superblocks){
           a.store(255, std::memory_order_relaxed);
       }
-      workers[workers.size()-1].free_ranges.insert({0, superblock_area_base});
-      workers[workers.size()-1].free_ranges.insert({main_mem_area_base, (1ul << 63) - main_mem_area_base});
+
+      auto lower_range = new vm_range(0, superblock_area_base);
+      workers[workers.size()-1].free_ranges.insert(*lower_range);
+      auto upper_edge = new vm_range(main_mem_area_base, (1ul << 63) - main_mem_area_base);
+      workers[workers.size()-1].free_ranges.insert(*upper_edge);
     }
 
     // Get vma lock for manager managing intersecting superblock
@@ -319,34 +347,38 @@ class superblock_manager {
 
     // Allocating the given range means removing it from the free_ranges map
     void allocate_range(uintptr_t addr, u64 size){
+        auto r = vm_range(addr, size);
         uint8_t i = owner(addr);
         auto& my_free_ranges = workers[i].free_ranges;
-        auto opt = leq_range(addr, my_free_ranges);
+        auto range = leq_range(r, my_free_ranges);
 
-        // We assume that the range was free, in which case the optional will hold a value
-        assert(opt.has_value());
-        auto range = opt.get();
-        assert(range->second >= size);
+        // We assume that the range was free
+        assert(range != my_free_ranges.end());
+        assert(range->size >= size);
 
         // We allocate the beginning of a free range
-        if(range->first == addr){
-            u64 s = range->second;
+        if(range->addr == addr){
+            auto& moved = *range;
             my_free_ranges.erase(range);
-            if(s > size){
-                my_free_ranges.insert({addr + size, s - size});
+            if(moved.size > size){
+                moved.addr = addr;
+                moved.size -= size;
+                my_free_ranges.insert(moved);
+            } else {
+                delete &moved;
             }
         // We allocate the middle or end of a free range 
         } else {
-            u64 offset = addr - range->first;
-            u64 tail_size = range->second - offset - size;
+            u64 offset = addr - range->addr;
+            u64 tail_size = range->size - offset - size;
 
             // adjust size of preceding range
-            range->second = offset;
+            range->size = offset;
 
 
             // insert new range behind newly allocated region
             if(tail_size){
-                my_free_ranges.insert({addr + size, tail_size});
+                my_free_ranges.insert(*(new vm_range(addr + size, tail_size)));
             }
             
         }
@@ -363,40 +395,41 @@ class superblock_manager {
         if(size == 0) return;
 
         auto& my = workers[owner];
+        auto r = vm_range(addr, size);
 
         // Get the previous range if there is one
-        auto opt = leq_range(addr, my.free_ranges);
+        auto prev = leq_range(r, my.free_ranges);
 
         bool inplace{false};
 
-        if(opt.has_value()) {
-            auto prev = opt.get();
-
-            assert(prev->first + prev->second <= addr);
+        if(prev != my.free_ranges.end()) {
+            assert(prev->addr + prev->size <= addr);
 
             // Check if we can merge them
-            if(prev->first + prev->second == addr) {
-                prev->second += size;
-                addr = prev->first;
-                size = prev->second;
+            if(prev->addr + prev->size == addr) {
+                prev->size += size;
+                addr = prev->addr;
+                size = prev->size;
                 inplace = true;
             }
         }
 
         // Get the next range
-        auto next = my.free_ranges.upper_bound(addr);
+        auto next = my.free_ranges.upper_bound(r);
 
         // We cannot merge with next element
-        if(next == my.free_ranges.end() || next->first != addr + size){
+        if(next == my.free_ranges.end() || next->addr != addr + size){
             if(!inplace)
-                my.free_ranges.insert({addr, size});
+                my.free_ranges.insert(*(new vm_range(r)));
             return;
         }
 
         // We can merge with next range
-        size += next->second;
+        auto& moved = *next;
         my.free_ranges.erase(next);
-        my.free_ranges.insert({addr, size});
+        moved.addr = addr;
+        moved.size += size;
+        my.free_ranges.insert(moved);
     }
 
     // Frees the given range by adding it to the free range map. Requires the addr to be owned
@@ -420,12 +453,13 @@ class superblock_manager {
         if(size <= superblock_size){
             WITH_LOCK(my.free_ranges_mutex.for_write()){
                 for(auto& r : my.free_ranges){
-                    if(r.second > size){
-                        r.second -= size;
-                        return r.first + r.second;
-                    } else if (r.second == size){
-                        uintptr_t res = r.first;
-                        my.free_ranges.erase(r.first);
+                    if(r.size > size){
+                        r.size -= size;
+                        return r.addr + r.size;
+                    } else if (r.size == size){
+                        uintptr_t res = r.addr;
+                        my.free_ranges.erase(r);
+                        delete &r;
                         return res;
                     }
                 }
