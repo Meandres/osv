@@ -120,6 +120,7 @@ struct superblock_bucket {
   rwlock_t vma_list_mutex;
   std::map<uintptr_t, u64> free_ranges;
   rwlock_t free_ranges_mutex;
+  char padding[40];
 };
 
 // So that we don't need to create a vma (with size, permission and alot of
