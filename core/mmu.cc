@@ -1499,7 +1499,12 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     } else {
         // we don't know if the given range is free, need to evacuate it first
         WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ evacuate(start, start+size); }
-        WITH_LOCK(sb_mgr->free_ranges_lock(start).for_write()){ sb_mgr->allocate_range(start, size); }
+        auto list = sb_mgr->generate_owner_list(start, size);
+        for(auto& o : list){
+            WITH_LOCK(sb_mgr->free_ranges_lock(std::get<0>(o)).for_write()) {
+              sb_mgr->allocate_range(std::get<0>(o), std::get<1>(o));
+            }
+        }
     }
     v->set(start, start+size);
 
