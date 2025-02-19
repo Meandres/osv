@@ -352,7 +352,7 @@ class superblock_manager {
             auto& moved = *range;
             my.free_ranges.erase(range);
             if(moved.size > size){
-                moved.addr = addr;
+                moved.addr += size;
                 moved.size -= size;
                 my.free_ranges.insert(moved);
             } else {
@@ -426,7 +426,11 @@ class superblock_manager {
         bool inplace{false};
 
         if(prev != my.free_ranges.end()) {
-            assert(prev->addr + prev->size <= addr);
+            if(prev->addr + prev->size > addr){
+                printf("[WARNING] While freeing virtual memory range: 0x%lx-0x%lx\n", addr, addr+size);
+                printf("          Overlapping region is already free: 0x%lx-0x%lx\n", prev->addr, prev->addr + prev->size);
+                return;
+            }
 
             // Check if we can merge them
             if(prev->addr + prev->size == addr) {

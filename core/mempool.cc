@@ -1023,17 +1023,6 @@ static void free_large(void* obj)
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
     void* ret;
-
-    // Use mapped memory is possible
-    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size))){
-        ret = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
-        trace_memory_malloc_large(ret, size, size, page_size);
-        return ret;
-    } else if (llfree_allocator.is_ready() && size > llf_max_size){
-        printf("[ERROR]: physically contiguous allocations above 0x%lxB are not possible\n", llf_max_size);
-        abort();
-    }
-
     size_t requested_size{size};
     size_t offset;
     if (alignment < page_size) {
@@ -1045,10 +1034,18 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     size += offset;
     size = align_up(size, page_size);
 
+    // Use mapped memory is possible
+    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size - page_size))){
+        ret = mmu::map_anon(nullptr, requested_size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
+        trace_memory_malloc_large(ret, requested_size, requested_size, page_size);
+        return ret;
+    } else if (llfree_allocator.is_ready() && size > llf_max_size){
+        abort("physically contiguous allocations above 0x%lxB are not possible (requested: 0x%lxB)\n", llf_max_size, size);
+    }
 
     // handle in linearly mapped, contiguous physical memory.
     // Additional space for a header needs to be allocated in this case
-    if(size <= llf_max_size && llfree_allocator.is_ready() && (contiguous || use_linear_map)){
+    if(llfree_allocator.is_ready()){
         unsigned order = llf::order(size);
         ret = llfree_allocator.alloc_huge_page(order);
     } else {
