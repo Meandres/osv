@@ -38,7 +38,8 @@
 #include <osv/dbg-alloc.hh>
 #include <osv/export.h>
 
-#include "osv/llfree.h"
+#include <osv/llfree.h>
+#include <osv/kernel_integration.hh>
 
 #include <osv/kernel_config_lazy_stack.h>
 #include <osv/kernel_config_lazy_stack_invariant.h>
@@ -1651,4 +1652,12 @@ extern "C" void* alloc_contiguous_aligned(size_t size, size_t align)
 extern "C" void free_contiguous_aligned(void* p)
 {
     memory::free_phys_contiguous_aligned(p);
+}
+
+namespace kii {
+    void* frames_alloc(unsigned order){ return memory::llfree_allocator.alloc_huge_page(order); }
+    void free_frames(void* addr, unsigned order){ memory::llfree_allocator.free_page(addr, order); }
+
+    u64 stat_free_phys_mem() { return memory::llfree_allocator.free_memory(); }
+    u64 stat_total_phys_mem() { return memory::total_memory.load(); }
 }

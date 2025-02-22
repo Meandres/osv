@@ -36,6 +36,8 @@
 #include <osv/kernel_config_lazy_stack_invariant.h>
 #include <osv/kernel_config_memory_jvm_balloon.h>
 
+#include <osv/kernel_integration.hh>
+
 // FIXME: Without this pragma, we get a lot of warnings that I don't know
 // how to explain or fix. For now, let's just ignore them :-(
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -339,8 +341,6 @@ class superblock_manager {
         uint8_t i = owner(addr);
         auto& my = workers[i];
 
-        SCOPE_LOCK(my.free_ranges_mutex.for_write());
-
         auto range = leq_range(r, my.free_ranges);
 
         // We assume that the range was free
@@ -410,7 +410,6 @@ class superblock_manager {
     void erase(vma& v){
         uint8_t i = owner(v);
         workers[i].vma_list.erase(v);
-        delete &v;
     }
   
     // Frees the given range by adding it to the free range map
@@ -1383,6 +1382,7 @@ ulong evacuate(vma& dead){
         sb_mgr->free_range(dead.start(), dead.size());
     }
     sb_mgr->erase(dead);
+    delete &dead;
     return size;
 }
 
@@ -1529,7 +1529,9 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 
         // we don't know if the given range is free, need to evacuate it first
         WITH_LOCK(sb_mgr->vma_lock(start).for_write()){ evacuate(start, start+size); }
-        sb_mgr->allocate_range(start, size);
+        WITH_LOCK(sb_mgr->free_ranges_lock(start).for_write()){
+            sb_mgr->allocate_range(start, size);
+        }
     }
     v->set(start, start+size);
 
@@ -2350,7 +2352,9 @@ void linear_map(void* _virt, phys addr, size_t size, const char* name,
        linear_vma_set.insert(_vma);
     }
     sb_mgr->validate_map_fixed(_vma->v_start(), _vma->_size);
-    sb_mgr->allocate_range(_vma->v_start(), _vma->_size);
+    WITH_LOCK(sb_mgr->free_ranges_lock(_vma->v_start()).for_write()){
+        sb_mgr->allocate_range(_vma->v_start(), _vma->_size);
+    }
 }
 
 unsigned tmp{0};
@@ -2454,3 +2458,34 @@ extern "C" bool is_linear_mapped(const void *addr)
 {
     return addr >= mmu::phys_mem;
 }
+
+namespace kii {
+  rwlock_t& vma_lock(const uintptr_t addr){ return mmu::sb_mgr->vma_lock(addr); }
+  rwlock_t& free_ranges_lock(const uintptr_t addr){ return mmu::sb_mgr->free_ranges_lock(addr); }
+
+  boost::optional<mmu::vma*> find_intersecting_vma(const uintptr_t addr){
+      auto v = mmu::sb_mgr->find_intersecting_vma(addr);
+      if(v == mmu::sb_mgr->vma_end_iterator(addr))
+        return boost::none;
+      return &*v;
+  }
+
+  std::vector<mmu::vma*> find_intersecting_vmas(const uintptr_t addr, const u64 size){
+      std::vector<mmu::vma*> res;
+
+      auto range = mmu::sb_mgr->find_intersecting_vmas(addr_range(addr, addr + size));
+      for (auto i = range.first; i != range.second; ++i) {
+        res.push_back(&*i);
+      }
+      return res;
+  }
+
+  void insert(mmu::vma* v){ mmu::sb_mgr->insert(v); }
+  void erase(mmu::vma& v){ mmu::sb_mgr->erase(v); }
+
+  bool validate(const uintptr_t addr, const u64 size){ return mmu::sb_mgr->validate_map_fixed(addr, size); }
+  void allocate_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->allocate_range(addr, size); }
+  uintptr_t reserve_range(const u64 size){ return mmu::sb_mgr->reserve_range(size); }
+  void free_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->free_range(addr, size); }
+
+} // namespace kii
