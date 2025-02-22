@@ -38,7 +38,8 @@
 #include <osv/dbg-alloc.hh>
 #include <osv/export.h>
 
-#include "osv/llfree.h"
+#include <osv/llfree.h>
+#include <osv/kernel_integration.hh>
 
 #include <osv/kernel_config_lazy_stack.h>
 #include <osv/kernel_config_lazy_stack_invariant.h>
@@ -1023,17 +1024,6 @@ static void free_large(void* obj)
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
     void* ret;
-
-    // Use mapped memory is possible
-    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size))){
-        ret = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
-        trace_memory_malloc_large(ret, size, size, page_size);
-        return ret;
-    } else if (llfree_allocator.is_ready() && size > llf_max_size){
-        printf("[ERROR]: physically contiguous allocations above 0x%lxB are not possible\n", llf_max_size);
-        abort();
-    }
-
     size_t requested_size{size};
     size_t offset;
     if (alignment < page_size) {
@@ -1045,10 +1035,18 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     size += offset;
     size = align_up(size, page_size);
 
+    // Use mapped memory is possible
+    if(!contiguous && (!use_linear_map || (llfree_allocator.is_ready() && size > llf_max_size - page_size))){
+        ret = mmu::map_anon(nullptr, requested_size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
+        trace_memory_malloc_large(ret, requested_size, requested_size, page_size);
+        return ret;
+    } else if (llfree_allocator.is_ready() && size > llf_max_size){
+        abort("physically contiguous allocations above 0x%lxB are not possible (requested: 0x%lxB)\n", llf_max_size, size);
+    }
 
     // handle in linearly mapped, contiguous physical memory.
     // Additional space for a header needs to be allocated in this case
-    if(size <= llf_max_size && llfree_allocator.is_ready() && (contiguous || use_linear_map)){
+    if(llfree_allocator.is_ready()){
         unsigned order = llf::order(size);
         ret = llfree_allocator.alloc_huge_page(order);
     } else {
@@ -1654,4 +1652,12 @@ extern "C" void* alloc_contiguous_aligned(size_t size, size_t align)
 extern "C" void free_contiguous_aligned(void* p)
 {
     memory::free_phys_contiguous_aligned(p);
+}
+
+namespace kii {
+    void* frames_alloc(unsigned order){ return memory::llfree_allocator.alloc_huge_page(order); }
+    void free_frames(void* addr, unsigned order){ memory::llfree_allocator.free_page(addr, order); }
+
+    u64 stat_free_phys_mem() { return memory::llfree_allocator.free_memory(); }
+    u64 stat_total_phys_mem() { return memory::total_memory.load(); }
 }

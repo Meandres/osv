@@ -783,7 +783,7 @@ void main_cont(int loader_argc, char** loader_argv)
         poweroff();
     }
 
-    memory::activate_paging();
+    memory::prefer_linear_mapping(true);
 
 #if CONF_tracepoints
     if (opt_list_tracepoints) {
