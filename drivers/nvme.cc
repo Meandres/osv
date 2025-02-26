@@ -352,14 +352,15 @@ int nvme_check_completion_ooo(nvme_queue_t* q, int* stat, u32* cqe_cs, int pos)
 int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 {
     *stat = 0;
-    nvme_cq_entry_t* cqe;
+    /*nvme_cq_entry_t* cqe;
     do{
         cqe = &q->cq[q->cq_head];
         if(cqe->rsvd3 == 1){
             printf("Skipping\n");
             q->cq_head++;
         }
-    }while(cqe->rsvd3 == 1); // skip cqe removed ooo
+    }while(cqe->rsvd3 == 1); // skip cqe removed ooo*/
+    nvme_cq_entry_t* cqe = &q->cq[q->cq_head];
     if (cqe->p == q->cq_phase) return -1;
 
     *stat = cqe->psf & 0xfffe;
@@ -801,8 +802,6 @@ int nvme_ioq_delete(nvme_queue_t* ioq)
  * @param   cqpa        admin completion physical address
  * @return  pointer to the admin queue or NULL if failure.
  */
-#pragma GCC push_options
-#pragma GCC optimize ("O0")
 nvme_queue_t* nvme_adminq_setup(nvme_device_t* dev, int qsize,
                                 void* sqbuf, u64 sqpa, void* cqbuf, u64 cqpa)
 {
@@ -840,7 +839,6 @@ nvme_queue_t* nvme_adminq_setup(nvme_device_t* dev, int qsize,
              dev->reg->intms, dev->reg->intmc, dev->reg->csts.val);
     return adminq;
 }
-#pragma GCC pop_options
 
 /**
  * Create an NVMe device context and map the controller register.
@@ -1695,6 +1693,7 @@ unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 
 unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid,
                          const void* buf, u64 slba, u32 nlb)
 {
+    //printf("awrite - qid: %u, buf: %p, slba: %lu, nlb: %u\n", qid, buf, slba, nlb);
     return (unvme_iod_t)unvme_do_rw(ns, qid, NVME_CMD_WRITE, (void*)buf, slba, nlb);
 } // this function used to be inline which caused problems of linking
   // TODO maybe put them (all the async func) in the header file directly ? 
@@ -1801,21 +1800,27 @@ vfio_dma_t* vfio_dma_alloc(size_t size)
 {
    vfio_dma_t* p = (vfio_dma_t*)malloc(sizeof(vfio_dma_t));
    p->size = size;
-
+   /*if(size <= 4096){
+    p->buf = malloc(4096);
+   }else{
+    p->buf = malloc(2*1024*1024);
+   }
+   p->addr = mmu::virt_to_phys(p->buf);*/
    if (size <= 4096) {
       p->buf = (void*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(p->buf, size, MADV_NOHUGEPAGE);
       memset(p->buf, 0, size);
-      //p->addr = mmu::virt_to_phys(p->buf) * 4096;
+      //p->addr = mmu::virt_to_phys(p->buf);
       //p->addr = mmu::virt_to_phys_dynamic_phys(p->buf)*4096;
       //p->addr = (uintptr_t)p->buf;
-      p->addr = walk(p->buf).phys * 4096;
+      p->addr = walk(p->buf).phys << 12;
    } else {
       assert(size <= 2*1024*1024);
       p->buf = (void*)mmap(NULL, 2*1024*1024, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(p->buf, 2*1024*1024, MADV_HUGEPAGE);
       memset(p->buf, 0, 2*1024*1024);
-      p->addr = walkHuge(p->buf).phys * 4096;
+      //p->addr = mmu::virt_to_phys(p->buf);
+      p->addr = walkHuge(p->buf).phys <<12;
    }
    assert(p->buf);
 
@@ -1849,7 +1854,7 @@ nvme::nvme(pci::device &dev)
     printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
 
     /*unsigned datasize = 4096;
-    char* buf = (char*)unvme_alloc(ns, datasize);
+    char* buf = (char*)nvme_alloc(ns, datasize);
     char* buf = (char*)malloc(datasize);
     for (unsigned i=0; i<datasize; i++) buf[i] = i%10;
     int ret = unvme_write(ns, 0, buf, 1, 4);
@@ -1891,6 +1896,7 @@ void nvme::parse_pci_config()
 
 hw_driver* nvme::probe(hw_device* dev)
 {
+   initYmaps();
    if (auto pci_dev = dynamic_cast<pci::device*>(dev)) {
       if ((pci_dev->get_base_class_code()==1) && (pci_dev->get_sub_class_code()==8) && (pci_dev->get_programming_interface()==2)) // detect NVMe device
          return aligned_new<nvme>(*pci_dev);

@@ -64,6 +64,8 @@
               python311Packages.numpy
               python311Packages.pandas
               python311Packages.matplotlib
+              virtiofsd
+              just
             ];
 
             buildInputs = with pkgs; [

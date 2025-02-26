@@ -99,11 +99,20 @@ struct VMA{
     }
 
     void* getPtr(PID pid){
-        return start + pid * pageSize;
+        return start + (pid * pageSize);
     }
 
     bool isValidPtr(void* addr){
         return addr >= start && addr < start + size;
+    }
+
+
+    u64 getStorageLocation(void* addr){ // for now just place the only vma at the beginning of the lba 
+        return ((u64)addr - (u64)start)/blockSize;
+    }
+
+    u64 getStorageLocation(PID pid){ // for now just place the only vma at the beginning of the lba 
+        return pid*(pageSize/blockSize);
     }
 };
 
@@ -128,10 +137,6 @@ struct VMATree{
         return NULL;
     }
 
-    u64 getStorageLocation(void* addr){ // for now just place the only vma at the beginning of the lba 
-        return ((u64)addr - (u64)vma->start)/blockSize;
-    }
-
     bool isValidPtr(uintptr_t addr){
         return vma->isValidPtr(reinterpret_cast<void*>(addr)); // TODO: this is not used atm
     }
@@ -147,7 +152,7 @@ typedef void (*custom_batch_func)(PID, PageLists*);
 typedef std::vector<PID>* candidate_list;
 
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
-struct ResidentPageSet {
+struct ResidentSet {
     static const u64 empty = ~0ull;
     static const u64 tombstone = (~0ull)-1;
 
@@ -160,9 +165,9 @@ struct ResidentPageSet {
     u64 mask;
     std::atomic<u64> clockPos;
 
-    ResidentPageSet();
+    ResidentSet();
     void init(u64 maxCount);
-    ~ResidentPageSet();
+    ~ResidentSet();
     u64 next_pow2(u64 x);
     u64 hash(u64 k);
    
@@ -189,7 +194,7 @@ class uCache {
     std::atomic<u64> pfCount;
 
 	  // interface <-> application
-   	ResidentPageSet residentSet;
+   	ResidentSet residentSet;
 
    	uCache(u64 physSize, int batch);
    	~uCache();
@@ -213,10 +218,12 @@ class uCache {
     }
 
    	void ensureFreePages(u64 additionalSize);
+   	void readPage(PID pid);
    	void readPage(void* addr, u64 size);
     void readPageAt(void* addr, void* virt, u64 size);
     
     void flush(std::vector<void*> toWrite, std::vector<PID>* aborted);
+    void flush(std::vector<PID> toWrite);
     bool handleFault(void* addr, exception_frame *ef); // called from the page fault handler
     void fix(PID pid); // explicit call
    	void evict();

@@ -79,3 +79,6 @@ __sysconf = sysconf;
 
 /* fix for the __isoc23_strtoul linking error : https://github.com/cloudius-systems/osv/issues/1299 */
 __isoc23_strtoul = strtoul;
+__isoc23_sscanf = sscanf;
+__isoc23_strtoll = strtoll;
+__isoc23_strtol = strtol;

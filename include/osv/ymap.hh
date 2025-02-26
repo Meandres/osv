@@ -238,6 +238,7 @@ struct Buffer{
 
    // for non-concurrent scenarios
    void map(u64 phys);
+   u64 unmap();
    void invalidateTLBEntries();
 
 };

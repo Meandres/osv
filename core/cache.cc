@@ -55,9 +55,9 @@ void* allocHuge(size_t size) {
    return p;
 }
 
-ResidentPageSet::ResidentPageSet(){}
+ResidentSet::ResidentSet(){}
 
-void ResidentPageSet::init(u64 maxCount){
+void ResidentSet::init(u64 maxCount){
 	count = next_pow2(maxCount * 1.5);
 	mask = count-1;
 	clockPos = 0;
@@ -65,15 +65,15 @@ void ResidentPageSet::init(u64 maxCount){
 	memset((void*)ht, 0xFF, count * sizeof(Entry));
 }
 
-ResidentPageSet::~ResidentPageSet() {
+ResidentSet::~ResidentSet() {
     munmap(ht, count * sizeof(u64));
 }
 
-u64 ResidentPageSet::next_pow2(u64 x) {
+u64 ResidentSet::next_pow2(u64 x) {
 	return 1<<(64-__builtin_clzl(x-1));
 }
 
-u64 ResidentPageSet::hash(u64 k) {
+u64 ResidentSet::hash(u64 k) {
     const u64 m = 0xc6a4a7935bd1e995;
     const int r = 47;
     u64 h = 0x8445d61a4e774912 ^ (8*m);
@@ -88,7 +88,7 @@ u64 ResidentPageSet::hash(u64 k) {
     return h;
 }
 
-bool ResidentPageSet::insert(u64 pid) {
+bool ResidentSet::insert(u64 pid) {
     u64 pos = hash(pid) & mask;
     while (true) {
         u64 curr = ht[pos].pid.load();
@@ -103,7 +103,7 @@ bool ResidentPageSet::insert(u64 pid) {
     }
 }
 
-bool ResidentPageSet::contains(u64 pid) {
+bool ResidentSet::contains(u64 pid) {
     u64 pos = hash(pid) & mask;
     while (true) {
         u64 curr = ht[pos].pid.load();
@@ -117,7 +117,7 @@ bool ResidentPageSet::contains(u64 pid) {
     }
 }
 
-bool ResidentPageSet::remove(u64 pid) {
+bool ResidentSet::remove(u64 pid) {
       u64 pos = hash(pid) & mask;
       while (true) {
          u64 curr = ht[pos].pid.load();
@@ -132,7 +132,7 @@ bool ResidentPageSet::remove(u64 pid) {
       }
    }
 
-template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn, PageLists *pl) {
+template<class Fn> void ResidentSet::iterateClockBatch(u64 batch, Fn fn, PageLists *pl) {
       u64 pos, newPos;
       do {
          pos = clockPos.load();
@@ -147,7 +147,7 @@ template<class Fn> void ResidentPageSet::iterateClockBatch(u64 batch, Fn fn, Pag
       }
    }
 
-void ResidentPageSet::print(){
+void ResidentSet::print(){
     for(u64 i=0; i<count; i++){
         if(ht[i].pid.load() != empty && ht[i].pid.load() != tombstone){
             printf("pid: %lu\n", ht[i].pid.load());
@@ -179,7 +179,7 @@ uCache::~uCache(){};
 void uCache::addVMA(u64 virtSize, u64 pageSize){
     VMA* vma = new VMA(virtSize, pageSize);
     vmaTree->addVMA(vma);
-    cout << "Added a vm_area @ " << vma->start << " of size: " << virtSize/(1024ull*1024*1024) << "GB, with pageSize: " << pageSize << endl;
+    cout << "Added a vm_area @ " << vma->start << " of size: " << virtSize/(1024ull*1024*1024) << "GB (upper bound: " << vma->start+virtSize << "), with pageSize: " << pageSize << endl;
 }
 
 bool uCache::handleFault(void* faultingAddr, exception_frame *ef){
@@ -187,6 +187,7 @@ bool uCache::handleFault(void* faultingAddr, exception_frame *ef){
     if(vma == NULL){
         return false;
     }
+    printf("shouldn't happen: %p\n", faultingAddr);
     void* basePage = alignPage(faultingAddr, vma->pageSize);
     int indexFaultingPage = (int)((u64)faultingAddr - (u64)basePage)/vma->pageSize;
     Buffer buffer(basePage, vma->pageSize);
@@ -363,17 +364,23 @@ void uCache::ensureFreePages(u64 additionalSize) {
         evict();
 }
 
-void uCache::readPage(void* addr, u64 size) {
+void uCache::readPage(PID pid){
+    int ret = unvme_read(ns, get_IOtoolkit().id, toPtr(pid), vmaTree->vma->getStorageLocation(pid), 4096/blockSize);
+    assert(ret==0);
+}
+
+void uCache::readPage(void* addr, u64 size) { 
     readPageAt(addr, addr, size);
     readSize+=size;
 }
 
 void uCache::readPageAt(void* addr, void* virt, u64 size) {
-    int ret = unvme_read(ns, get_IOtoolkit().id, virt, vmaTree->getStorageLocation(addr), size/blockSize);
+    int ret = unvme_read(ns, get_IOtoolkit().id, virt, vmaTree->vma->getStorageLocation(addr), size/blockSize);
     assert(ret==0);
 }
 
 void uCache::fix(PID pid){
+    printf("shouldn't happen\n");
     VMA* vma = vmaTree->vma;
     void* addr = vma->getPtr(pid);
     Buffer buffer(addr, vma->pageSize);
@@ -386,11 +393,26 @@ void uCache::fix(PID pid){
     usedPhysSize += vma->pageSize;
 }
 
+void uCache::flush(std::vector<PID> toWrite){
+    for(u64 i=0; i<toWrite.size(); i++){
+        PID pid = toWrite[i];
+        get_IOtoolkit().io_descriptors[i] = unvme_awrite(ns, get_IOtoolkit().id, toPtr(pid), vmaTree->vma->getStorageLocation(pid), sizeSmallPage/blockSize);
+        assert(get_IOtoolkit().io_descriptors[i]);
+    }
+    for(u64 i=0; i<toWrite.size(); i++){
+        int ret=unvme_apoll(get_IOtoolkit().io_descriptors[i], 16);
+        if(ret!=0){
+            std::cout << "IO error, writing with ret " << ret << ", queue: " << get_IOtoolkit().id << ", i " << i << ", pid " << toWrite.at(i) << std::endl;
+        }
+        assert(ret==0);
+    }
+}
+
 void uCache::flush(std::vector<void*> toWrite, std::vector<PID>* aborted){
     int iod_used=0;
     toWrite.erase(std::remove_if(toWrite.begin(), toWrite.end(), [&](void* addr){
         if(trySetClean(addr)){
-            get_IOtoolkit().io_descriptors[iod_used] = unvme_awrite(ns, get_IOtoolkit().id, addr, vmaTree->getStorageLocation(addr), sizeSmallPage/blockSize);
+            get_IOtoolkit().io_descriptors[iod_used] = unvme_awrite(ns, get_IOtoolkit().id, addr, vmaTree->vma->getStorageLocation(addr), sizeSmallPage/blockSize);
             assert(get_IOtoolkit().io_descriptors[iod_used]);
             iod_used++;
             return false;

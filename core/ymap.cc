@@ -54,6 +54,9 @@ u64 ymap_getPage(int order){
 void ymap_putPage(u64 phys, int order){
 	ymap& ymap = get_ymap();
 	u64 index = ((phys<<12) - aligned_start)/4096;
+	if(index < 0 || index >= aligned_size / 4096){
+		printf("error %lu\n", index);
+	}
 	assert(index >= 0 && index < aligned_size / 4096);
 	llfree_result_t res = llfree_put(llfree_allocator, ymap.id, index, llflags(order));
 	assert(llfree_is_ok(res)); // TODO: error handling
@@ -131,6 +134,7 @@ bool Buffer::tryMapPhys(u64 phys){
 		newPTE.present = 1;
 		newPTE.phys = phys+i;
 		if(!pteRefs[i]->compare_exchange_strong(snapshot[i].word, newPTE.word)){
+			std::cout << std::bitset<64>(snapshot[i].word) << "\n" << std::bitset<64>(PTE(*(pteRefs[i])).word) << std::endl;
 			/*PTE updatedPTE = PTE(*pteRefs[i]);
 			// we need to handle the case where another core accessed one of the page
 			if(updatedPTE.phys == snapshot[i].phys && updatedPTE.present == snapshot[i].present){
@@ -173,30 +177,47 @@ u16 Buffer::getDirty(){
 u64 Buffer::tryUnmapPhys(){
 	PTE base = basePTE();
 	assert(base.phys != 0); // evictors own the eviction so this cannot happen
-	if(base.present == 1){
+	/*if(base.present == 1){
+		printf("concurrent fault\n");
 		return 0; // another core soft faulted the page
-	}
-	// basePTE.present == 0 so we can try to remove the frame
+	}*/
+	
 	u64 phys = base.phys;
 	PTE newPTE = PTE(base.word);
+	newPTE.present = 0;
 	newPTE.phys = 0;
 	std::atomic<u64>* baseRef = pteRefs[0];
 	if(baseRef->compare_exchange_strong(base.word, newPTE.word))
 		return phys;
+	std::cout << "old: " << std::bitset<64>(base.word) << "\nnew: " << std::bitset<64>(PTE(*baseRef).word) << std::endl;
 	return 0;
 }
 
 // this function does not race with any other thread
 void Buffer::map(u64 phys){
-	PTE newPTE = basePTE();
-	newPTE.present = 1;
 	for(int i=0; i<nb; i++){
+		PTE newPTE = snapshot[i];
+		newPTE.present = 1;
 		newPTE.phys = phys+i;
 		std::atomic<u64>* ref = pteRefs[i];
 		ref->store(newPTE.word);
 	}
 }
 
+// this function does not race with any other thread
+u64 Buffer::unmap(){
+	u64 phys;
+	PTE newPTE = basePTE();
+	phys = newPTE.phys;
+	for(int i=0; i<nb; i++){
+		newPTE = snapshot[i];
+		newPTE.present = 0;
+		newPTE.phys = 0;
+		std::atomic<u64>* ref = pteRefs[i];
+		ref->store(newPTE.word);
+	}
+	return phys;
+}
 // this function does not race with any other thread
 void Buffer::invalidateTLBEntries(){
 	for(int i=0; i<nb; i++){
