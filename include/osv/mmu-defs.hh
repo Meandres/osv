@@ -177,6 +177,7 @@ pt_element<N> make_empty_pte() { return pt_element<N>(); }
 
 /* get the root of the page table responsible for virtual address virt */
 pt_element<4> *get_root_pt(uintptr_t virt);
+pt_element<0>* get_root_ptr();
 
 /* take an error code coming from the exception frame, and return
    whether the error reports a page fault (insn/write) */

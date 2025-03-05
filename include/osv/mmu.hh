@@ -20,6 +20,8 @@
 #include <osv/mmu-defs.hh>
 #include <osv/align.hh>
 #include <osv/trace.hh>
+#include <osv/rwlock.h>
+#include <set>
 #include <osv/kernel_config_memory_debug.h>
 #include <osv/kernel_config_memory_jvm_balloon.h>
 
@@ -63,7 +65,7 @@ struct linear_vma {
 
 class vma {
 public:
-    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr);
+    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr, u64 id=0);
     virtual ~vma();
     void set(uintptr_t start, uintptr_t end);
     void protect(unsigned perm);
@@ -73,6 +75,7 @@ public:
     uintptr_t size() const;
     unsigned perm() const;
     unsigned flags() const;
+    u64 id() const;
     virtual void fault(uintptr_t addr, exception_frame *ef);
     virtual void split(uintptr_t edge) = 0;
     virtual error sync(uintptr_t start, uintptr_t end) = 0;
@@ -90,6 +93,7 @@ protected:
     unsigned _flags;
     bool _map_dirty;
     page_allocator *_page_ops;
+    u64 _id;
 public:
     boost::intrusive::set_member_hook<> _vma_list_hook;
 };
@@ -128,6 +132,7 @@ struct vma_range {
 class anon_vma : public vma {
 public:
     anon_vma(addr_range range, unsigned perm, unsigned flags);
+    anon_vma(addr_range range, unsigned perm, unsigned flags, uint64_t id);
     virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
 };
@@ -377,6 +382,150 @@ unsigned long all_vmas_size();
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);
 
+namespace bi = boost::intrusive;
+
+struct vma_range_compare {
+    bool operator()(const vma_range& a, const vma_range& b) const {
+        return a.start() < b.start();
+    }
+};
+
+extern rwlock_t vma_range_set_mutex;
+extern std::set<vma_range, vma_range_compare> vma_range_set;
+
+class vma_compare {
+public:
+    bool operator ()(const vma& a, const vma& b) const {
+        return a.addr() < b.addr();
+    }
+};
+
+constexpr uintptr_t lower_vma_limit = 0x0;
+constexpr uintptr_t upper_vma_limit = 0x400000000000;
+
+typedef boost::intrusive::set<vma,
+                              bi::compare<vma_compare>,
+                              bi::member_hook<vma,
+                                              bi::set_member_hook<>,
+                                              &vma::_vma_list_hook>,
+                              bi::optimize_size<true>
+                              > vma_list_base;
+
+struct vma_list_type : vma_list_base {
+    vma_list_type() {
+        // insert markers for the edges of allocatable area
+        // simplifies searches
+        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
+        insert(*lower_edge);
+        auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
+        insert(*upper_edge);
+
+        WITH_LOCK(vma_range_set_mutex.for_write()) {
+            vma_range_set.insert(vma_range(lower_edge));
+            vma_range_set.insert(vma_range(upper_edge));
+        }
+    }
+};
+
+struct vm_range : public bi::set_base_hook<> {
+    uintptr_t addr;
+    uint64_t size;
+
+    vm_range(uintptr_t addr, uint64_t size) : addr(addr), size(size) {}
+
+    bool operator<(const vm_range& other) const {
+        return addr < other.addr;
+    }
+};
+
+struct vm_range_compare {
+    bool operator()(const vm_range& a, const vm_range& b) const {
+        return a.addr < b.addr;
+    }
+};
+
+using vm_range_set = bi::set<vm_range, bi::compare<vm_range_compare>, bi::optimize_size<true>>;
+
+struct vm_range_type : vm_range_set {
+    vm_range_type() {
+
+    }
+};
+
+struct superblock_bucket {
+  vma_list_type vma_list;
+  rwlock_t vma_list_mutex;
+  vm_range_set free_ranges;
+  rwlock_t free_ranges_mutex;
+  char padding[48];
+};
+
+class superblock_manager {
+    // 64 workers for superblock segments, 1 worker for outside segments
+    std::array<superblock_bucket, sched::max_cpus + 1> workers;
+    std::array<std::atomic_uint8_t, superblock_len> superblocks;
+
+    uint8_t free_idx{255};
+    uint8_t resereved_idx{254};
+
+    uint8_t cpu_id();
+    u64 superblock_index(const uintptr_t addr);
+    inline u64 superblock_index(const void* addr){ return superblock_index(reinterpret_cast<uintptr_t>(addr)); }
+    uintptr_t superblock_ptr(const u64 superblock);
+    uint8_t owner(const uintptr_t addr);
+    inline uint8_t owner(const void* addr){ return owner(reinterpret_cast<uintptr_t>(addr)); }
+    inline uint8_t owner(const vma& v){ return owner(v.start()); }
+    void release_superblocks(u64 start, unsigned n);
+    u64 allocate_superblocks(unsigned n);
+
+    // tries to allocate the superblock with index n. Returns once the superblock is allocated with the cpu id
+    uint8_t allocate_superblock_at(u64 index, uint8_t core);
+
+    // Returns the iterator with the largest key less or equal than addr.
+    vm_range_set::iterator leq_range(vm_range addr, vm_range_set& fr);
+
+  public:
+    superblock_manager();
+
+    // Get vma lock for manager managing intersecting superblock
+    rwlock_t& vma_lock(const uintptr_t addr);
+
+    inline rwlock_t& vma_lock(const void* addr){ return vma_lock(reinterpret_cast<uintptr_t>(addr)); }
+
+    rwlock_t& free_ranges_lock(uintptr_t addr);
+    vma_list_type::iterator vma_end_iterator(uintptr_t addr);
+
+    vma_list_type::iterator find_intersecting_vma(const uintptr_t addr);
+
+    std::pair<vma_list_type::iterator, vma_list_type::iterator>find_intersecting_vmas(addr_range r);
+
+    void insert(vma* v);
+
+    // Allocating the given range means removing it from the free_ranges map
+    void allocate_range(uintptr_t addr, u64 size);
+
+    // If this returns true, the entire map is guaranteed to be owned by the same bucket
+    bool validate_map_fixed(uintptr_t start, u64 size);
+    
+    void erase(vma& v);
+  
+    // Frees the given range by adding it to the free range map
+    void free_range(uintptr_t addr, u64 size, uint8_t owner);
+    
+    // Frees the given range by adding it to the free range map. Requires the addr to be owned
+    void free_range(uintptr_t addr, u64 size);
+    
+    // Returns the pointer to a free range of the requested size.
+    // This function is threadsafe and already allocates the memory
+    // from free_ranges
+    uintptr_t reserve_range(u64 size);
+    
+    u64 all_vmas_size();
+    
+    std::string procfs_maps();
+};
+
+extern superblock_manager* sb_mgr;
 void initialize_superblocks();
 }
 

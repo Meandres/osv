@@ -920,6 +920,10 @@ ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
 drivers += drivers/nvme-queue.o
 endif
+ifeq ($(conf_drivers_pollnvme),1)
+drivers += drivers/poll_nvme.o
+$(out)/drivers/poll_nvme.o: CXXFLAGS += -DUNVME_IDENTITY_MAP_DMA
+endif
 ifeq ($(conf_networking_stack),1)
 drivers += drivers/virtio-net.o
 endif
@@ -1092,6 +1096,8 @@ objects += core/llfree/child.o
 objects += core/llfree/local.o
 objects += core/llfree/lower.o
 objects += core/llfree/tree.o
+
+objects += core/ucache.o
 
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o

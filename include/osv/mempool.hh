@@ -52,6 +52,9 @@ public:
   void *alloc_page();
 
   /// Allocate a frame of the given order without header information
+  u64 alloc_page_phys_addr(unsigned order);
+  
+  /// Allocate a frame of the given order without header information
   void *alloc_huge_page(unsigned order);
 
   /// Allocate the frame llfree keeps at the given index
@@ -62,6 +65,8 @@ public:
 
   /// Free a page of the corresponding order
   void free_page(void *addr, unsigned order);
+
+  void free_page_phys_addr(u64 idx, unsigned order);
 
   /// Calculate the order of memory to be allocated
   static unsigned order(size_t size);;

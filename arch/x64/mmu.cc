@@ -123,6 +123,9 @@ static pt_element<4> page_table_root __attribute__((init_priority((int)init_prio
 pt_element<4> *get_root_pt(uintptr_t virt __attribute__((unused))) {
     return &page_table_root;
 }
+pt_element<0>* get_root_ptr(){
+    return (pt_element<0>*)&page_table_root;
+}
 
 void switch_to_runtime_page_tables()
 {

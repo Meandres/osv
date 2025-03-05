@@ -43,6 +43,11 @@ ifeq ($(conf_drivers_nvme),1)
 export conf_drivers_pci?=1
 endif
 
+export conf_drivers_pollnvme?=0
+ifeq ($(conf_drivers_nvme),1)
+export conf_drivers_pci?=1
+endif
+
 export conf_drivers_vmxnet3?=0
 ifeq ($(conf_drivers_vmxnet3),1)
 export conf_drivers_pci?=1

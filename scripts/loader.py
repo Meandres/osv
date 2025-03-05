@@ -1714,7 +1714,7 @@ class osv_linear_mmap(gdb.Command):
                       (vaddr, paddr, size, memattr, name))
 
 osv()
-osv_heap()
+#osv_heap()
 osv_memory()
 osv_waiters()
 osv_mmap()

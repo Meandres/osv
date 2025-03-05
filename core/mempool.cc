@@ -39,7 +39,7 @@
 #include <osv/export.h>
 
 #include <osv/llfree.h>
-#include <osv/kernel_integration.hh>
+#include <osv/ucache.hh>
 
 #include <osv/kernel_config_lazy_stack.h>
 #include <osv/kernel_config_lazy_stack_invariant.h>
@@ -869,6 +869,24 @@ void *llf::alloc_page() {
     return nullptr;
 }
 
+u64 llf::alloc_page_phys_addr(unsigned order){
+   assert(is_ready());
+
+    llfree_result_t page = llfree_get(
+        self,
+        mempool_cpuid(),
+        llflags(order)
+    );
+
+    if(llfree_is_ok(page)){
+        return page.frame;
+    }
+
+    oom();
+    return 0;
+
+}
+
 void *llf::alloc_huge_page(unsigned order){
    assert(is_ready());
 
@@ -922,6 +940,19 @@ void llf::free_page(void *addr, unsigned order){
         self,
         mempool_cpuid(),
         virt_to_idx(addr),
+        llflags(order)
+    );
+
+    assert(llfree_is_ok(res));
+}
+
+void llf::free_page_phys_addr(u64 idx, unsigned order){
+    assert(is_ready());
+
+    llfree_result_t res = llfree_put(
+        self,
+        mempool_cpuid(),
+        idx,
         llflags(order)
     );
 
@@ -1654,9 +1685,11 @@ extern "C" void free_contiguous_aligned(void* p)
     memory::free_phys_contiguous_aligned(p);
 }
 
-namespace kii {
+namespace ucache {
     void* frames_alloc(unsigned order){ return memory::llfree_allocator.alloc_huge_page(order); }
+    u64 frames_alloc_phys_addr(size_t size) { return memory::llfree_allocator.alloc_page_phys_addr(memory::llfree_allocator.order(size)); }
     void free_frames(void* addr, unsigned order){ memory::llfree_allocator.free_page(addr, order); }
+    void frames_free_phys_addr(u64 idx, size_t size){ memory::llfree_allocator.free_page_phys_addr(idx, memory::llfree_allocator.order(size)); }
 
     u64 stat_free_phys_mem() { return memory::llfree_allocator.free_memory(); }
     u64 stat_total_phys_mem() { return memory::total_memory.load(); }

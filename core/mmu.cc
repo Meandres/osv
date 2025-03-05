@@ -30,13 +30,12 @@
 #include <osv/rwlock.h>
 #include <numeric>
 #include <set>
+#include <osv/ucache.hh>
 
 #include <osv/kernel_config_memory_debug.h>
 #include <osv/kernel_config_lazy_stack.h>
 #include <osv/kernel_config_lazy_stack_invariant.h>
 #include <osv/kernel_config_memory_jvm_balloon.h>
-
-#include <osv/kernel_integration.hh>
 
 // FIXME: Without this pragma, we get a lot of warnings that I don't know
 // how to explain or fix. For now, let's just ignore them :-(
@@ -60,12 +59,6 @@ namespace mmu {
 #define PREVENT_STACK_PAGE_FAULT
 #endif
 
-struct vma_range_compare {
-    bool operator()(const vma_range& a, const vma_range& b) const {
-        return a.start() < b.start();
-    }
-};
-
 //Set of all vma ranges - both linear and non-linear ones
 __attribute__((init_priority((int)init_prio::vma_range_set)))
 std::set<vma_range, vma_range_compare> vma_range_set;
@@ -81,75 +74,6 @@ __attribute__((init_priority((int)init_prio::linear_vma_set)))
 std::set<linear_vma*, linear_vma_compare> linear_vma_set;
 rwlock_t linear_vma_set_mutex;
 
-namespace bi = boost::intrusive;
-
-class vma_compare {
-public:
-    bool operator ()(const vma& a, const vma& b) const {
-        return a.addr() < b.addr();
-    }
-};
-
-constexpr uintptr_t lower_vma_limit = 0x0;
-constexpr uintptr_t upper_vma_limit = 0x400000000000;
-
-typedef boost::intrusive::set<vma,
-                              bi::compare<vma_compare>,
-                              bi::member_hook<vma,
-                                              bi::set_member_hook<>,
-                                              &vma::_vma_list_hook>,
-                              bi::optimize_size<true>
-                              > vma_list_base;
-
-struct vma_list_type : vma_list_base {
-    vma_list_type() {
-        // insert markers for the edges of allocatable area
-        // simplifies searches
-        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
-        insert(*lower_edge);
-        auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
-        insert(*upper_edge);
-
-        WITH_LOCK(vma_range_set_mutex.for_write()) {
-            vma_range_set.insert(vma_range(lower_edge));
-            vma_range_set.insert(vma_range(upper_edge));
-        }
-    }
-};
-
-struct vm_range : public bi::set_base_hook<> {
-    uintptr_t addr;
-    uint64_t size;
-
-    vm_range(uintptr_t addr, uint64_t size) : addr(addr), size(size) {}
-
-    bool operator<(const vm_range& other) const {
-        return addr < other.addr;
-    }
-};
-
-struct vm_range_compare {
-    bool operator()(const vm_range& a, const vm_range& b) const {
-        return a.addr < b.addr;
-    }
-};
-
-using vm_range_set = bi::set<vm_range, bi::compare<vm_range_compare>, bi::optimize_size<true>>;
-
-struct vm_range_type : vm_range_set {
-    vm_range_type() {
-
-    }
-};
-
-struct superblock_bucket {
-  vma_list_type vma_list;
-  rwlock_t vma_list_mutex;
-  vm_range_set free_ranges;
-  rwlock_t free_ranges_mutex;
-  char padding[48];
-};
-
 // So that we don't need to create a vma (with size, permission and alot of
 // other irrelevant data) just to find an address in the vma list, we have
 // the following addr_compare, which compares exactly like vma_compare does,
@@ -160,381 +84,367 @@ public:
     bool operator()(uintptr_t x, const vma& y) const { return x < y.start(); }
 };
 
-class superblock_manager {
-    // 64 workers for superblock segments, 1 worker for outside segments
-    std::array<superblock_bucket, sched::max_cpus + 1> workers;
-    std::array<std::atomic_uint8_t, superblock_len> superblocks;
+uint8_t superblock_manager::cpu_id(){
+    return sched::cpu::current() ? sched::cpu::current()->id : 0;
+}
 
-    uint8_t free_idx{255};
-    uint8_t resereved_idx{254};
+u64 superblock_manager::superblock_index(const uintptr_t addr){
+    return (addr - superblock_area_base) >> superblock_bits;
+}
 
-    uint8_t cpu_id(){
-        return sched::cpu::current() ? sched::cpu::current()->id : 0;
+uintptr_t superblock_manager::superblock_ptr(const u64 superblock){
+    return (superblock << superblock_bits) + superblock_area_base;
+}
+
+uint8_t superblock_manager::owner(const uintptr_t addr){
+    if(addr < superblock_area_base || addr >= main_mem_area_base)
+        return workers.size()-1;
+    return superblocks[superblock_index(addr)].load();
+}
+
+void superblock_manager::release_superblocks(u64 start, unsigned n){
+    uint8_t cpuid = cpu_id();
+    for(u64 i{start}; i < start + n; ++i){
+        superblocks[i].compare_exchange_weak(cpuid, 255, std::memory_order_acq_rel);
     }
+}
 
-    u64 superblock_index(const uintptr_t addr){
-        return (addr - superblock_area_base) >> superblock_bits;
-    }
-    u64 superblock_index(const void* addr){ return superblock_index(reinterpret_cast<uintptr_t>(addr)); }
+u64 superblock_manager::allocate_superblocks(unsigned n){
+    assert(n > 0);
+    // we need to mark them as "resereved" not allocated first, if we need multiple blocks
+    uint8_t swap_id = n == 1? cpu_id() : resereved_idx;
 
-    uintptr_t superblock_ptr(const u64 superblock){
-        return (superblock << superblock_bits) + superblock_area_base;
-    }
-
-    uint8_t owner(const uintptr_t addr){
-        if(addr < superblock_area_base || addr >= main_mem_area_base)
-            return workers.size()-1;
-        return superblocks[superblock_index(addr)].load();
-    }
-    uint8_t owner(const void* addr){ return owner(reinterpret_cast<uintptr_t>(addr)); }
-    uint8_t owner(const vma& v){ return owner(v.start()); }
-
-    void release_superblocks(u64 start, unsigned n){
-        uint8_t cpuid = cpu_id();
-        for(u64 i{start}; i < start + n; ++i){
-            superblocks[i].compare_exchange_weak(cpuid, 255, std::memory_order_acq_rel);
-        }
-    }
-
-    u64 allocate_superblocks(unsigned n){
-        assert(n > 0);
-        // we need to mark them as "resereved" not allocated first, if we need multiple blocks
-        uint8_t swap_id = n == 1? cpu_id() : resereved_idx;
-
-        unsigned k{0};
-        for(unsigned i{0}; i < superblock_len; ++i){
-            if(superblocks[i].load() != free_idx) {
-              k = 0;
-            } else if(++k == n) {
-                // We found n free segments in a row. Now lets see if we can reserve them before someone else does
-                for(unsigned j{i-n+1}; j <= i; ++j){
-                    if(!superblocks[j].compare_exchange_weak(free_idx, swap_id, std::memory_order_acq_rel)){
-                        // Someone else was faster, we have to start over
-                        release_superblocks(i-n, j-i-n);
-                        return allocate_superblocks(n);
-                    };
-                }
-                unsigned first_index = i-n+1;
-                if(n > 1){
-                    for(unsigned j{first_index}; j <= i; ++j){
-                        superblocks[j].store(cpu_id());
-                    }
-                }
-                return first_index;
+    unsigned k{0};
+    for(unsigned i{0}; i < superblock_len; ++i){
+        if(superblocks[i].load() != free_idx) {
+          k = 0;
+        } else if(++k == n) {
+            // We found n free segments in a row. Now lets see if we can reserve them before someone else does
+            for(unsigned j{i-n+1}; j <= i; ++j){
+                if(!superblocks[j].compare_exchange_weak(free_idx, swap_id, std::memory_order_acq_rel)){
+                    // Someone else was faster, we have to start over
+                    release_superblocks(i-n, j-i-n);
+                    return allocate_superblocks(n);
+                };
             }
-
-        }
-
-        printf("couldn't allocate superblock\n");
-        // TODO This error isn't thrown correctly
-        throw make_error(ENOMEM);
-        return 0;
-    }
-
-    // tries to allocate the superblock with index n. Returns once the superblock is allocated with the cpu id
-    uint8_t allocate_superblock_at(u64 index, uint8_t core){
-      uint8_t free_idx = 255;
-      while(superblocks[index].load() >= workers.size()){
-          if(superblocks[index].compare_exchange_weak(
-                free_idx, core, std::memory_order_acq_rel)){
-                WITH_LOCK(workers[core].free_ranges_mutex.for_write()){
-                    free_range(superblock_ptr(index), superblock_size);
+            unsigned first_index = i-n+1;
+            if(n > 1){
+                for(unsigned j{first_index}; j <= i; ++j){
+                    superblocks[j].store(cpu_id());
                 }
             }
-
-      }
-      uint8_t id = superblocks[index].load();
-      assert(id < workers.size());
-      return id;
-    }
-
-    // Returns the iterator with the largest key less or equal than addr.
-    vm_range_set::iterator leq_range(vm_range addr, vm_range_set& fr){
-        auto it = fr.upper_bound(addr);
-        if(it != fr.begin())
-            return --it;
-        else
-            return fr.end();
-    }
-
-  public:
-    superblock_manager(){
-      for(auto& a : superblocks){
-          a.store(255, std::memory_order_relaxed);
-      }
-
-      auto lower_range = new vm_range(0, superblock_area_base);
-      workers[workers.size()-1].free_ranges.insert(*lower_range);
-      auto upper_edge = new vm_range(main_mem_area_base, (1ul << 63) - main_mem_area_base);
-      workers[workers.size()-1].free_ranges.insert(*upper_edge);
-    }
-
-    // Get vma lock for manager managing intersecting superblock
-    rwlock_t& vma_lock(const uintptr_t addr){
-        uint8_t o = owner(addr);
-        assert(o < workers.size());
-        return workers[owner(addr)].vma_list_mutex;
-    }
-
-    rwlock_t& vma_lock(const void* addr){ return vma_lock(reinterpret_cast<uintptr_t>(addr)); }
-
-    rwlock_t& free_ranges_lock(uintptr_t addr){
-        return workers[owner(addr)].free_ranges_mutex;
-    }
-
-    vma_list_type::iterator vma_end_iterator(uintptr_t addr){
-        return workers[owner(addr)].vma_list.end();
-    }
-
-    vma_list_type::iterator find_intersecting_vma(const uintptr_t addr){
-    auto& my_vma_list = workers[owner(addr)].vma_list;
-
-    auto vma = my_vma_list.lower_bound(addr, addr_compare());
-        if (vma->start() == addr) {
-            return vma;
+            return first_index;
         }
-        --vma;
-        if (addr >= vma->start() && addr < vma->end()) {
-              return vma;
-        } else {
-              return my_vma_list.end();
-        }
+
     }
 
-    std::pair<vma_list_type::iterator, vma_list_type::iterator>
-    find_intersecting_vmas(addr_range r){
-        assert(owner(r.start()) == owner(r.end()-1));
+    printf("couldn't allocate superblock\n");
+    // TODO This error isn't thrown correctly
+    throw make_error(ENOMEM);
+    return 0;
+}
 
-        auto& my_vma_list = workers[owner(r.start())].vma_list;
-      
-        if (r.end() <= r.start()) { // empty range, so nothing matches
-            return {my_vma_list.end(), my_vma_list.end()};
-        }
-        auto start = my_vma_list.lower_bound(r.start(), addr_compare());
-        if (start->start() > r.start()) {
-            // The previous vma might also intersect with our range if it ends
-            // after our range's start.
-            auto prev = std::prev(start);
-            if (prev->end() > r.start()) {
-                start = prev;
-            }
-        }
-        // If the start vma is actually beyond the end of the search range,
-        // there is no intersection.
-        if (start->start() >= r.end()) {
-            return {my_vma_list.end(), my_vma_list.end()};
-        }
-        // end is the first vma starting >= r.end(), so any previous vma (after
-        // start) surely started < r.end() so is part of the intersection.
-        auto end = my_vma_list.lower_bound(r.end(), addr_compare());
-        return {start, end};
-    }
-
-    void insert(vma* v){
-        uint8_t i = owner(*v);
-        workers[i].vma_list.insert(*v);
-    }
-
-    // Allocating the given range means removing it from the free_ranges map
-    void allocate_range(uintptr_t addr, u64 size){
-        auto r = vm_range(addr, size);
-        uint8_t i = owner(addr);
-        auto& my = workers[i];
-
-        auto range = leq_range(r, my.free_ranges);
-
-        // We assume that the range was free
-        assert(range != my.free_ranges.end());
-        assert(range->size >= size);
-
-        // We allocate the beginning of a free range
-        if(range->addr == addr){
-            auto& moved = *range;
-            my.free_ranges.erase(range);
-            if(moved.size > size){
-                moved.addr += size;
-                moved.size -= size;
-                my.free_ranges.insert(moved);
-            } else {
-                delete &moved;
-            }
-        // We allocate the middle or end of a free range 
-        } else {
-            u64 offset = addr - range->addr;
-            u64 tail_size = range->size - offset - size;
-
-            // adjust size of preceding range
-            range->size = offset;
-
-
-            // insert new range behind newly allocated region
-            if(tail_size){
-                my.free_ranges.insert(*(new vm_range(addr + size, tail_size)));
-            }
-            
-        }
-    }
-
-    // If this returns true, the entire map is guaranteed to be owned by the same bucket
-    bool validate_map_fixed(uintptr_t start, u64 size){
-        // Outside superblock area is always valid
-        if(start + size < superblock_area_base || start >= main_mem_area_base)
-          return true;
-
-        // Overlaps between superblock area and outside are never valid
-        if((start < superblock_area_base && start + size >= superblock_area_base) ||
-           (start < main_mem_area_base && start + size >= main_mem_area_base))
-          return false;
-
-        // Within superblock area is only valid if all required superblocks
-        // are either free or owner by the same core
-        uint8_t first_owner = free_idx;
-        for(uintptr_t s{start}; s < start + size; s += superblock_size){
-            uint8_t cur_owner = owner(s);
-            if(cur_owner < workers.size()){
-                if(first_owner < workers.size() && cur_owner != first_owner) return false;
-                first_owner = cur_owner;
+// tries to allocate the superblock with index n. Returns once the superblock is allocated with the cpu id
+uint8_t superblock_manager::allocate_superblock_at(u64 index, uint8_t core){
+  uint8_t free_idx = 255;
+  while(superblocks[index].load() >= workers.size()){
+      if(superblocks[index].compare_exchange_weak(
+            free_idx, core, std::memory_order_acq_rel)){
+            WITH_LOCK(workers[core].free_ranges_mutex.for_write()){
+                free_range(superblock_ptr(index), superblock_size);
             }
         }
 
-        if(first_owner == 255)
-            first_owner = cpu_id();
+  }
+  uint8_t id = superblocks[index].load();
+  assert(id < workers.size());
+  return id;
+}
 
-        for(uintptr_t s{start}; s < start + size; s += superblock_size){
-            if(allocate_superblock_at(superblock_index(s), first_owner) != first_owner) return false;
-        }
+// Returns the iterator with the largest key less or equal than addr.
+vm_range_set::iterator superblock_manager::leq_range(vm_range addr, vm_range_set& fr){
+    auto it = fr.upper_bound(addr);
+    if(it != fr.begin())
+        return --it;
+    else
+        return fr.end();
+}
 
-        return true;
+superblock_manager::superblock_manager(){
+  for(auto& a : superblocks){
+      a.store(255, std::memory_order_relaxed);
+  }
+
+  auto lower_range = new vm_range(0, superblock_area_base);
+  workers[workers.size()-1].free_ranges.insert(*lower_range);
+  auto upper_edge = new vm_range(main_mem_area_base, (1ul << 63) - main_mem_area_base);
+  workers[workers.size()-1].free_ranges.insert(*upper_edge);
+}
+
+// Get vma lock for manager managing intersecting superblock
+rwlock_t& superblock_manager::vma_lock(const uintptr_t addr){
+    uint8_t o = owner(addr);
+    assert(o < workers.size());
+    return workers[owner(addr)].vma_list_mutex;
+}
+
+
+rwlock_t& superblock_manager::free_ranges_lock(uintptr_t addr){
+    return workers[owner(addr)].free_ranges_mutex;
+}
+
+vma_list_type::iterator superblock_manager::vma_end_iterator(uintptr_t addr){
+    return workers[owner(addr)].vma_list.end();
+}
+
+vma_list_type::iterator superblock_manager::find_intersecting_vma(const uintptr_t addr){
+auto& my_vma_list = workers[owner(addr)].vma_list;
+
+auto vma = my_vma_list.lower_bound(addr, addr_compare());
+    if (vma->start() == addr) {
+        return vma;
     }
-
-    void erase(vma& v){
-        uint8_t i = owner(v);
-        workers[i].vma_list.erase(v);
+    --vma;
+    if (addr >= vma->start() && addr < vma->end()) {
+          return vma;
+    } else {
+          return my_vma_list.end();
     }
+}
+
+std::pair<vma_list_type::iterator, vma_list_type::iterator>
+superblock_manager::find_intersecting_vmas(addr_range r){
+    assert(owner(r.start()) == owner(r.end()-1));
+
+    auto& my_vma_list = workers[owner(r.start())].vma_list;
   
-    // Frees the given range by adding it to the free range map
-    void free_range(uintptr_t addr, u64 size, uint8_t owner){
-        if(size == 0) return;
-
-        auto& my = workers[owner];
-        auto r = vm_range(addr, size);
-
-        // Get the previous range if there is one
-        auto prev = leq_range(r, my.free_ranges);
-
-        bool inplace{false};
-
-        if(prev != my.free_ranges.end()) {
-            if(prev->addr + prev->size > addr){
-                printf("[WARNING] While freeing virtual memory range: 0x%lx-0x%lx\n", addr, addr+size);
-                printf("          Overlapping region is already free: 0x%lx-0x%lx\n", prev->addr, prev->addr + prev->size);
-                return;
-            }
-
-            // Check if we can merge them
-            if(prev->addr + prev->size == addr) {
-                prev->size += size;
-                addr = prev->addr;
-                size = prev->size;
-                inplace = true;
-            }
+    if (r.end() <= r.start()) { // empty range, so nothing matches
+        return {my_vma_list.end(), my_vma_list.end()};
+    }
+    auto start = my_vma_list.lower_bound(r.start(), addr_compare());
+    if (start->start() > r.start()) {
+        // The previous vma might also intersect with our range if it ends
+        // after our range's start.
+        auto prev = std::prev(start);
+        if (prev->end() > r.start()) {
+            start = prev;
         }
+    }
+    // If the start vma is actually beyond the end of the search range,
+    // there is no intersection.
+    if (start->start() >= r.end()) {
+        return {my_vma_list.end(), my_vma_list.end()};
+    }
+    // end is the first vma starting >= r.end(), so any previous vma (after
+    // start) surely started < r.end() so is part of the intersection.
+    auto end = my_vma_list.lower_bound(r.end(), addr_compare());
+    return {start, end};
+}
 
-        // Get the next range
-        auto next = my.free_ranges.upper_bound(r);
+void superblock_manager::insert(vma* v){
+    uint8_t i = owner(*v);
+    workers[i].vma_list.insert(*v);
+}
 
-        // We cannot merge with next element
-        if(next == my.free_ranges.end() || next->addr != addr + size){
-            if(!inplace)
-                my.free_ranges.insert(*(new vm_range(r)));
+// Allocating the given range means removing it from the free_ranges map
+void superblock_manager::allocate_range(uintptr_t addr, u64 size){
+    auto r = vm_range(addr, size);
+    uint8_t i = owner(addr);
+    auto& my = workers[i];
+
+    auto range = leq_range(r, my.free_ranges);
+
+    // We assume that the range was free
+    assert(range != my.free_ranges.end());
+    assert(range->size >= size);
+
+    // We allocate the beginning of a free range
+    if(range->addr == addr){
+        auto& moved = *range;
+        my.free_ranges.erase(range);
+        if(moved.size > size){
+            moved.addr += size;
+            moved.size -= size;
+            my.free_ranges.insert(moved);
+        } else {
+            delete &moved;
+        }
+    // We allocate the middle or end of a free range 
+    } else {
+        u64 offset = addr - range->addr;
+        u64 tail_size = range->size - offset - size;
+
+        // adjust size of preceding range
+        range->size = offset;
+
+
+        // insert new range behind newly allocated region
+        if(tail_size){
+            my.free_ranges.insert(*(new vm_range(addr + size, tail_size)));
+        }
+        
+    }
+}
+
+// If this returns true, the entire map is guaranteed to be owned by the same bucket
+bool superblock_manager::validate_map_fixed(uintptr_t start, u64 size){
+    // Outside superblock area is always valid
+    if(start + size < superblock_area_base || start >= main_mem_area_base)
+      return true;
+
+    // Overlaps between superblock area and outside are never valid
+    if((start < superblock_area_base && start + size >= superblock_area_base) ||
+       (start < main_mem_area_base && start + size >= main_mem_area_base))
+      return false;
+
+    // Within superblock area is only valid if all required superblocks
+    // are either free or owner by the same core
+    uint8_t first_owner = free_idx;
+    for(uintptr_t s{start}; s < start + size; s += superblock_size){
+        uint8_t cur_owner = owner(s);
+        if(cur_owner < workers.size()){
+            if(first_owner < workers.size() && cur_owner != first_owner) return false;
+            first_owner = cur_owner;
+        }
+    }
+
+    if(first_owner == 255)
+        first_owner = cpu_id();
+
+    for(uintptr_t s{start}; s < start + size; s += superblock_size){
+        if(allocate_superblock_at(superblock_index(s), first_owner) != first_owner) return false;
+    }
+
+    return true;
+}
+
+void superblock_manager::erase(vma& v){
+    uint8_t i = owner(v);
+    workers[i].vma_list.erase(v);
+}
+
+// Frees the given range by adding it to the free range map
+void superblock_manager::free_range(uintptr_t addr, u64 size, uint8_t owner){
+    if(size == 0) return;
+
+    auto& my = workers[owner];
+    auto r = vm_range(addr, size);
+
+    // Get the previous range if there is one
+    auto prev = leq_range(r, my.free_ranges);
+
+    bool inplace{false};
+
+    if(prev != my.free_ranges.end()) {
+        if(prev->addr + prev->size > addr){
+            printf("[WARNING] While freeing virtual memory range: 0x%lx-0x%lx\n", addr, addr+size);
+            printf("          Overlapping region is already free: 0x%lx-0x%lx\n", prev->addr, prev->addr + prev->size);
             return;
         }
 
-        // We can merge with next range
-        auto& moved = *next;
-        my.free_ranges.erase(next);
-        moved.addr = addr;
-        moved.size += size;
-        my.free_ranges.insert(moved);
+        // Check if we can merge them
+        if(prev->addr + prev->size == addr) {
+            prev->size += size;
+            addr = prev->addr;
+            size = prev->size;
+            inplace = true;
+        }
     }
 
-    // Frees the given range by adding it to the free range map. Requires the addr to be owned
-    void free_range(uintptr_t addr, u64 size){
-        uint8_t i = owner(addr);
-        assert(i < workers.size());
-        assert(workers[i].free_ranges_mutex.wowned());
-        free_range(addr, size, i);
+    // Get the next range
+    auto next = my.free_ranges.upper_bound(r);
+
+    // We cannot merge with next element
+    if(next == my.free_ranges.end() || next->addr != addr + size){
+        if(!inplace)
+            my.free_ranges.insert(*(new vm_range(r)));
+        return;
     }
 
-    // Returns the pointer to a free range of the requested size.
-    // This function is threadsafe and already allocates the memory
-    // from free_ranges
-    uintptr_t reserve_range(u64 size){
-        assert(size > 0);
+    // We can merge with next range
+    auto& moved = *next;
+    my.free_ranges.erase(next);
+    moved.addr = addr;
+    moved.size += size;
+    my.free_ranges.insert(moved);
+}
 
-        uint8_t cpuid = cpu_id();
-        auto &my = workers[cpuid];
+// Frees the given range by adding it to the free range map. Requires the addr to be owned
+void superblock_manager::free_range(uintptr_t addr, u64 size){
+    uint8_t i = owner(addr);
+    assert(i < workers.size());
+    assert(workers[i].free_ranges_mutex.wowned());
+    free_range(addr, size, i);
+}
 
-        // Try to find a large enough free range (first fit).
-        if(size <= superblock_size){
-            WITH_LOCK(my.free_ranges_mutex.for_write()){
-                for(auto& r : my.free_ranges){
-                    if(r.size > size){
-                        r.size -= size;
-                        return r.addr + r.size;
-                    } else if (r.size == size){
-                        uintptr_t res = r.addr;
-                        my.free_ranges.erase(r);
-                        delete &r;
-                        return res;
-                    }
+// Returns the pointer to a free range of the requested size.
+// This function is threadsafe and already allocates the memory
+// from free_ranges
+uintptr_t superblock_manager::reserve_range(u64 size){
+    assert(size > 0);
+
+    uint8_t cpuid = cpu_id();
+    auto &my = workers[cpuid];
+
+    // Try to find a large enough free range (first fit).
+    if(size <= superblock_size){
+        WITH_LOCK(my.free_ranges_mutex.for_write()){
+            for(auto& r : my.free_ranges){
+                if(r.size > size){
+                    r.size -= size;
+                    return r.addr + r.size;
+                } else if (r.size == size){
+                    uintptr_t res = r.addr;
+                    my.free_ranges.erase(r);
+                    delete &r;
+                    return res;
                 }
             }
         }
-
-        // There is no fitting free range we can draw from, so we need to get a new superblock
-        unsigned n = (size-1) / superblock_size + 1;
-        unsigned remainder = (n*superblock_size) - size;
-        u64 s = allocate_superblocks(n);
-        uintptr_t ptr = superblock_ptr(s);
-        WITH_LOCK(my.free_ranges_mutex.for_write()){ free_range(ptr, remainder, cpuid); }
-        return ptr + remainder;
     }
 
-    u64 all_vmas_size(){
-        u64 sum{0};
-        for(auto& w : workers){
-            SCOPE_LOCK(w.vma_list_mutex.for_read());
-            sum += std::accumulate(w.vma_list.begin(), w.vma_list.end(), size_t(0), [](size_t s, vma& v) { return s + v.size(); });
-        }
-        return sum;
-    }
+    // There is no fitting free range we can draw from, so we need to get a new superblock
+    unsigned n = (size-1) / superblock_size + 1;
+    unsigned remainder = (n*superblock_size) - size;
+    u64 s = allocate_superblocks(n);
+    uintptr_t ptr = superblock_ptr(s);
+    WITH_LOCK(my.free_ranges_mutex.for_write()){ free_range(ptr, remainder, cpuid); }
+    return ptr + remainder;
+}
 
-    std::string procfs_maps(){
-        std::string output;
-        for(auto& w : workers){
-            WITH_LOCK(w.vma_list_mutex.for_read()) {
-                for (auto& vma : w.vma_list) {
-                    char read    = vma.perm() & perm_read  ? 'r' : '-';
-                    char write   = vma.perm() & perm_write ? 'w' : '-';
-                    char execute = vma.perm() & perm_exec  ? 'x' : '-';
-                    char priv    = 'p';
-                    output += osv::sprintf("%lx-%lx %c%c%c%c ", vma.start(), vma.end(), read, write, execute, priv);
-                    if (vma.flags() & mmap_file) {
-                        const file_vma &f_vma = static_cast<file_vma&>(vma);
-                        unsigned dev_id_major = major(f_vma.file_dev_id());
-                        unsigned dev_id_minor = minor(f_vma.file_dev_id());
-                        output += osv::sprintf("%08x %02x:%02x %ld %s\n", f_vma.offset(), dev_id_major, dev_id_minor, f_vma.file_inode(), f_vma.file()->f_dentry->d_path);
-                    } else {
-                        output += osv::sprintf("00000000 00:00 0\n");
-                    }
+u64 superblock_manager::all_vmas_size(){
+    u64 sum{0};
+    for(auto& w : workers){
+        SCOPE_LOCK(w.vma_list_mutex.for_read());
+        sum += std::accumulate(w.vma_list.begin(), w.vma_list.end(), size_t(0), [](size_t s, vma& v) { return s + v.size(); });
+    }
+    return sum;
+}
+
+std::string superblock_manager::procfs_maps(){
+    std::string output;
+    for(auto& w : workers){
+        WITH_LOCK(w.vma_list_mutex.for_read()) {
+            for (auto& vma : w.vma_list) {
+                char read    = vma.perm() & perm_read  ? 'r' : '-';
+                char write   = vma.perm() & perm_write ? 'w' : '-';
+                char execute = vma.perm() & perm_exec  ? 'x' : '-';
+                char priv    = 'p';
+                output += osv::sprintf("%lx-%lx %c%c%c%c ", vma.start(), vma.end(), read, write, execute, priv);
+                if (vma.flags() & mmap_file) {
+                    const file_vma &f_vma = static_cast<file_vma&>(vma);
+                    unsigned dev_id_major = major(f_vma.file_dev_id());
+                    unsigned dev_id_minor = minor(f_vma.file_dev_id());
+                    output += osv::sprintf("%08x %02x:%02x %ld %s\n", f_vma.offset(), dev_id_major, dev_id_minor, f_vma.file_inode(), f_vma.file()->f_dentry->d_path);
+                } else {
+                    output += osv::sprintf("00000000 00:00 0\n");
                 }
             }
         }
-        return output;
-
     }
-};
+    return output;
+
+}
 
 // Array of all superblocks available
 superblock_manager* sb_mgr;
@@ -1787,17 +1697,21 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
             trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "slow");
             return;
         }
-        vma->fault(addr, ef);
+        if(vma->id() != 0)
+            ucache::uCacheManager->handleFault(vma->id(), (void*)addr, ef);
+        else
+            vma->fault(addr, ef);
     }
     trace_mmu_vm_fault_ret(addr, ef->get_error());
 }
 
-vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops)
+vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops, u64 id)
     : _range(align_down(range.start(), mmu::page_size), align_up(range.end(), mmu::page_size))
     , _perm(perm)
     , _flags(flags)
     , _map_dirty(map_dirty)
     , _page_ops(page_ops)
+    , _id(id)
 {
 }
 
@@ -1845,9 +1759,14 @@ unsigned vma::flags() const
     return _flags;
 }
 
+u64 vma::id() const
+{
+    return _id;
+}
+
 void vma::update_flags(unsigned flag)
 {
-    assert(sb_mgr->vma_lock(this).wowned());
+    assert(sb_mgr->vma_lock(start()).wowned());
     _flags |= flag;
 }
 
@@ -1910,8 +1829,13 @@ static uninitialized_anonymous_page_provider page_allocator_noinit;
 static initialized_anonymous_page_provider page_allocator_init;
 static page_allocator *page_allocator_noinitp = &page_allocator_noinit, *page_allocator_initp = &page_allocator_init;
 
-anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
-    : vma(range, perm, flags, true, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp)
+anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags):
+    anon_vma(range, perm, flags, 0)
+{
+}
+
+anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags, uint64_t id)
+    : vma(range, perm, flags, true, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp, id)
 {
 }
 
@@ -1938,7 +1862,7 @@ error anon_vma::sync(uintptr_t start, uintptr_t end)
 // not count on it being initialized to any value.
 jvm_balloon_vma::jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start,
                                  uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags)
-    : vma(addr_range(start, end), perm_rw, flags | mmap_jvm_balloon, true, page_allocator_noinitp),
+    : vma(addr_range(start, end), perm_rw, flags | mmap_jvm_balloon, true, page_allocator_noinitp)
       _balloon(b), _jvm_addr(jvm_addr),
       _real_perm(perm), _real_flags(flags & ~mmap_jvm_balloon), _real_size(end - start)
 {
@@ -2146,7 +2070,7 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
 #endif
 
 file_vma::file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator* page_ops)
-    : vma(range, perm, flags | mmap_small, !(flags & mmap_shared), page_ops)
+    : vma(range, perm, flags | mmap_small, !(flags & mmap_shared), page_ops)//, NULL)
     , _file(file)
     , _offset(offset)
 {
@@ -2458,34 +2382,3 @@ extern "C" bool is_linear_mapped(const void *addr)
 {
     return addr >= mmu::phys_mem;
 }
-
-namespace kii {
-  rwlock_t& vma_lock(const uintptr_t addr){ return mmu::sb_mgr->vma_lock(addr); }
-  rwlock_t& free_ranges_lock(const uintptr_t addr){ return mmu::sb_mgr->free_ranges_lock(addr); }
-
-  boost::optional<mmu::vma*> find_intersecting_vma(const uintptr_t addr){
-      auto v = mmu::sb_mgr->find_intersecting_vma(addr);
-      if(v == mmu::sb_mgr->vma_end_iterator(addr))
-        return boost::none;
-      return &*v;
-  }
-
-  std::vector<mmu::vma*> find_intersecting_vmas(const uintptr_t addr, const u64 size){
-      std::vector<mmu::vma*> res;
-
-      auto range = mmu::sb_mgr->find_intersecting_vmas(addr_range(addr, addr + size));
-      for (auto i = range.first; i != range.second; ++i) {
-        res.push_back(&*i);
-      }
-      return res;
-  }
-
-  void insert(mmu::vma* v){ mmu::sb_mgr->insert(v); }
-  void erase(mmu::vma& v){ mmu::sb_mgr->erase(v); }
-
-  bool validate(const uintptr_t addr, const u64 size){ return mmu::sb_mgr->validate_map_fixed(addr, size); }
-  void allocate_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->allocate_range(addr, size); }
-  uintptr_t reserve_range(const u64 size){ return mmu::sb_mgr->reserve_range(size); }
-  void free_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->free_range(addr, size); }
-
-} // namespace kii
