@@ -210,20 +210,22 @@ class superblock_manager {
               k = 0;
             } else if(++k == n) {
                 // We found n free segments in a row. Now lets see if we can reserve them before someone else does
-                for(unsigned j{i-n+1}; j <= i; ++j){
+
+                // Reset i to the first free block
+                i = i-n+1;
+                for(unsigned j{i}; j < i+n; ++j){
                     if(!superblocks[j].compare_exchange_strong(free_idx, swap_id, std::memory_order_seq_cst)){
                         // Someone else was faster, we have to start over
-                        release_superblocks(i-n+1, j-i+n-1);
+                        release_superblocks(i, j-i);
                         return allocate_superblocks(n);
                     };
                 }
-                unsigned first_index = i-n+1;
                 if(n > 1){
-                    for(unsigned j{first_index}; j <= i; ++j){
+                    for(unsigned j{i}; j < i+n; ++j){
                         superblocks[j].store(cpu_id());
                     }
                 }
-                return first_index;
+                return i;
             }
 
         }
