@@ -165,8 +165,8 @@ class superblock_manager {
     std::array<superblock_bucket, sched::max_cpus + 1> workers;
     std::array<std::atomic_uint8_t, superblock_len> superblocks;
 
-    uint8_t free_idx{255};
-    uint8_t resereved_idx{254};
+    const uint8_t _free_idx{255};
+    const uint8_t _reserved_idx{254};
 
     uint8_t cpu_id(){
         return sched::cpu::current() ? sched::cpu::current()->id : 0;
@@ -190,6 +190,7 @@ class superblock_manager {
     uint8_t owner(const vma& v){ return owner(v.start()); }
 
     void release_superblocks(u64 start, unsigned n){
+        if(n == 0) return;
         uint8_t cpuid = cpu_id();
         for(u64 i{start}; i < start + n; ++i){
             superblocks[i].compare_exchange_weak(cpuid, 255, std::memory_order_acq_rel);
@@ -198,19 +199,21 @@ class superblock_manager {
 
     u64 allocate_superblocks(unsigned n){
         assert(n > 0);
+        uint8_t free_idx{_free_idx};
+        uint8_t resereved_idx{_reserved_idx};
         // we need to mark them as "resereved" not allocated first, if we need multiple blocks
         uint8_t swap_id = n == 1? cpu_id() : resereved_idx;
 
         unsigned k{0};
         for(unsigned i{0}; i < superblock_len; ++i){
-            if(superblocks[i].load() != free_idx) {
+            if(superblocks[i].load(std::memory_order_seq_cst) != free_idx) {
               k = 0;
             } else if(++k == n) {
                 // We found n free segments in a row. Now lets see if we can reserve them before someone else does
                 for(unsigned j{i-n+1}; j <= i; ++j){
-                    if(!superblocks[j].compare_exchange_weak(free_idx, swap_id, std::memory_order_acq_rel)){
+                    if(!superblocks[j].compare_exchange_strong(free_idx, swap_id, std::memory_order_seq_cst)){
                         // Someone else was faster, we have to start over
-                        release_superblocks(i-n, j-i-n);
+                        release_superblocks(i-n+1, j-i+n-1);
                         return allocate_superblocks(n);
                     };
                 }
@@ -225,7 +228,7 @@ class superblock_manager {
 
         }
 
-        printf("couldn't allocate superblock\n");
+        printf("[%d] couldn't allocate superblock\n", cpu_id());
         // TODO This error isn't thrown correctly
         throw make_error(ENOMEM);
         return 0;
@@ -233,7 +236,7 @@ class superblock_manager {
 
     // tries to allocate the superblock with index n. Returns once the superblock is allocated with the cpu id
     uint8_t allocate_superblock_at(u64 index, uint8_t core){
-      uint8_t free_idx = 255;
+      uint8_t free_idx{_free_idx};
       while(superblocks[index].load() >= workers.size()){
           if(superblocks[index].compare_exchange_weak(
                 free_idx, core, std::memory_order_acq_rel)){
@@ -388,7 +391,7 @@ class superblock_manager {
 
         // Within superblock area is only valid if all required superblocks
         // are either free or owner by the same core
-        uint8_t first_owner = free_idx;
+        uint8_t first_owner = _free_idx;
         for(uintptr_t s{start}; s < start + size; s += superblock_size){
             uint8_t cur_owner = owner(s);
             if(cur_owner < workers.size()){
