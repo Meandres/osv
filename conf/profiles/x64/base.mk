@@ -44,7 +44,7 @@ export conf_drivers_pci?=1
 endif
 
 export conf_drivers_pollnvme?=0
-ifeq ($(conf_drivers_nvme),1)
+ifeq ($(conf_drivers_pollnvme),1)
 export conf_drivers_pci?=1
 endif
 

@@ -1097,7 +1097,9 @@ objects += core/llfree/local.o
 objects += core/llfree/lower.o
 objects += core/llfree/tree.o
 
+ifeq ($(conf_drivers_pollnvme),1)
 objects += core/ucache.o
+endif
 
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o

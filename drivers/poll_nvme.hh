@@ -47,18 +47,6 @@
 #include <osv/interrupt.hh>
 #include <osv/msi.hh>
 
-inline uint64_t rdtsc(void)
-{
-    union {
-        uint64_t val;
-        struct {
-            uint32_t lo;
-            uint32_t hi;
-        };
-    } tsc;
-    asm volatile ("rdtsc" : "=a" (tsc.lo), "=d" (tsc.hi));
-    return tsc.val;
-}
 /**
  * Get tsc per second using sleeping for 1/100th of a second.
  */
@@ -66,11 +54,11 @@ static inline uint64_t rdtsc_second()
 {
     static uint64_t tsc_ps = 0;
     if (!tsc_ps) {
-        uint64_t t0 = rdtsc();
+        uint64_t t0 = processor::rdtsc();
         usleep(1000);
-        uint64_t t1 = rdtsc();
+        uint64_t t1 = processor::rdtsc();
         usleep(1000);
-        uint64_t t2 = rdtsc();
+        uint64_t t2 = processor::rdtsc();
         t2 -= t1;
         t1 -= t0;
         if (t2 > t1) t2 = t1;
@@ -661,11 +649,11 @@ typedef struct _nvme_queue {
     nvme_sq_entry_t*        sq;         ///< submission queue entries
     nvme_cq_entry_t*        cq;         ///< completion queue entries
     u32*                    sq_doorbell; ///< submission queue doorbell
-    u32*                    cq_doorbell; ///< completion queue doorbell
+    std::atomic<u32>*       cq_doorbell; ///< completion queue doorbell
     int                     sq_head;    ///< submission queue head
     int                     sq_tail;    ///< submission queue tail
-    int                     cq_head;    ///< completion queue head
-    u16                     cq_phase;   ///< completion queue phase bit
+    std::atomic<int>        cq_head;    ///< completion queue head
+    std::atomic<u16>        cq_phase;   ///< completion queue phase bit
     u16                     ext;        ///< externally allocated flag
 } nvme_queue_t;
 
@@ -899,6 +887,7 @@ int unvme_do_free(const unvme_ns_t* ses, void* buf);
 int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs);
 unvme_desc_t* unvme_do_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc, void* buff, u64 slba, u32 nlb);
+int unvme_check_completion(const unvme_ns_t* ns, int qid);
 
 
 #define UNVME_TIMEOUT   60          ///< default timeout in seconds

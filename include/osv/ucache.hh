@@ -13,7 +13,9 @@
 #include <cmath>
 #include <cstring>
 #include <bitset>
+#include <fstream>
 #include <sys/mman.h>
+#include "drivers/poll_nvme.hh"
 
 #include <osv/types.h>
 #include <osv/sched.hh>
@@ -21,7 +23,6 @@
 #include <osv/percpu.hh>
 #include <osv/llfree.h>
 #include <osv/power.hh>
-#include <drivers/poll_nvme.hh>
 
 static const u64 maxPageSize = mmu::huge_page_size;
 #ifndef THRESHOLD_INVLPG_FLUSH
@@ -29,6 +30,25 @@ static const u64 maxPageSize = mmu::huge_page_size;
 #endif
 
 namespace ucache {
+
+extern int next_available_file_id;
+struct ucache_file{
+    int id;
+    std::string name;
+    u64 start_lba;
+    u64 num_lb;
+    u64 size;
+    
+    u64 lba_size;
+    u64 current_seek_pos;
+
+    ucache_file(std::string n, u64 slba, u64 size, u64 blksize): id(next_available_file_id++), name(n), start_lba(slba), num_lb(ceil(size/(blksize+0.0))), size(size), lba_size(blksize), current_seek_pos(0)
+    {
+    }
+};
+
+extern u64 next_available_slba;
+extern std::vector<ucache_file*> available_nvme_files;
 
 typedef u64 phys_addr;
 typedef u64* virt_addr;
@@ -124,6 +144,15 @@ struct pt_elem {
         }
         return pte;
     }
+    static u64 valid_mask(){
+        pt_elem pte;
+        pte.word = ~(0ull);
+        pte.unused = 0;
+        pte.unused2 = 0;
+        pte.no_execute = 0;
+        pte.huge_page_null = 0;
+        return ~(pte.word);
+    }
 };
 
 typedef pt_elem PTE;
@@ -134,24 +163,34 @@ static unsigned idx(void *virt, unsigned level)
 }
 
 inline virt_addr ensure_valid_pt_elem(virt_addr parent, unsigned idx, bool with_frame, bool huge=false){
-    if(pt_elem(parent[idx]).phys == 0){ // if the children is an empty page
+    if(pt_elem(parent[idx]).phys == 0 || pt_elem(parent[idx]).present == 0 || pt_elem(parent[idx]).writable == 0 || (parent[idx] & pt_elem::valid_mask()) != 0){ // if the children is an empty page
         u64 page_size = huge ? 2ul*1024*1024 : 4096;
         u64 frame = with_frame ? frames_alloc_phys_addr(page_size) : 0ul;
         pt_elem pte = pt_elem::make(frame, huge);
-        parent[idx] = pte.word; 
+        parent[idx] = pte.word;
+        if(with_frame) // initialize new page
+            memset(mmu::phys_cast<u64>(pte.phys << 12), 0, 4096);
     }
     return mmu::phys_cast<u64>(pt_elem(parent[idx]).phys << 12);
 }
 
-inline void ensure_valid_pte(virt_addr l1, unsigned idx, bool with_frame){
+inline void initialize_pte(virt_addr l1, unsigned idx, bool with_frame){
+    u64 frame = with_frame ? frames_alloc_phys_addr(4096) : 0ul;
+    pt_elem pte = pt_elem::make(frame, false);
+    *(l1+idx) = pte.word; 
+}
+inline void ensure_valid_pte_debug(virt_addr l1, unsigned idx, bool with_frame){
     if(*(l1+idx) == 0){ // if the children is an empty page
         u64 frame = with_frame ? frames_alloc_phys_addr(4096) : 0ul;
         pt_elem pte = pt_elem::make(frame, false);
+        std::cout << std::bitset<64>(pte.word) << std::endl;
         *(l1+idx) = pte.word; 
+        std::cout << std::bitset<64>(*(l1+idx)) << std::endl;
     }
 }
 
 void allocate_pte_range(void* virt, u64 size, bool init, bool huge);
+
 /*
  * if we ever need wrappers around allocate_pte_range
 void allocate_pte_range_init(void* virt, u64 size){ allocate_pte_range(virt, size, true, false); }
@@ -202,23 +241,21 @@ inline void invalidateTLBEntry(void* addr) {
  */
 enum BufferState{
    Mapped, // phys != 0 and present == 1
-   SoftUnmapped, // phys != 0 and present == 0
-   //CandidateEviction, // same as softunmapped + removed from resident set
-   //Clean, // same as candidateeviction + synchronized with storage
-   HardUnmapped, // phys == 0 and present == 0
+   Writing, // currently being written
+   Evicting, // chosen for eviction
+   Prefetching, // currently being prefetched
+   Unmapped, // phys == 0 and present == 0
    Inconsistent, // fail
-   TBD // just something to work with
+   TBD // something to work with
 };
 
 struct VMA;
-struct Buffer{
-   std::atomic<u64>* pteRefs[16]; 
-   PTE snapshot[16];
-   BufferState snapshotState;
+struct Buffer {
+   std::vector<std::atomic<u64>*> pteRefs; // change this to dynamically 
+   std::vector<PTE> snapshot;
+   std::atomic<BufferState> snapshotState;
    void* baseVirt;
    VMA* vma;
-   int nb; // max 16 for 64KiB max size (+ 2MiB)
-   // overhead (max for buffer size == sizeSmallPage) => 8+8+4+8+4 = 32B = 0.78%
 
    Buffer(void* addr, u64 size, VMA* vma);
    ~Buffer(){}
@@ -229,39 +266,40 @@ struct Buffer{
       return snapshot[0];
    }
 
-   void updateSnapshot(){
-      snapshotState = BufferState::TBD;
-      for(int i = 0; i < nb; i++){
-         snapshot[i] = PTE(*pteRefs[i]);
-         if(snapshotState == BufferState::Inconsistent){
-            continue; // skip since we already reached an inconsistent state
-         }
-         if(snapshot[i].phys != 0){
-            if(snapshot[i].present == 1){ // phys != 0 && present == 1
-               if(snapshotState == BufferState::Mapped || snapshotState == BufferState::TBD)
-                  snapshotState = BufferState::Mapped;
-               else
-                  snapshotState = BufferState::Inconsistent; 
-            }else{ // phys != 0 && present == 0
-               if(snapshotState == BufferState::SoftUnmapped || snapshotState == BufferState::TBD)
-                  snapshotState = BufferState::SoftUnmapped;
-               else
-                  if(snapshotState != BufferState::HardUnmapped){ // phys != 0 && present == 0 is inconsistent only for the first page
-                             // since we only remove the frame address for the first page
-                     snapshotState = BufferState::Inconsistent;
-                  }
+    void updateSnapshot(){
+        BufferState oldState = snapshotState.load();
+        BufferState newState = BufferState::TBD;
+        for(size_t i = 0; i < pteRefs.size(); i++){
+            snapshot[i] = PTE(pteRefs[i]->load());
+            if(oldState == BufferState::Evicting || oldState == BufferState::Prefetching || oldState == BufferState::Writing){
+                // do not update the state if it being processed
+                // the relevant functions should change the state directly
+                continue;
             }
-         }else{
-            if(snapshot[i].present == 0){ // phys == 0 && present == 0
-               if(snapshotState == BufferState::HardUnmapped || snapshotState == BufferState::TBD)
-                  snapshotState = BufferState::HardUnmapped;
-               else
-                  snapshotState = BufferState::Inconsistent;
-            }else // phys == 0 && present == 1
-               snapshotState = BufferState::Inconsistent;
-         }
-      }
-   }
+            if(newState == BufferState::Inconsistent){
+                break; // skip since we already reached an inconsistent state
+            }
+            if(snapshot[i].phys != 0){
+                if(snapshot[i].present == 1){ // phys != 0 && present == 1
+                    if(newState == BufferState::Mapped || newState == BufferState::TBD)
+                        newState = BufferState::Mapped;
+                    else
+                        newState = BufferState::Inconsistent; 
+                }else{ // phys != 0 && present == 0
+                    newState = BufferState::Inconsistent;
+                }
+            }else{
+                if(snapshot[i].present == 0){ // phys == 0 && present == 0
+                    if(newState == BufferState::Unmapped || newState == BufferState::TBD)
+                        newState = BufferState::Unmapped;
+                    else
+                        newState = BufferState::Inconsistent;
+                }else // phys == 0 && present == 1
+                    newState = BufferState::Inconsistent;
+            }
+        }
+        snapshotState.compare_exchange_strong(oldState, newState);
+    }
 
    void tryClearAccessed();
 
@@ -286,9 +324,7 @@ inline void invlpg_tlb_all(std::vector<Buffer*> toFlush){
     return;
 }
 
-typedef u64 PID; // page id type
-
-static const int16_t maxQueueSize = 512;
+static const int16_t maxQueueSize = 256;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
@@ -325,23 +361,22 @@ inline void* alignPage(void* addr, u64 pageSize){
     return reinterpret_cast<void*>(reinterpret_cast<u64>(addr) & ~(pageSize-1));
 }
 
-typedef std::vector<Buffer*>& prefetchList;
-typedef std::vector<Buffer*>& evictList;
+typedef std::vector<Buffer*>& PrefetchList;
+typedef std::vector<Buffer*>& EvictList;
 
-typedef float (*custom_score_func)(PID);
-typedef u64 (*vm_to_storage_mapping_func)(VMA*, void*);
+typedef float (*custom_score_func)(Buffer*);
 typedef bool (*isDirty_func)(Buffer* virt, int id);
 typedef void (*setClean_func)(Buffer* virt, int id);
-typedef void (*alloc_func)(VMA*, void*, prefetchList);
-typedef void (*evict_func)(VMA*, u64, evictList);
+typedef void (*alloc_func)(VMA*, void*, PrefetchList, void*);
+typedef void (*evict_func)(VMA*, u64, EvictList);
 
 class ResidentSet{
     public:
     struct Entry {
-        std::atomic<u64> pid;
+        std::atomic<Buffer*> buf;
     };
-    virtual bool insert(u64) = 0;
-    virtual bool remove(u64) = 0;
+    virtual bool insert(Buffer*) = 0;
+    virtual bool remove(Buffer*) = 0;
     virtual u64 getNextBatch(u64 batchsize) = 0;
     virtual void getNextValidEntry(std::pair<u64, Entry*>*) = 0;
 };
@@ -349,8 +384,8 @@ class ResidentSet{
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
 class HashTableResidentSet: public ResidentSet {
     public:
-    static const u64 empty = ~0ull;
-    static const u64 tombstone = (~0ull)-1;
+    static const uintptr_t empty = ~0ull;
+    static const uintptr_t tombstone = (~0ull)-1;
 
     Entry* ht;
     u64 count;
@@ -362,9 +397,9 @@ class HashTableResidentSet: public ResidentSet {
     u64 next_pow2(u64 x);
     u64 hash(u64 k);
    
-    bool insert(u64 pid) override;
-    bool contains(u64 pid);
-    bool remove(u64 pid) override;
+    bool insert(Buffer* buf) override;
+    bool contains(Buffer* buf);
+    bool remove(Buffer* buf) override;
     u64 getNextBatch(u64 batch) override;
     void getNextValidEntry(std::pair<u64, Entry*>* entry) override;
 };
@@ -373,41 +408,44 @@ class VMA {
     public:
     void* start;
     u64 size;
-    u64 lba_start;
+    struct ucache_file* file;
     u64 pageSize;
     u64 id;
     std::atomic<u64> usedPhysSize;
+    Buffer* buffers;
 
     // policy related
     ResidentSet* residentSet;
-    vm_to_storage_mapping_func vm_storage_map;
     isDirty_func isDirty_implem; 
     setClean_func setClean_implem;
     alloc_func prefetch_pol;
     evict_func evict_pol;
-    
 
-    VMA(u64 size, u64 page_size, u64 first_lba, isDirty_func dirty_func, setClean_func clean_func,
-        ResidentSet* set, vm_to_storage_mapping_func f, alloc_func prefetch_policy, evict_func evict_policy);
-    VMA(u64 size, u64 page_size, u64 first_lba);
+    void* prefetchObject;
+
+    VMA(u64 size, u64 page_size, isDirty_func dirty_func, setClean_func clean_func,
+        ResidentSet* set, struct ucache_file*, alloc_func prefetch_policy, evict_func evict_policy);
+    static VMA* newVMA(u64 size, u64 page_size);
+    static VMA* newVMA(const char* name, u64 page_size);
     ~VMA(){}
 
-    PID getPID(void* addr){
-        assert(isValidPtr(addr));
-        return ((u64)alignPage(addr, pageSize) - (u64)start)/pageSize;
-    }
-
-    void* getPtr(PID pid){
-        return start + (pid * pageSize);
+    Buffer* getBuffer(void* addr){
+        if(!isValidPtr(addr)){
+            return NULL;
+        }
+        u64 index = ((u64)alignPage(addr, pageSize) - (u64)start)/pageSize;
+        return buffers+index;
     }
 
     bool isValidPtr(void* addr){
-        return addr >= start && addr < start + size;
+        uintptr_t s = (uintptr_t)start;
+        uintptr_t a = (uintptr_t)addr;
+        return a >= s && a < s + size;
     }
 
     u64 getStorageLocation(void* addr){
-        return vm_storage_map(this, addr);
-    }
+        return file->start_lba + ((uintptr_t)addr-(uintptr_t)start)/file->lba_size;
+    } 
 
     bool isDirty(Buffer* buf, int id){
         return isDirty_implem(buf, id);
@@ -417,18 +455,27 @@ class VMA {
         return setClean_implem(buf, id);
     }
 
-    void choosePrefetchingCandidates(void* addr, prefetchList pl){
-        prefetch_pol(this, addr, pl);
+    void choosePrefetchingCandidates(void* addr, PrefetchList pl){
+        prefetch_pol(this, addr, pl, prefetchObject);
     }
 
-    void chooseEvictionCandidates(u64 sizeToEvict, evictList el){
+    void chooseEvictionCandidates(u64 sizeToEvict, EvictList el){
         evict_pol(this, sizeToEvict, el);
     }
-};
 
-inline u64 linear_mapping(VMA* vma, void* addr){
-    return vma->lba_start+(((u64)addr - (u64)vma->start)/blockSize);
-}
+    bool addEvictionCandidate(Buffer* buf, EvictList el){
+        BufferState oldState = buf->snapshotState.load();
+        if(residentSet->remove(buf)){
+            if(buf->snapshotState.compare_exchange_strong(oldState, BufferState::Evicting)){
+                el.push_back(buf);
+                return true;
+            }else{
+                assert(residentSet->insert(buf));
+            }
+        }
+        return false;
+    }
+};
 
 inline bool pte_isDirty(Buffer* buf, int id){
     return buf->at(id).dirty == 1;
@@ -445,11 +492,11 @@ inline void pte_setClean(Buffer* buf, int id){
 }
 
 // by default -> no prefetching
-inline void default_prefetch(VMA* vma, void* addr, prefetchList pl){
+inline void default_prefetch(VMA* vma, void* addr, PrefetchList pl, void* obj){
     return;
 }
 
-void default_transparent_eviction(VMA*, u64, evictList);
+void default_transparent_eviction(VMA*, u64, EvictList);
 
 class uCache {	
     public:
@@ -468,28 +515,52 @@ class uCache {
    	uCache(u64 physSize, int batch);
    	~uCache();
 
-    void* addVMA(u64 virtSize, u64 pageSize, u64 first_lba=0);
+    void* addVMA(u64 virtSize, u64 pageSize);
+    VMA* getOrCreateVMA(const char* name);
     VMA* getVMA(void* start);
+    Buffer* getBuffer(void* addr);
 
-   	const unvme_ns_t* ns;
-	
-	  // Functions
-
+    const unvme_ns_t* ns;
+	  
+    // Functions
    	void ensureFreePages(u64 additionalSize);
    	void readBuffer(Buffer* buf);
     void readBufferToTmp(Buffer* buf, Buffer* tmp);
     void flush(std::vector<Buffer*> toWrite);
     
     void handleFault(u64 vmaID, void* addr, exception_frame *ef); // called from the page fault handler
+    void prefetch(VMA* vma, PrefetchList pl);
    	void evict();
 
 };
 
 extern uCache* uCacheManager;
 
-inline void createCache(u64 physSize, int batch){
-    uCacheManager = new uCache(physSize, batch); 
+void createCache(u64 physSize, int batch);
+
+inline void discover_ucache_files(){
+    std::ifstream files("/nvme_files.txt");
+    std::string name;
+    u64 slba, size;
+    std::cout << "Available files on the ssd:" << std::endl;
+    while(files >> name >> slba >> size){
+        ucache_file* file = new ucache_file(name, slba, size, uCacheManager->ns->blocksize);
+        std::cout << name << ": from " << slba << ", size: " << size << std::endl;
+        available_nvme_files.push_back(file);
+        next_available_slba += file->num_lb + 1;
+    }
+
 }
 
+inline struct ucache_file* find_ucache_file(const char* name){
+    for(struct ucache_file* file: available_nvme_files){
+        if(strcmp(file->name.c_str(), name) == 0){
+            //printf("Found file: %s from %lu with %lu blocks (of size %u)\n", file->name.c_str(), file->start_lba, file->num_lb, uCacheManager->ns->blocksize);
+            return file;
+        }
+    }
+    //printf("Error: could not find %s\n", name);
+    return NULL;
+}
 }; // namespace ucache
 #endif

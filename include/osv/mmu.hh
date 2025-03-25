@@ -60,7 +60,7 @@ struct linear_vma {
     ~linear_vma();
 
     uintptr_t v_start() const { return reinterpret_cast<uintptr_t>(_virt_addr); }
-    uintptr_t v_end() const { return reinterpret_cast<uintptr_t>(_virt_addr + _size); }
+    uintptr_t v_end() const { return reinterpret_cast<uintptr_t>(_virt_addr) + _size; }
 };
 
 class vma {
@@ -465,8 +465,8 @@ class superblock_manager {
     std::array<superblock_bucket, sched::max_cpus + 1> workers;
     std::array<std::atomic_uint8_t, superblock_len> superblocks;
 
-    uint8_t free_idx{255};
-    uint8_t resereved_idx{254};
+    uint8_t _free_idx{255};
+    uint8_t _reserved_idx{254};
 
     uint8_t cpu_id();
     u64 superblock_index(const uintptr_t addr);

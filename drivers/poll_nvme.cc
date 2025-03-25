@@ -75,12 +75,12 @@ nvme_controller_reg_t* globalReg;
 // count successful requests
 static std::atomic<int> failure_cnt = {0};
 inline void wait_us(nvme_queue_t* q, u64 us){
-    u64 endtsc = rdtsc() + us * (q->dev->rdtsec/100000);
-    while (rdtsc() < endtsc){}
+    u64 endtsc = processor::rdtsc() + us * (q->dev->rdtsec/100000);
+    while (processor::rdtsc() < endtsc){}
 }
 
 inline u64 hash(int opc, u64 prp1, u64 slba, int nlb){
-    return rdtsc() + (prp1*opc & slba*nlb) + opc-nlb;
+    return processor::rdtsc() + (prp1*opc & slba*nlb) + opc-nlb;
 }
 
 inline bool do_fail(nvme_queue_t* q, int opc, u64 prp1, u64 prp2, u64 slba, int nlb){
@@ -308,67 +308,32 @@ static int nvme_submit_cmd(nvme_queue_t* q)
  * @param   cqe_cs      CQE command specific DW0 returned
  * @return  the completed command id or -1 if there's no completion.
  */
-int nvme_check_completion_ooo(nvme_queue_t* q, int* stat, u32* cqe_cs, int pos)
-{
-    *stat = 0;
-    nvme_cq_entry_t* cqe = &q->cq[pos];
-    if (cqe->p == q->cq_phase) return -1;
-
-    *stat = cqe->psf & 0xfffe;
-    if(pos == q->cq_head){ // move cq_head
-        if (++q->cq_head == q->size) {
-            q->cq_head = 0;
-            q->cq_phase = !q->cq_phase;
-        }
-        if (cqe_cs) *cqe_cs = cqe->cs;
-            printf("writing, pos: %u, cq_head: %u\n", pos, q->cq_head);
-            w32(q->dev, q->cq_doorbell, q->cq_head);
-    }else
-        (q->cq+pos)->rsvd3 = 1;
-
-#if 0
-    // Some SSD does not advance sq_head properly (e.g. Intel DC D3600)
-    // so let the upper layer detect queue full error condition
-    q->sq_head = cqe->sqhd;
-#endif
-
-    if (*stat == 0) {
-        PDEBUG("q=%d cq=%d sq=%d-%d cid=%#x (C)", q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid);
-    } else {
-        ERROR("q=%d cq=%d sq=%d-%d cid=%#x stat=%#x (dnr=%d m=%d sct=%d sc=%#x) (C)",
-              q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
-    }
-    return cqe->cid;
-}
-
-/**
- * Check a completion queue and return the completed command id and status.
- * @param   q           queue
- * @param   stat        completion status returned
- * @param   cqe_cs      CQE command specific DW0 returned
- * @return  the completed command id or -1 if there's no completion.
- */
 int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 {
     *stat = 0;
-    /*nvme_cq_entry_t* cqe;
-    do{
-        cqe = &q->cq[q->cq_head];
-        if(cqe->rsvd3 == 1){
-            printf("Skipping\n");
-            q->cq_head++;
-        }
-    }while(cqe->rsvd3 == 1); // skip cqe removed ooo*/
-    nvme_cq_entry_t* cqe = &q->cq[q->cq_head];
-    if (cqe->p == q->cq_phase) return -1;
+    nvme_cq_entry_t* cqe;
+    bool con = true;
+    while(con){
+        u32 oldCQHead = q->cq_head.load();
+        cqe = &q->cq[oldCQHead];
+        u16 oldPhase = q->cq_phase.load();
+        if (cqe->p == oldPhase) return -1;
 
-    *stat = cqe->psf & 0xfffe;
-    if (++q->cq_head == q->size) {
-        q->cq_head = 0;
-        q->cq_phase = !q->cq_phase;
+        u32 newCQHead = oldCQHead+1 == (u32)q->size ? 0 :  oldCQHead + 1;
+        bool changePhase = oldCQHead + 1 == (u32)q->size;
+
+        //w32(q->dev, q->cq_doorbell, q->cq_head);
+        if(q->cq_doorbell->compare_exchange_strong(oldCQHead, newCQHead)){
+            con = false;
+            q->cq_head = newCQHead;
+            if(changePhase){
+                assert(q->cq_phase.compare_exchange_strong(oldPhase, !oldPhase));
+            }
+        }
     }
+    *stat = cqe->psf & 0xfffe;
     if (cqe_cs) *cqe_cs = cqe->cs;
-    w32(q->dev, q->cq_doorbell, q->cq_head);
+
 
 #if 0
     // Some SSD does not advance sq_head properly (e.g. Intel DC D3600)
@@ -381,7 +346,7 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
     } else {
         printf("current cpu id: %u\n", sched::cpu::current()->id);
         ERROR("q=%d cq=%d sq=%d-%d cid=%#x stat=%#x (dnr=%d m=%d sct=%d sc=%#x) (C)",
-              q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
+              q->id, q->cq_head.load(), q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
     }
     return cqe->cid;
 }
@@ -408,9 +373,9 @@ int nvme_wait_completion(nvme_queue_t* q, int cid, int timeout)
             }
             return stat;
         } else if (endtsc == 0) {
-            endtsc = rdtsc() + timeout * q->dev->rdtsec;
+            endtsc = processor::rdtsc() + timeout * q->dev->rdtsec;
         }
-    } while (rdtsc() < endtsc);
+    } while (processor::rdtsc() < endtsc);
 
     ERROR("timeout");
     return -1;
@@ -693,9 +658,6 @@ int nvme_cmd_vs(nvme_queue_t* q, int opc, u16 cid, int nsid,
 int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid,
                 u64 slba, int nlb, u64 prp1, u64 prp2)
 {
-    if(do_fail(ioq, opc, prp1, prp2, slba, nlb)){
-        return -1;
-    }
     nvme_command_rw_t* cmd = &ioq->sq[ioq->sq_tail].rw;
 
     memset(cmd, 0, sizeof (*cmd));
@@ -770,7 +732,7 @@ nvme_queue_t* nvme_ioq_create(nvme_device_t* dev, nvme_queue_t* ioq,
     ioq->sq = (nvme_sq_entry_t*)sqbuf;
     ioq->cq = (nvme_cq_entry_t*)cqbuf;
     ioq->sq_doorbell = dev->reg->sq0tdbl + (2 * id * dev->dbstride);
-    ioq->cq_doorbell = ioq->sq_doorbell + dev->dbstride;
+    ioq->cq_doorbell = (std::atomic<u32>*) ioq->sq_doorbell + dev->dbstride;
 
     if (nvme_acmd_create_cq(ioq, cqpa) || nvme_acmd_create_sq(ioq, sqpa)) {
         free(ioq);
@@ -814,7 +776,7 @@ nvme_queue_t* nvme_adminq_setup(nvme_device_t* dev, int qsize,
     adminq->sq = (nvme_sq_entry_t*)sqbuf;
     adminq->cq = (nvme_cq_entry_t*)cqbuf;
     adminq->sq_doorbell = dev->reg->sq0tdbl;
-    adminq->cq_doorbell = adminq->sq_doorbell + dev->dbstride;
+    adminq->cq_doorbell = (std::atomic<u32>*) adminq->sq_doorbell + dev->dbstride;
 
     nvme_adminq_attr_t aqa;
     aqa.val = 0;
@@ -960,8 +922,8 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
         cid = nvme_check_completion(q->nvmeq, &err, cqe_cs);
         if (timeout == 0 || cid >= 0) break;
         if (endtsc){} //sched_yield();
-        else endtsc = rdtsc() + timeout * q->nvmeq->dev->rdtsec;
-    } while (rdtsc() < endtsc);
+        else endtsc = processor::rdtsc() + timeout * q->nvmeq->dev->rdtsec;
+    } while (processor::rdtsc() < endtsc);
 
     if (cid < 0) return cid;
 
@@ -975,6 +937,22 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
             FATAL("pending cid %d not found", cid);
     }
     if (err) desc->error = err;
+
+    ucache::Buffer* buf = ucache::uCacheManager->getBuffer(desc->buf);
+    if(buf != NULL){
+        ucache::BufferState oldState = buf->snapshotState.load();
+        switch(oldState){
+            case ucache::BufferState::Writing:
+                buf->snapshotState.compare_exchange_strong(oldState, ucache::BufferState::Evicting);
+                break;
+            case ucache::BufferState::Prefetching:
+                assert(buf->tryHandlingSoftFault());
+                buf->snapshotState.compare_exchange_strong(oldState, ucache::BufferState::Mapped);
+                break;
+            default:
+                break;
+        }
+    }
 
     // clear cid bit used
     desc->cidmask[b] &= ~mask;
@@ -991,6 +969,11 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
            q->nvmeq->id, cid, q->cidcount, *q->cidmask,
            desc->id, desc->cidcount, *desc->cidmask, q->descpend->id);
     return err;
+}
+
+int unvme_check_completion(const unvme_ns_t* ns, int qid){
+    unvme_queue_t* q = ((unvme_session_t*)ns->ses)->dev->ioqs + qid;
+    return unvme_check_completion(q, 0, NULL);
 }
 
 /**
@@ -1487,9 +1470,6 @@ int unvme_do_free(const unvme_ns_t* ns, void* buf)
  */
 int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
 {
-    if(do_fail(desc->q->nvmeq, timeout, (u64)desc, (u64)desc, (u64)desc, timeout)){
-        return -1;
-    }
     if (desc->sentinel != desc)
         FATAL("bad IO descriptor");
 
@@ -1800,19 +1780,24 @@ vfio_dma_t* vfio_dma_alloc(size_t size)
 {
     vfio_dma_t* p = (vfio_dma_t*)malloc(sizeof(vfio_dma_t));
     p->size = size;
-    if (size <= 4096) {
+    p->buf = (void*) memory::alloc_phys_contiguous_aligned(size, mmu::page_size);
+    memset(p->buf, 0, size);
+    p->addr = mmu::virt_to_phys(p->buf);
+    /*if (size <= 4096) {
         p->buf = (void*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         madvise(p->buf, size, MADV_NOHUGEPAGE);
         memset(p->buf, 0, size);
-        p->addr = mmu::virt_to_phys(p->buf);
+        //p->addr = mmu::virt_to_phys(p->buf);
+        p->addr = ucache::walk(p->buf).phys << 12;
     } else {
         assert(size <= 2*1024*1024);
         p->buf = (void*)mmap(NULL, 2*1024*1024, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         madvise(p->buf, 2*1024*1024, MADV_HUGEPAGE);
         memset(p->buf, 0, 2*1024*1024);
-        p->addr = mmu::virt_to_phys(p->buf);
-        //p->addr = ucache::walkHuge(p->buf).phys <<12;
-    }
+        //p->addr = mmu::virt_to_phys(p->buf);
+        p->addr = ucache::walkHuge(p->buf).phys <<12;
+    }*/
+    //std::cout << std::bitset<64>(p->addr) << std::endl;
     assert(p->buf);
     return p;
 }

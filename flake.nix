@@ -55,7 +55,7 @@
               yaml-cpp
               xz.out
               krb5.out
-              libselinux
+              libselinux.out
               libz
               boost175
               #glibc.static
@@ -68,6 +68,7 @@
               just
               flex
               bison
+              ninja
             ];
 
             buildInputs = with pkgs; [
@@ -84,10 +85,11 @@
             boost_base = "${pkgs.osv-boost}";
             BOOST_SO_DIR="${pkgs.boost175}/lib";
             OPENSSL_DIR="${pkgs.osv-ssl}";
-            OPENSSL_HDR= "${pkgs.osv-ssl-hdr}/include";
+            OPENSSL_HDR="${pkgs.osv-ssl-hdr}/include";
             KRB5_DIR="${pkgs.krb5.out}";
             XZ_DIR="${pkgs.xz.out}";
             LIBZ_DIR="${pkgs.libz}";
+            LIBSELINUX_DIR="${pkgs.libselinux.out}";
 
             CAPSTAN_QEMU_PATH = "${pkgs.qemu}/bin/qemu-system-x86_64";
 
@@ -98,7 +100,6 @@
               ln -rsf ${pkgs.openssl.out}/* $TMP/openssl-all
               export OPENSSL_DIR="$TMP/openssl-all";
               export OPENSSL_LIB_PATH="$TMP/openssl-all/lib";
-
             '';*/
           };
         }
