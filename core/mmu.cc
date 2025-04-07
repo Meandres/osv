@@ -1694,7 +1694,7 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     }
 #endif
     addr = align_down(addr, mmu::page_size);
-    WITH_LOCK(sb_mgr->vma_lock(addr).for_read()) {
+    //WITH_LOCK(sb_mgr->vma_lock(addr).for_read()) {
         auto vma = sb_mgr->find_intersecting_vma(addr);
         if (vma == sb_mgr->vma_end_iterator(addr) || access_fault(*vma, ef->get_error())) {
             vm_sigsegv(addr, ef);
@@ -1705,7 +1705,7 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
             ucache::uCacheManager->handleFault(vma->id(), (void*)addr, ef);
         else
             vma->fault(addr, ef);
-    }
+    //}
     trace_mmu_vm_fault_ret(addr, ef->get_error());
 }
 
