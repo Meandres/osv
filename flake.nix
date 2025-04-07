@@ -69,6 +69,7 @@
               flex
               bison
               ninja
+              tbb
             ];
 
             buildInputs = with pkgs; [
