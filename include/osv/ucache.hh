@@ -26,7 +26,7 @@
 
 static const u64 maxPageSize = mmu::huge_page_size;
 #ifndef THRESHOLD_INVLPG_FLUSH
-#define THRESHOLD_INVLPG_FLUSH 0
+#define THRESHOLD_INVLPG_FLUSH 1024
 #endif
 
 namespace ucache {
@@ -241,9 +241,10 @@ inline void invalidateTLBEntry(void* addr) {
  */
 enum BufferState{
    Mapped, // phys != 0 and present == 1
+   Resolving,
+   Prefetching, // currently being prefetched
    Writing, // currently being written
    Evicting, // chosen for eviction
-   Prefetching, // currently being prefetched
    Unmapped, // phys == 0 and present == 0
    Inconsistent, // fail
    TBD // something to work with
@@ -255,51 +256,46 @@ struct Buffer {
    std::vector<PTE> snapshot;
    std::atomic<BufferState> snapshotState;
    void* baseVirt;
+   std::atomic<u16> dirty;
    VMA* vma;
 
    Buffer(void* addr, u64 size, VMA* vma);
    ~Buffer(){}
 
-   PTE at(int index) { return snapshot[index]; }
-
-   PTE basePTE(){
-      return snapshot[0];
-   }
-
-    void updateSnapshot(){
-        BufferState oldState = snapshotState.load();
-        BufferState newState = BufferState::TBD;
-        for(size_t i = 0; i < pteRefs.size(); i++){
-            snapshot[i] = PTE(pteRefs[i]->load());
-            if(oldState == BufferState::Evicting || oldState == BufferState::Prefetching || oldState == BufferState::Writing){
-                // do not update the state if it being processed
-                // the relevant functions should change the state directly
-                continue;
-            }
-            if(newState == BufferState::Inconsistent){
-                break; // skip since we already reached an inconsistent state
-            }
-            if(snapshot[i].phys != 0){
-                if(snapshot[i].present == 1){ // phys != 0 && present == 1
-                    if(newState == BufferState::Mapped || newState == BufferState::TBD)
-                        newState = BufferState::Mapped;
-                    else
-                        newState = BufferState::Inconsistent; 
-                }else{ // phys != 0 && present == 0
-                    newState = BufferState::Inconsistent;
-                }
-            }else{
-                if(snapshot[i].present == 0){ // phys == 0 && present == 0
-                    if(newState == BufferState::Unmapped || newState == BufferState::TBD)
-                        newState = BufferState::Unmapped;
-                    else
-                        newState = BufferState::Inconsistent;
-                }else // phys == 0 && present == 1
-                    newState = BufferState::Inconsistent;
-            }
+  void updateSnapshot(){
+    BufferState oldState = snapshotState.load();
+    BufferState newState = BufferState::TBD;
+    for(size_t i = 0; i < pteRefs.size(); i++){
+        snapshot[i] = PTE(pteRefs[i]->load());
+        if(oldState == BufferState::Evicting || oldState == BufferState::Prefetching || oldState == BufferState::Writing || oldState == BufferState::Resolving){
+            // do not update the state if it being processed
+            // the relevant functions should change the state directly
+            return;
         }
-        snapshotState.compare_exchange_strong(oldState, newState);
+        if(newState == BufferState::Inconsistent){
+            break; // skip since we already reached an inconsistent state
+        }
+        if(snapshot[i].phys != 0){
+            if(snapshot[i].present == 1){ // phys != 0 && present == 1
+                if(newState == BufferState::Mapped || newState == BufferState::TBD)
+                    newState = BufferState::Mapped;
+                else
+                    newState = BufferState::Inconsistent; 
+            }else{ // phys != 0 && present == 0
+                newState = BufferState::Inconsistent;
+            }
+        }else{
+            if(snapshot[i].present == 0){ // phys == 0 && present == 0
+                if(newState == BufferState::Unmapped || newState == BufferState::TBD)
+                    newState = BufferState::Unmapped;
+                else
+                    newState = BufferState::Inconsistent;
+            }else // phys == 0 && present == 1
+                newState = BufferState::Inconsistent;
+        }
     }
+    snapshotState.compare_exchange_strong(oldState, newState);
+  }
 
    void tryClearAccessed();
 
@@ -324,7 +320,7 @@ inline void invlpg_tlb_all(std::vector<Buffer*> toFlush){
     return;
 }
 
-static const int16_t maxQueueSize = 256;
+static const int16_t maxQueueSize = 512;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
@@ -365,8 +361,8 @@ typedef std::vector<Buffer*>& PrefetchList;
 typedef std::vector<Buffer*>& EvictList;
 
 typedef float (*custom_score_func)(Buffer*);
-typedef bool (*isDirty_func)(Buffer* virt, int id);
-typedef void (*setClean_func)(Buffer* virt, int id);
+typedef bool (*isDirty_func)(Buffer* virt);
+typedef void (*setClean_func)(Buffer* virt);
 typedef void (*alloc_func)(VMA*, void*, PrefetchList, void*);
 typedef void (*evict_func)(VMA*, u64, EvictList);
 
@@ -447,12 +443,12 @@ class VMA {
         return file->start_lba + ((uintptr_t)addr-(uintptr_t)start)/file->lba_size;
     } 
 
-    bool isDirty(Buffer* buf, int id){
-        return isDirty_implem(buf, id);
+    bool isDirty(Buffer* buf){
+        return isDirty_implem(buf);
     }
 
-    void setClean(Buffer* buf, int id){
-        return setClean_implem(buf, id);
+    void setClean(Buffer* buf){
+        return setClean_implem(buf);
     }
 
     void choosePrefetchingCandidates(void* addr, PrefetchList pl){
@@ -477,18 +473,24 @@ class VMA {
     }
 };
 
-inline bool pte_isDirty(Buffer* buf, int id){
-    return buf->at(id).dirty == 1;
+inline bool pte_isDirty(Buffer* buf){
+	int dirty = 0;
+	for(size_t i=0; i<buf->pteRefs.size(); i++){
+		dirty += buf->snapshot[i].dirty;
+	}
+	return dirty > 0;
 }
 
-inline void pte_setClean(Buffer* buf, int id){
-    buf->updateSnapshot();
-    PTE oldPTE = buf->at(id);
-    if(oldPTE.dirty == 0)
-        return;
-    PTE cleanPTE = PTE(oldPTE.word);
-    cleanPTE.dirty = 0;
-    buf->pteRefs[id]->compare_exchange_strong(oldPTE.word, cleanPTE.word); // if another thread wrote to it in the mean time just ignore
+inline void pte_setClean(Buffer* buf){
+  for(size_t i = 0; i < buf->pteRefs.size(); i++){ // just try to 
+		PTE pte = buf->snapshot[i];
+		if(pte.dirty == 0){ // simply skip
+			continue;
+		}
+		PTE newPTE = PTE(pte.word);
+		newPTE.dirty = 0; 
+		buf->pteRefs[i]->compare_exchange_strong(pte.word, newPTE.word); // best effort 
+	}
 }
 
 // by default -> no prefetching
@@ -511,6 +513,7 @@ class uCache {
 	  std::atomic<u64> usedPhysSize;
    	std::atomic<u64> readSize;
    	std::atomic<u64> writeSize;
+    std::atomic<u64> tlbFlush;
 
    	uCache(u64 physSize, int batch);
    	~uCache();

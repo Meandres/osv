@@ -102,17 +102,10 @@ Buffer::Buffer(void* addr, u64 size, VMA* vma_ptr){
 	baseVirt = addr;
 	u64 workingPageSize = mmu::page_size;
 	vma = vma_ptr;
-	/*if(size%sizeHugePage == 0){
-		workingPageSize = sizeHugePage;
-		huge = true;
-	}*/
 	size_t nb = size / workingPageSize;
 	pteRefs.reserve(nb);
 	snapshot.reserve(nb);
 	for(size_t i = 0; i < nb; i++){
-		/*if(huge)
-			pteRefs[i] = walkRefHuge(addr + (i * workingPageSize));
-		else*/
 		pteRefs.push_back(walkRef(addr + (i* workingPageSize)));
 		snapshot.push_back(PTE(0));
 	}
@@ -153,7 +146,7 @@ void Buffer::tryClearAccessed(){
 // called to handle a hard fault. Sets the pages to present and set the frame accordingly
 // the core that wins the race gets to use its frame
 bool Buffer::tryMapPhys(u64 phys){
-	if(snapshotState.load() != BufferState::Unmapped){
+	if(snapshotState.load() != BufferState::Resolving){
 		return false;
 	}
 	for(size_t i = 0; i < pteRefs.size(); i++){
@@ -162,14 +155,7 @@ bool Buffer::tryMapPhys(u64 phys){
 		newPTE.present = 1;
 		newPTE.phys = phys+i;
 		if(!pteRefs[i]->compare_exchange_strong(snapshot[i].word, newPTE.word)){
-			std::cout << std::bitset<64>(snapshot[i].word) << "\n" << std::bitset<64>(PTE(*(pteRefs[i])).word) << std::endl;
-			/*PTE updatedPTE = PTE(*pteRefs[i]);
-			// we need to handle the case where another core accessed one of the page
-			if(updatedPTE.phys == snapshot[i].phys && updatedPTE.present == snapshot[i].present){
-				snapshot[i].accessed = updatedPTE.accessed;
-				snapshot[i].dirty = updatedPTE.dirty;
-				goto retry;
-			}*/
+			std::cout << std::bitset<64>(snapshot[i].word) << "\n" << std::bitset<64>(PTE(*(pteRefs[i])).word) << "\n" << std::bitset<64>(phys) << std::endl;
 			return false;
 		}
 	}
@@ -203,28 +189,19 @@ u16 Buffer::getDirty(){
 }
 
 u64 Buffer::tryUnmapPhys(){
-	PTE base = basePTE();
-	if(base.phys == 0){ // evictors own the eviction so this cannot happen
-		printf("phys is 0 in unmap\n");
-		crash_osv();
+	if(snapshotState.load() != BufferState::Evicting){
+		return 0;
 	}
-	
-	/*if(base.present == 1){
-		printf("concurrent fault\n");
-		return 0; // another core soft faulted the page
-	}*/
-	std::string oldWord = std::bitset<64>(base.word).to_string();
-	u64 phys = base.phys;
-	PTE newPTE = PTE(base.word);
-	newPTE.present = 0;
-	newPTE.phys = 0;
-	std::atomic<u64>* baseRef = pteRefs[0];
-	if(baseRef->compare_exchange_strong(base.word, newPTE.word)){
-		return phys;
+	u64 phys = snapshot[0].phys;
+	for(size_t i = 0; i < pteRefs.size(); i++){
+		PTE newPTE = PTE(snapshot[i].word);
+		newPTE.present = 0;
+		newPTE.phys = 0;
+		if(!pteRefs[i]->compare_exchange_strong(snapshot[i].word, newPTE.word)){
+			return 0;
+		}
 	}
-	std::string newWord = std::bitset<64>(base.word).to_string();
-	printf("old: %s\nnew: %s\n", oldWord.c_str(), newWord.c_str());
-	return 0;
+	return phys;
 }
 
 // this function does not race with any other thread
@@ -240,11 +217,9 @@ void Buffer::map(u64 phys){
 
 // this function does not race with any other thread
 u64 Buffer::unmap(){
-	u64 phys;
-	PTE newPTE = basePTE();
-	phys = newPTE.phys;
+	u64 phys = snapshot[0].phys;
 	for(size_t i=0; i<pteRefs.size(); i++){
-		newPTE = snapshot[i];
+		PTE newPTE = PTE(snapshot[i].word);
 		newPTE.present = 0;
 		newPTE.phys = 0;
 		std::atomic<u64>* ref = pteRefs[i];
@@ -286,17 +261,11 @@ struct IOtoolkit {
     Buffer* tempBuffer;
     int id;
     unvme_iod_t io_descriptors[maxQueueSize];
-		std::atomic<bool> handlingFault;
-		u64 tid;
 
     IOtoolkit(int i){
-        void* tempPage = createVMA(0, mmu::page_size, mmu::page_size, false, false); // this only works for buffer size = 4KiB
-				tempBuffer = new Buffer(tempPage, mmu::page_size, NULL); 
         for(int i=0; i<maxQueueSize; i++){
             io_descriptors[i] = nullptr;
         }
-				handlingFault.store(false);
-				tid = 0;
         id = i;
     };
 };
@@ -419,11 +388,6 @@ VMA::VMA(u64 size, u64 page_size, isDirty_func dirty_func, setClean_func clean_f
 	assert(isSupportedPageSize(page_size));
 	bool huge = page_size == 2ul*1024*1024 ? true : false;
 	start = createVMA(id, size, page_size, false, huge);
-	u64 nb_buf = size / page_size;
-	buffers = (Buffer*) malloc(sizeof(Buffer)*nb_buf);
-	for(u64 i = 0; i < nb_buf; i++){
-		new (buffers+i) Buffer(start+i*page_size, page_size, this);
-	}
 }
 
 VMA* VMA::newVMA(u64 size, u64 page_size)
@@ -431,14 +395,14 @@ VMA* VMA::newVMA(u64 size, u64 page_size)
 		printf("Creating a file at %lu with %lu blocks (of size %u)\n", next_available_slba, size/uCacheManager->ns->blocksize, uCacheManager->ns->blocksize);
     struct ucache_file* f = new ucache_file("tmp", next_available_slba, size/uCacheManager->ns->blocksize, uCacheManager->ns->blocksize);
     available_nvme_files.push_back(f);
-		return new VMA(size, mmu::page_size, pte_isDirty, pte_setClean, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_prefetch, default_transparent_eviction);
+		return new VMA(size, page_size, pte_isDirty, pte_setClean, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_prefetch, default_transparent_eviction);
 }
 
 VMA* VMA::newVMA(const char* name, u64 page_size)
 {
 	assert(name != NULL);
 	struct ucache_file* f = find_ucache_file(name);
-	return new VMA(align_up(f->size, mmu::page_size), mmu::page_size, pte_isDirty, pte_setClean, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_prefetch, default_transparent_eviction);
+	return new VMA(align_up(f->size, page_size), page_size, pte_isDirty, pte_setClean, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_prefetch, default_transparent_eviction);
 }
 
 uCache::uCache(u64 physSize, int batch) : totalPhysSize(physSize), batch(batch){
@@ -448,6 +412,7 @@ uCache::uCache(u64 physSize, int batch) : totalPhysSize(physSize), batch(batch){
    	usedPhysSize = 0;
    	readSize = 0;
    	writeSize = 0;
+		tlbFlush = 0;
 
     cout << "uCache initialized with " << physSize/(1024ull*1024*1024) << " GB of physical memory available" << endl;
 }
@@ -499,21 +464,22 @@ void uCache::handleFault(u64 vmaID, void* faultingAddr, exception_frame *ef){
   auto search = vmas.find(vmaID);
 	assert(search != vmas.end());
 	VMA* vma = search->second;
+
+	std::vector<Buffer*> pl; // need those here for goto to work
+	BufferState oldState;
     
 	void* basePage = alignPage(faultingAddr, vma->pageSize);
-	Buffer* buffer = vma->getBuffer(basePage); 
-	assert(buffer != NULL);
-	buffer->updateSnapshot();
+	Buffer* buffer = new Buffer(basePage, vma->pageSize, vma);
 	if(buffer->snapshotState == BufferState::Inconsistent){
-			crash_osv(); // TODO: change this to run with big pages
+			goto out_polling;
 	}
 	phys_addr phys;
 
-	BufferState oldState = buffer->snapshotState.load();
+	oldState = buffer->snapshotState.load();
 	switch(oldState){
 		case BufferState::Evicting:
 			if(!buffer->snapshotState.compare_exchange_strong(oldState, BufferState::Mapped)){ // try to set the state to mapped
-				if(buffer->snapshotState.load() != BufferState::Unmapped) // if it failed, only continue if this thread lost to the eviction, otherwise just return
+				if(buffer->snapshotState.load() == BufferState::Mapped) // if it failed, only continue if this thread lost to the eviction, otherwise just return
 					return;
 			}
 			break;
@@ -532,7 +498,6 @@ void uCache::handleFault(u64 vmaID, void* faultingAddr, exception_frame *ef){
 			break;
 	}
 
-	std::vector<Buffer*> pl;
 	pl.reserve(batch);
 	vma->choosePrefetchingCandidates(basePage, pl);
 	ensureFreePages(vma->pageSize *(1 + pl.size())); // make enough room for the page being faulted and the prefetched ones
@@ -541,34 +506,43 @@ void uCache::handleFault(u64 vmaID, void* faultingAddr, exception_frame *ef){
 	if(buffer->snapshotState.load() == BufferState::Evicting){
 		BufferState oldState = BufferState::Evicting;
 		if(!buffer->snapshotState.compare_exchange_strong(oldState, BufferState::Mapped)){ // try to set the state to mapped
-			if(buffer->snapshotState.load() != BufferState::Unmapped){ // if it failed, only continue if this thread lost to the eviction, otherwise just return
+			if(buffer->snapshotState.load() == BufferState::Mapped){ // if it failed, only continue if this thread lost to the eviction, otherwise just return
 				return;
 			}
 		}
 	}
-	if(buffer->snapshotState.load() == BufferState::Mapped){
+
+	oldState = buffer->snapshotState.load();
+	if(oldState == BufferState::Mapped){
 		return;
 	}
-
-	// get a physical frame
-	// computeOrder cannot fail since we check vma->pageSize at creation
-	phys = frames_alloc_phys_addr(vma->pageSize);
-	get_IOtoolkit().tempBuffer->map(phys);
-	readBufferToTmp(buffer, get_IOtoolkit().tempBuffer);
-	if(buffer->tryMapPhys(phys)){ // thread that won the race
-			readSize += vma->pageSize;
-			usedPhysSize += vma->pageSize;
-			vma->usedPhysSize += vma->pageSize;
-			assert(vma->residentSet->insert(buffer));
-			prefetch(vma, pl);
-	}else{
-		frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
+	if(oldState == BufferState::Resolving){
+		goto out_polling;
 	}
-	// no need to unmap since we will only R/W from it after overwriting the frame
-	get_IOtoolkit().tempBuffer->invalidateTLBEntries();
+	if(!buffer->snapshotState.compare_exchange_strong(oldState, BufferState::Resolving)){
+		goto out_polling;
+	}
+
+	phys = frames_alloc_phys_addr(vma->pageSize);
+	assert(buffer->tryMapPhys(phys));
+	readBuffer(buffer);
+	readSize += vma->pageSize;
+	usedPhysSize += vma->pageSize;
+	oldState = BufferState::Resolving;
+	assert(buffer->snapshotState.compare_exchange_strong(oldState, BufferState::Mapped));
+	vma->usedPhysSize += vma->pageSize;
+	assert(vma->residentSet->insert(buffer));
+	prefetch(vma, pl);
+	return;
+out_polling:
+	do{
+	buffer->updateSnapshot();
+	} while(buffer->snapshotState.load() != BufferState::Mapped);
+	delete buffer;
 }
 
 void uCache::prefetch(VMA *vma, PrefetchList pl){
+	u64 prefetchedSize = 0;
 	for(Buffer* buf: pl){
 		buf->updateSnapshot();
 		BufferState oldState = buf->snapshotState.load();
@@ -582,13 +556,14 @@ void uCache::prefetch(VMA *vma, PrefetchList pl){
 		if(buf->tryMapPhys(phys)){ // this can fail if another thread already resolved the prefetched buffer concurrently
 			unvme_aread(ns, get_IOtoolkit().id, buf->baseVirt, buf->vma->getStorageLocation(buf->baseVirt), buf->vma->pageSize/buf->vma->file->lba_size);
 			usedPhysSize += buf->vma->pageSize;
-			vma->usedPhysSize += buf->vma->pageSize; // TODO: another candidate for aggregation of usedPhysSize
+			prefetchedSize += buf->vma->pageSize;
 		}else{
 			oldState = BufferState::Prefetching;
 			assert(buf->snapshotState.compare_exchange_strong(oldState, BufferState::Mapped));
 			frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
 		}
 	}
+	vma->usedPhysSize += prefetchedSize;
 }
 
 void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
@@ -611,16 +586,16 @@ void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
 
 void uCache::evict(){
 		std::vector<Buffer*> toEvict;
-    toEvict.reserve(batch);
+    toEvict.reserve(batch*1.5);
 
 		// 0. find candidates
-		for(auto p: vmas){
+		for(const auto& p: vmas){
 			p.second->chooseEvictionCandidates(batch/vmas.size(), toEvict);
 		}
 
     // write single pages that are dirty.
     assert(toEvict.size() <= maxQueueSize);
-    flush(toEvict);
+    //flush(toEvict);
     
     // checking if the page have been remapped only improve performance
     // we need to settle on which pages to flush from the TLB at some point anyway
@@ -639,15 +614,14 @@ void uCache::evict(){
     }else{
         mmu::flush_tlb_all();
     }
+		tlbFlush++;
 
     // now all accesses will trigger a page fault 
      
     u64 actuallyEvictedSize = 0;
+		std::map<VMA*, u64> evictedSizePerVMA;
     for(Buffer* buf: toEvict){
 				buf->updateSnapshot();
-				if(buf->getAccessed() != 0){
-					printf("accessed\n");
-				}
         if(buf->snapshotState == BufferState::Evicting){ // no other thread remapped the page in the mean time
             u64 phys = buf->tryUnmapPhys();
             if(phys != 0){
@@ -656,16 +630,22 @@ void uCache::evict(){
 								frames_free_phys_addr(phys, buf->vma->pageSize); // put back unused candidates
                 actuallyEvictedSize += buf->vma->pageSize;
 								buf->snapshotState.store(BufferState::Unmapped);
-								// TODO: need to remove the size from the accounting of the VMA too. 
-								// need to batch it tho. Accumulate then remove at the end of the for loop
+								if(evictedSizePerVMA.find(buf->vma) == evictedSizePerVMA.end()){
+									evictedSizePerVMA[buf->vma] = buf->vma->pageSize;
+								}else{
+									evictedSizePerVMA[buf->vma] += buf->vma->pageSize;
+								}
             }else{
-								assert(buf->snapshotState.load() == BufferState::Mapped);
-                assert(buf->vma->residentSet->insert(buf));
+            	assert(buf->vma->residentSet->insert(buf));
 						}
         }else{
         		assert(buf->vma->residentSet->insert(buf)); // return the page to the RS
 				}
     }
+		for(const auto& p: evictedSizePerVMA){
+			VMA* vma = p.first;
+			vma->usedPhysSize -= p.second; 
+		}
     usedPhysSize -= actuallyEvictedSize;
 }
 
@@ -689,29 +669,27 @@ void uCache::readBufferToTmp(Buffer* buf, Buffer* tmp) {
 
 void uCache::flush(std::vector<Buffer*> toWrite){
 	std::vector<Buffer*> requests;
+	u64 sizeWritten = 0;
 	requests.reserve(batch+5);
 	for(u64 i=0; i<toWrite.size(); i++){
 		Buffer* buf = toWrite[i];
 		buf->updateSnapshot();
-		for(u16 j = 0; j<buf->pteRefs.size(); j++){ // TODO: for now this only works for 4KiB buffers
-																								// two solutions: 1) write the whole buffer if any part is dirty
-																								// 2) write only the dirty parts but only set the buffer to Evicting once all dirty parts have been written
-			if(buf->vma->isDirty(buf, j)){
-				BufferState prev = BufferState::Evicting;
-				assert(buf->snapshotState.compare_exchange_strong(prev, BufferState::Writing));
-				unvme_iod_t iod = unvme_awrite(ns, get_IOtoolkit().id, buf->baseVirt+j*mmu::page_size, buf->vma->getStorageLocation(buf->baseVirt+j*mmu::page_size), mmu::page_size/ns->blocksize);
-				assert(iod);
-				requests.push_back(buf);
-				buf->vma->setClean(buf, j); // TODO: check if setClean should be before or after the write
-			}
+		if(buf->vma->isDirty(buf)){ // this writes the whole buffer
+			BufferState prev = BufferState::Evicting;
+			assert(buf->snapshotState.compare_exchange_strong(prev, BufferState::Writing));
+			unvme_iod_t iod = unvme_awrite(ns, get_IOtoolkit().id, buf->baseVirt, buf->vma->getStorageLocation(buf->baseVirt), buf->vma->pageSize/ns->blocksize);
+			assert(iod);
+			requests.push_back(buf);
+			buf->vma->setClean(buf); // TODO: check if setClean should be before or after the write
 		}
-  }
+	}
 	for(Buffer* buf: requests){
 		while(buf->snapshotState.load() == BufferState::Writing){
 			unvme_check_completion(ns, get_IOtoolkit().id);
+			sizeWritten += buf->vma->pageSize;
 		}
 	}
-	writeSize += requests.size()*mmu::page_size;
+	writeSize += sizeWritten;
 }
 
 void createCache(u64 physSize, int batch){
