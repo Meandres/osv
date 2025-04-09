@@ -938,23 +938,8 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
     }
     if (err) desc->error = err;
 
-    //ucache::Buffer* buf = ucache::uCacheManager->getBuffer(desc->buf);
-    ucache::Buffer buffer(desc->buf, desc->nlb * 512, NULL); // TODO: make it depend on the actual lb size
-    ucache::Buffer* buf = &buffer;
-    if(buf != NULL){
-        ucache::BufferState oldState = buf->snapshotState.load();
-        switch(oldState){
-            case ucache::BufferState::Writing:
-                buf->snapshotState.compare_exchange_strong(oldState, ucache::BufferState::Evicting);
-                break;
-            case ucache::BufferState::Prefetching:
-                assert(buf->tryHandlingSoftFault());
-                buf->snapshotState.compare_exchange_strong(oldState, ucache::BufferState::Mapped);
-                break;
-            default:
-                break;
-        }
-    }
+    //ucache::Buffer buffer(desc->buf, desc->nlb * 512, NULL); // TODO: make it depend on the actual lb size
+    //assert(buffer.clearIO());
 
     // clear cid bit used
     desc->cidmask[b] &= ~mask;
