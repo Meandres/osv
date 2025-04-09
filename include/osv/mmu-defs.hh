@@ -96,6 +96,10 @@ enum {
     pte_cow = 0,
 };
 
+/* invlpg tlb for the current processor */
+void invlpg_tlb_local();
+/* invlpg tlb for all */
+void invlpg_tlb_all(std::vector<void*>*);
 /* flush tlb for the current processor */
 void flush_tlb_local();
 /* flush tlb for all */
