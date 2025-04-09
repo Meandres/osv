@@ -938,8 +938,8 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
     }
     if (err) desc->error = err;
 
-    //ucache::Buffer buffer(desc->buf, desc->nlb * 512, NULL); // TODO: make it depend on the actual lb size
-    //assert(buffer.clearIO());
+    ucache::Buffer buffer(desc->buf, desc->nlb * 512, NULL); // TODO: make it depend on the actual lb size
+    assert(buffer.clearIO());
 
     // clear cid bit used
     desc->cidmask[b] &= ~mask;
