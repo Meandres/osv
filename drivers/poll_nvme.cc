@@ -311,7 +311,7 @@ static int nvme_submit_cmd(nvme_queue_t* q)
 int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 {
     *stat = 0;
-    nvme_cq_entry_t* cqe;
+    /*nvme_cq_entry_t* cqe;
     bool con = true;
     while(con){
         u32 oldCQHead = q->cq_head.load();
@@ -332,8 +332,17 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
         }
     }
     *stat = cqe->psf & 0xfffe;
-    if (cqe_cs) *cqe_cs = cqe->cs;
+    if (cqe_cs) *cqe_cs = cqe->cs;*/
+    nvme_cq_entry_t* cqe = &q->cq[q->cq_head];
+    if (cqe->p == q->cq_phase) return -1;
 
+    *stat = cqe->psf & 0xfffe;
+    if (++q->cq_head == q->size) {
+        q->cq_head = 0;
+        q->cq_phase = !q->cq_phase;
+    }
+    if (cqe_cs) *cqe_cs = cqe->cs;
+    w32(q->dev, q->cq_doorbell, q->cq_head);
 
 #if 0
     // Some SSD does not advance sq_head properly (e.g. Intel DC D3600)
@@ -346,7 +355,7 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
     } else {
         printf("current cpu id: %u\n", sched::cpu::current()->id);
         ERROR("q=%d cq=%d sq=%d-%d cid=%#x stat=%#x (dnr=%d m=%d sct=%d sc=%#x) (C)",
-              q->id, q->cq_head.load(), q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
+              q->id, q->cq_head, q->sq_head, q->sq_tail, cqe->cid, *stat, cqe->dnr, cqe->m, cqe->sct, cqe->sc);
     }
     return cqe->cid;
 }
@@ -732,7 +741,8 @@ nvme_queue_t* nvme_ioq_create(nvme_device_t* dev, nvme_queue_t* ioq,
     ioq->sq = (nvme_sq_entry_t*)sqbuf;
     ioq->cq = (nvme_cq_entry_t*)cqbuf;
     ioq->sq_doorbell = dev->reg->sq0tdbl + (2 * id * dev->dbstride);
-    ioq->cq_doorbell = (std::atomic<u32>*) ioq->sq_doorbell + dev->dbstride;
+    //ioq->cq_doorbell = (std::atomic<u32>*) ioq->sq_doorbell + dev->dbstride;
+    ioq->cq_doorbell = (u32*) ioq->sq_doorbell + dev->dbstride;
 
     if (nvme_acmd_create_cq(ioq, cqpa) || nvme_acmd_create_sq(ioq, sqpa)) {
         free(ioq);
@@ -776,7 +786,8 @@ nvme_queue_t* nvme_adminq_setup(nvme_device_t* dev, int qsize,
     adminq->sq = (nvme_sq_entry_t*)sqbuf;
     adminq->cq = (nvme_cq_entry_t*)cqbuf;
     adminq->sq_doorbell = dev->reg->sq0tdbl;
-    adminq->cq_doorbell = (std::atomic<u32>*) adminq->sq_doorbell + dev->dbstride;
+    //adminq->cq_doorbell = (std::atomic<u32>*) adminq->sq_doorbell + dev->dbstride;
+    adminq->cq_doorbell = (u32*) adminq->sq_doorbell + dev->dbstride;
 
     nvme_adminq_attr_t aqa;
     aqa.val = 0;
@@ -958,9 +969,9 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
     return err;
 }
 
-int unvme_check_completion(const unvme_ns_t* ns, int qid){
+int unvme_check_completion(const unvme_ns_t* ns, int qid, int timeout){
     unvme_queue_t* q = ((unvme_session_t*)ns->ses)->dev->ioqs + qid;
-    return unvme_check_completion(q, 0, NULL);
+    return unvme_check_completion(q, timeout, NULL);
 }
 
 /**
@@ -1766,6 +1777,7 @@ using namespace memory;
 vfio_dma_t* vfio_dma_alloc(size_t size)
 {
     vfio_dma_t* p = (vfio_dma_t*)malloc(sizeof(vfio_dma_t));
+    size = align_up(size, mmu::page_size);
     p->size = size;
     p->buf = (void*) memory::alloc_phys_contiguous_aligned(size, mmu::page_size);
     memset(p->buf, 0, size);

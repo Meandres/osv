@@ -328,6 +328,11 @@ inline void crash_osv(){
     osv::halt();
 }
 
+inline void assert_crash(bool cond){
+    if(!cond)
+        crash_osv();
+}
+
 // only allow 4KiB -> 64 KiB and 2MiB
 inline int computeOrder(u64 size){
     switch(size){
@@ -527,6 +532,7 @@ class uCache {
 	  std::atomic<u64> usedPhysSize;
    	std::atomic<u64> readSize;
    	std::atomic<u64> writeSize;
+    std::atomic<u64> pageFaults;
     std::atomic<u64> tlbFlush;
 
    	uCache(u64 physSize, int batch);
@@ -558,12 +564,18 @@ inline void discover_ucache_files(){
     std::ifstream files("/nvme_files.txt");
     std::string name;
     u64 slba, size;
-    std::cout << "Available files on the ssd:" << std::endl;
+    std::string initial_text = "Available files on the ssd:\n";
+    bool printed_initial=false;
     while(files >> name >> slba >> size){
+        if(!printed_initial)
+            std::cout << initial_text;
         ucache_file* file = new ucache_file(name, slba, size, uCacheManager->ns->blocksize);
         std::cout << name << ": from " << slba << ", size: " << size << std::endl;
         available_nvme_files.push_back(file);
         next_available_slba += file->num_lb + 1;
+    }
+    if(!printed_initial){
+        printf("No files available on the SSD\n");
     }
 
 }
