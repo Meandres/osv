@@ -1702,7 +1702,7 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
             return;
         }
         if(vma->id() != 0)
-            ucache::uCacheManager->handleFault(vma->id(), (void*)addr, ef);
+            ucache::uCacheManager->handlePageFault(vma->id(), (void*)addr, ef);
         else
             vma->fault(addr, ef);
     //}

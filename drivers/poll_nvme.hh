@@ -658,6 +658,7 @@ typedef struct _nvme_queue {
     //std::atomic<u16>        cq_phase;   ///< completion queue phase bit
     u16                     cq_phase;   ///< completion queue phase bit
     u16                     ext;        ///< externally allocated flag
+    u32                     last_cq_doorbelled;
 } nvme_queue_t;
 
 /// Device context
@@ -696,7 +697,7 @@ int nvme_acmd_delete_cq(nvme_queue_t* ioq);
 int nvme_acmd_delete_sq(nvme_queue_t* ioq);
 
 int nvme_cmd_vs(nvme_queue_t* q, int opc, u16 cid, int nsid, u64 prp1, u64 prp2, u32 cdw10_15[6]);
-int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid, u64 slba, int nlb, u64 prp1, u64 prp2);
+int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid, u64 slba, int nlb, u64 prp1, u64 prp2, bool ring=true);
 int nvme_cmd_read(nvme_queue_t* ioq, u16 cid, int nsid, u64 slba, int nlb, u64 prp1, u64 prp2);
 int nvme_cmd_write(nvme_queue_t* ioq, u16 cid, int nsid, u64 slba, int nlb, u64 prp1, u64 prp2);
 
@@ -704,7 +705,7 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs);
 int nvme_check_completion_ooo(nvme_queue_t* q, int* stat, u32* cqe_cs, int pos);
 int nvme_wait_completion(nvme_queue_t* q, int cid, int timeout);
 
-
+//extern std::vector<u32> last_cq_doorbelled;
 
 /// Lock write bit
 #define UNVME_LOCKWBIT      0x80000000
@@ -887,14 +888,14 @@ unvme_ns_t* unvme_do_open(int nsid, int qcount, int qsize);
 int unvme_do_close(const unvme_ns_t* ns);
 void* unvme_do_alloc(const unvme_ns_t* ns, u64 size);
 int unvme_do_free(const unvme_ns_t* ses, void* buf);
-int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs);
+int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs, bool writing=false);
 unvme_desc_t* unvme_do_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc, void* buff, u64 slba, u32 nlb);
 int unvme_check_completion(const unvme_ns_t* ns, int qid, int timeout=0);
 
 
 #define UNVME_TIMEOUT   60          ///< default timeout in seconds
-#define UNVME_SHORT_TIMEOUT 1
+#define UNVME_SHORT_TIMEOUT 3
 #define UNVME_QSIZE     256         ///< default I/O queue size
 
 
@@ -910,11 +911,11 @@ int unvme_write(const unvme_ns_t* ns, int qid, const void* buf, u64 slba, u32 nl
 int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb);
 int unvme_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6], u32* cqe_cs);
 
-unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid, const void* buf, u64 slba, u32 nlb);
-unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb);
+unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid, const void* buf, u64 slba, u32 nlb, bool ring=true);
+unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb, bool ring=true);
 unvme_iod_t unvme_acmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 
-int unvme_apoll(unvme_iod_t iod, int timeout);
+int unvme_apoll(unvme_iod_t iod, int timeout, bool writing=false);
 int unvme_apoll_cs(unvme_iod_t iod, int timeout, u32* cqe_cs);
 
 extern nvme_controller_reg_t* globalReg;
@@ -931,7 +932,7 @@ public:
 
     static hw_driver* probe(hw_device* dev);
 
-
+    const unvme_ns_t* ns;
 private:
     void parse_pci_config();
     void stop();

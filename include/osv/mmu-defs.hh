@@ -96,6 +96,7 @@ enum {
     pte_cow = 0,
 };
 
+const int invlpg_max_pages = 1024;
 /* invlpg tlb for the current processor */
 void invlpg_tlb_local();
 /* invlpg tlb for all */

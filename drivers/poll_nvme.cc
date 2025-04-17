@@ -70,55 +70,7 @@ static FILE*                log_fp = NULL;  ///< log file pointer
 static int                  log_count = 0;  ///< log open count
 static pthread_mutex_t      log_lock = PTHREAD_MUTEX_INITIALIZER; ///< log lock
 nvme_controller_reg_t* globalReg;
-
-#ifdef NVME_FAIL
-// count successful requests
-static std::atomic<int> failure_cnt = {0};
-inline void wait_us(nvme_queue_t* q, u64 us){
-    u64 endtsc = processor::rdtsc() + us * (q->dev->rdtsec/100000);
-    while (processor::rdtsc() < endtsc){}
-}
-
-inline u64 hash(int opc, u64 prp1, u64 slba, int nlb){
-    return processor::rdtsc() + (prp1*opc & slba*nlb) + opc-nlb;
-}
-
-inline bool do_fail(nvme_queue_t* q, int opc, u64 prp1, u64 prp2, u64 slba, int nlb){
-    switch(NVME_FAIL_TYPE){
-        case 1: // simply flips a bit in the physical page  
-
-            break;
-        case 2: // instead of using rng, simply fail every nth operation. This include any operation.
-            if(NVME_FAIL_NTH == 0)
-                return false;
-            else{
-                if(failure_cnt.load(std::memory_order_relaxed) >= NVME_FAIL_NTH){
-                    failure_cnt.exchange(0, std::memory_order_relaxed);
-                    return true;
-                }
-                failure_cnt++;
-                return false;
-            }
-        case 3:
-            if(NVME_FAIL_BLOCK >= slba && NVME_FAIL_BLOCK < slba + nlb){
-                return true;
-            }
-            return false;
-        case 4:
-            wait_us(q, NVME_FAIL_TIMING);
-            return false;
-        case 5:
-            FATAL("Not yet implemented\n");
-        case 6:
-            u64 ttw = hash(opc, prp1, slba, nlb)%NVME_FAIL_TIMING_RND_UPLIM;
-            wait_us(q, ttw);
-            return false;
-    }
-    return false;
-}
-#else
-inline bool do_fail(nvme_queue_t* q, int opc, u64 prp1, u64 prp2, u64 slba, int nlb){ return false; }
-#endif
+//std::vector<u32> last_cq_doorbelled;
 
 /// IO descriptor debug print
 #define PDEBUG(fmt, arg...) //fprintf(stderr, fmt "\n", ##arg)
@@ -207,6 +159,7 @@ static inline u32 r32(nvme_device_t* dev, u32* addr)
 {
     u32 val = *addr;
     DEBUG("r32 %#lx %#x", (u64) addr - (u64) dev->reg, val);
+    //ucache::mmioAccesses++;
     return val;
 }
 
@@ -214,12 +167,14 @@ static inline void w32(nvme_device_t* dev, u32* addr, u32 val)
 {
     DEBUG("w32 %#lx %#x", (u64) addr - (u64) dev->reg, val);
     *addr = val;
+    //ucache::mmioAccesses++;
 }
 
 static inline u64 r64(nvme_device_t* dev, u64* addr)
 {
     u64 val = *addr;
     DEBUG("r64 %#lx %#lx", (u64) addr - (u64) dev->reg, val);
+    //ucache::mmioAccesses++;
     return val;
 }
 
@@ -227,6 +182,7 @@ static inline void w64(nvme_device_t* dev, u64* addr, u64 val)
 {
     DEBUG("w64 %#lx %#lx", (u64) addr - (u64) dev->reg, val);
     *addr = val;
+    //ucache::mmioAccesses++;
 }
 
 /**
@@ -283,7 +239,7 @@ static int nvme_ctlr_enable(nvme_device_t* dev, nvme_controller_config_t cc)
  * @param   q           queue
  * @return  0 if ok else -1.
  */
-static int nvme_submit_cmd(nvme_queue_t* q)
+static int nvme_submit_cmd(nvme_queue_t* q, bool ring=true)
 {
     int tail = q->sq_tail;
     //HEX_DUMP(&q->sq[tail], sizeof(nvme_sq_entry_t));
@@ -297,7 +253,8 @@ static int nvme_submit_cmd(nvme_queue_t* q)
     }
 #endif
     q->sq_tail = tail;
-    w32(q->dev, q->sq_doorbell, tail);
+    if(ring)
+        w32(q->dev, q->sq_doorbell, tail);
     return 0;
 }
 
@@ -311,28 +268,6 @@ static int nvme_submit_cmd(nvme_queue_t* q)
 int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
 {
     *stat = 0;
-    /*nvme_cq_entry_t* cqe;
-    bool con = true;
-    while(con){
-        u32 oldCQHead = q->cq_head.load();
-        cqe = &q->cq[oldCQHead];
-        u16 oldPhase = q->cq_phase.load();
-        if (cqe->p == oldPhase) return -1;
-
-        u32 newCQHead = oldCQHead+1 == (u32)q->size ? 0 :  oldCQHead + 1;
-        bool changePhase = oldCQHead + 1 == (u32)q->size;
-
-        //w32(q->dev, q->cq_doorbell, q->cq_head);
-        if(q->cq_doorbell->compare_exchange_strong(oldCQHead, newCQHead)){
-            con = false;
-            q->cq_head = newCQHead;
-            if(changePhase){
-                assert(q->cq_phase.compare_exchange_strong(oldPhase, !oldPhase));
-            }
-        }
-    }
-    *stat = cqe->psf & 0xfffe;
-    if (cqe_cs) *cqe_cs = cqe->cs;*/
     nvme_cq_entry_t* cqe = &q->cq[q->cq_head];
     if (cqe->p == q->cq_phase) return -1;
 
@@ -342,7 +277,16 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
         q->cq_phase = !q->cq_phase;
     }
     if (cqe_cs) *cqe_cs = cqe->cs;
-    w32(q->dev, q->cq_doorbell, q->cq_head);
+    //w32(q->dev, q->cq_doorbell, q->cq_head);
+    
+    if(q->id == 0){ // adminq
+        w32(q->dev, q->cq_doorbell, q->cq_head);
+    }else{
+        if((unsigned)q->cq_head == q->last_cq_doorbelled){
+            q->last_cq_doorbelled = q->cq_head == 0 ? q->size-1 : q->cq_head-1;
+            w32(q->dev, q->cq_doorbell, q->cq_head);
+        }
+    }
 
 #if 0
     // Some SSD does not advance sq_head properly (e.g. Intel DC D3600)
@@ -665,7 +609,7 @@ int nvme_cmd_vs(nvme_queue_t* q, int opc, u16 cid, int nsid,
  * @return  0 if ok else -1.
  */
 int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid,
-                u64 slba, int nlb, u64 prp1, u64 prp2)
+                u64 slba, int nlb, u64 prp1, u64 prp2, bool ring)
 {
     nvme_command_rw_t* cmd = &ioq->sq[ioq->sq_tail].rw;
 
@@ -680,7 +624,7 @@ int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid,
     DEBUG_FN("q=%d sq=%d-%d cid=%#x nsid=%d lba=%#lx nb=%#x prp=%#lx.%#lx (%c)",
              ioq->id, ioq->sq_head, ioq->sq_tail, cid, nsid, slba, nlb, prp1, prp2,
              opc == NVME_CMD_READ? 'R' : 'W');
-    return nvme_submit_cmd(ioq);
+    return nvme_submit_cmd(ioq, ring);
 }
 
 /**
@@ -695,9 +639,9 @@ int nvme_cmd_rw(nvme_queue_t* ioq, int opc, u16 cid, int nsid,
  * @return  0 if ok else -1.
  */
 int nvme_cmd_read(nvme_queue_t* ioq, u16 cid, int nsid,
-                  u64 slba, int nlb, u64 prp1, u64 prp2)
+                  u64 slba, int nlb, u64 prp1, u64 prp2, bool ring=true)
 {
-    return nvme_cmd_rw(ioq, NVME_CMD_READ, cid, nsid, slba, nlb, prp1, prp2);
+    return nvme_cmd_rw(ioq, NVME_CMD_READ, cid, nsid, slba, nlb, prp1, prp2, ring);
 }
 
 /**
@@ -712,9 +656,9 @@ int nvme_cmd_read(nvme_queue_t* ioq, u16 cid, int nsid,
  * @return  0 if ok else -1.
  */
 int nvme_cmd_write(nvme_queue_t* ioq, u16 cid, int nsid,
-                   u64 slba, int nlb, u64 prp1, u64 prp2)
+                   u64 slba, int nlb, u64 prp1, u64 prp2, bool ring=true)
 {
-    return nvme_cmd_rw(ioq, NVME_CMD_WRITE, cid, nsid, slba, nlb, prp1, prp2);
+    return nvme_cmd_rw(ioq, NVME_CMD_WRITE, cid, nsid, slba, nlb, prp1, prp2, ring);
 }
 
 /**
@@ -741,8 +685,9 @@ nvme_queue_t* nvme_ioq_create(nvme_device_t* dev, nvme_queue_t* ioq,
     ioq->sq = (nvme_sq_entry_t*)sqbuf;
     ioq->cq = (nvme_cq_entry_t*)cqbuf;
     ioq->sq_doorbell = dev->reg->sq0tdbl + (2 * id * dev->dbstride);
-    //ioq->cq_doorbell = (std::atomic<u32>*) ioq->sq_doorbell + dev->dbstride;
+    //ioq->cq_doorbell = (std::atomic<u32>*) (ioq->sq_doorbell + dev->dbstride);
     ioq->cq_doorbell = (u32*) ioq->sq_doorbell + dev->dbstride;
+    ioq->last_cq_doorbelled = qsize - 1;
 
     if (nvme_acmd_create_cq(ioq, cqpa) || nvme_acmd_create_sq(ioq, sqpa)) {
         free(ioq);
@@ -786,7 +731,7 @@ nvme_queue_t* nvme_adminq_setup(nvme_device_t* dev, int qsize,
     adminq->sq = (nvme_sq_entry_t*)sqbuf;
     adminq->cq = (nvme_cq_entry_t*)cqbuf;
     adminq->sq_doorbell = dev->reg->sq0tdbl;
-    //adminq->cq_doorbell = (std::atomic<u32>*) adminq->sq_doorbell + dev->dbstride;
+    //adminq->cq_doorbell = (std::atomic<u32>*) (adminq->sq_doorbell + dev->dbstride);
     adminq->cq_doorbell = (u32*) adminq->sq_doorbell + dev->dbstride;
 
     nvme_adminq_attr_t aqa;
@@ -924,19 +869,26 @@ static void unvme_desc_put(unvme_desc_t* desc)
  * @param   cqe_cs      CQE command specific DW0 returned
  * @return  0 if ok else NVMe error code (-1 means timeout).
  */
-static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
+static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs, bool writing=false)
 {
     // wait for completion
     int err, cid;
     u64 endtsc = 0;
+    bool broken = false;
     do {
         cid = nvme_check_completion(q->nvmeq, &err, cqe_cs);
-        if (timeout == 0 || cid >= 0) break;
+        if (timeout == 0 || cid >= 0) {broken = true; break;}
         if (endtsc){} //sched_yield();
         else endtsc = processor::rdtsc() + timeout * q->nvmeq->dev->rdtsec;
     } while (processor::rdtsc() < endtsc);
 
-    if (cid < 0) return cid;
+    if (cid < 0){
+        if(broken){
+            printf("broken\n");
+        }
+        ucache::assert_crash(false);
+        return cid;
+    }
 
     // find the pending cid in the descriptor list to clear it
     unvme_desc_t* desc = q->descpend;
@@ -949,8 +901,13 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs)
     }
     if (err) desc->error = err;
 
-    ucache::Buffer buffer(desc->buf, desc->nlb * 512, NULL); // TODO: make it depend on the actual lb size
-    assert(buffer.clearIO());
+    if(ucache::uCacheManager != NULL){
+        ucache::VMA* vma = ucache::uCacheManager->getVMA(desc->buf);
+        if(vma != NULL){
+            ucache::Buffer* buffer = vma->getBuffer(desc->buf); // TODO: make it depend on the actual lb size
+            assert(buffer->clearIO(writing));
+        }
+    }
 
     // clear cid bit used
     desc->cidmask[b] &= ~mask;
@@ -1099,7 +1056,7 @@ static int unvme_map_prps(const unvme_ns_t* ns, unvme_queue_t* q, int cid,
  * @return  cid if ok else -1.
  */
 static int unvme_submit_io(const unvme_ns_t* ns, unvme_desc_t* desc,
-                           void* buf, u64 slba, u32 nlb)
+                           void* buf, u64 slba, u32 nlb, bool ring=true)
 {
     u64 prp1, prp2;
     unvme_queue_t* ioq = desc->q;
@@ -1109,7 +1066,7 @@ static int unvme_submit_io(const unvme_ns_t* ns, unvme_desc_t* desc,
 
     // submit I/O command
     if (nvme_cmd_rw(ioq->nvmeq, desc->opc, cid,
-                    ns->id, slba, nlb, prp1, prp2)) return -1;
+                    ns->id, slba, nlb, prp1, prp2, ring)) return -1;
     PDEBUG("# %c %#lx %#x q%d={%d %d %#lx} d={%d %d %#lx}",
            desc->opc == NVME_CMD_READ ? 'r' : 'w', slba, nlb,
            ioq->nvmeq->id, cid, ioq->cidcount, *ioq->cidmask,
@@ -1370,7 +1327,11 @@ unvme_ns_t* unvme_do_open(int nsid, int qcount, int qsize)
 
         // setup IO queues
         dev->ioqs = (unvme_queue_t*)zalloc(qcount * sizeof(unvme_queue_t));
-        for (i = 0; i < qcount; i++) unvme_ioq_create(dev, i);
+        //last_cq_doorbelled.reserve(1+qcount);
+        for (i = 0; i < qcount; i++){
+            unvme_ioq_create(dev, i);
+            //last_cq_doorbelled[i+1]=qsize-1;
+        }
     }
 
     // allocate new session
@@ -1466,7 +1427,7 @@ int unvme_do_free(const unvme_ns_t* ns, void* buf)
  * @param   cqe_cs      CQE command specific DW0 returned
  * @return  0 if ok else error status (-1 means timeout).
  */
-int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
+int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs, bool writing)
 {
     if (desc->sentinel != desc)
         FATAL("bad IO descriptor");
@@ -1474,7 +1435,10 @@ int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
     PDEBUG("# POLL d={%d %d %#lx}", desc->id, desc->cidcount, *desc->cidmask);
     int err = 0;
     while (desc->cidcount) {
-        if ((err = unvme_check_completion(desc->q, timeout, cqe_cs)) != 0) break;
+        if ((err = unvme_check_completion(desc->q, timeout, cqe_cs, writing)) != 0){
+            ucache::assert_crash(false);
+            break;
+        }
     }
     if (desc->cidcount == 0) unvme_desc_put(desc);
     PDEBUG("# q%d +%d", desc->q->nvmeq->id, desc->q->desccount);
@@ -1494,7 +1458,7 @@ int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
  * @return  I/O descriptor or NULL if error.
  */
 unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc,
-                          void* buff, u64 slba, u32 nlb)
+                          void* buff, u64 slba, u32 nlb, bool ring=true)
 {
    char* buf = (char*)buff;
     unvme_queue_t* q = ((unvme_session_t*)ns->ses)->dev->ioqs + qid;
@@ -1511,7 +1475,7 @@ unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc,
     while (nlb) {
         int n = ns->maxbpio;
         if (n > (int)nlb) n = nlb;
-        int cid = unvme_submit_io(ns, desc, buf, slba, n);
+        int cid = unvme_submit_io(ns, desc, buf, slba, n, ring);
         if (cid < 0) {
             // poll currently pending descriptor
             int err = unvme_do_poll(desc, UNVME_SHORT_TIMEOUT, NULL);
@@ -1654,9 +1618,9 @@ unvme_iod_t unvme_acmd(const unvme_ns_t* ns, int qid, int opc, int nsid,
  * @param   nlb         number of logical blocks
  * @return  I/O descriptor or NULL if failed.
  */
-unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb)
+unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb, bool ring)
 {
-    return (unvme_iod_t)unvme_do_rw(ns, qid, NVME_CMD_READ, buf, slba, nlb);
+    return (unvme_iod_t)unvme_do_rw(ns, qid, NVME_CMD_READ, buf, slba, nlb, ring);
 }
 
 /**
@@ -1669,10 +1633,9 @@ unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 
  * @return  I/O descriptor or NULL if failed.
  */
 unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid,
-                         const void* buf, u64 slba, u32 nlb)
+                         const void* buf, u64 slba, u32 nlb, bool ring)
 {
-    //printf("awrite - qid: %u, buf: %p, slba: %lu, nlb: %u\n", qid, buf, slba, nlb);
-    return (unvme_iod_t)unvme_do_rw(ns, qid, NVME_CMD_WRITE, (void*)buf, slba, nlb);
+    return (unvme_iod_t)unvme_do_rw(ns, qid, NVME_CMD_WRITE, (void*)buf, slba, nlb, ring);
 } // this function used to be inline which caused problems of linking
   // TODO maybe put them (all the async func) in the header file directly ? 
 
@@ -1683,9 +1646,9 @@ unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid,
  * @param   timeout     in seconds
  * @return  0 if ok else error status (-1 for timeout).
  */
-int unvme_apoll(unvme_iod_t iod, int timeout)
+int unvme_apoll(unvme_iod_t iod, int timeout, bool writing)
 {
-    return unvme_do_poll((unvme_desc_t*)iod, timeout, NULL);
+    return unvme_do_poll((unvme_desc_t*)iod, timeout, NULL, writing);
 }
 
 /**
@@ -1741,6 +1704,7 @@ int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb)
         //sched_yield();
         return unvme_apoll(iod, UNVME_SHORT_TIMEOUT);
     }
+    ucache::assert_crash(false);
     return -1;
 }
 
@@ -1822,28 +1786,11 @@ nvme::nvme(pci::device &dev)
    command |= 0x4 | 0x2 | 0x400;
    dev.set_command(command);
 
-    const unvme_ns_t* ns = unvme_open();
-    while(!ns){ ns = unvme_open(); };
-    printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
-    printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
-
-    /*unsigned datasize = 4096;
-    char* buf = (char*)nvme_alloc(ns, datasize);
-    char* buf = (char*)malloc(datasize);
-    for (unsigned i=0; i<datasize; i++) buf[i] = i%10;
-    int ret = unvme_write(ns, 0, buf, 1, 4);
-    assert(ret == 0);
-
-    {
-       unsigned repeat = 10000;
-       //double start = gettime();
-       for (unsigned i=0; i<repeat; i++) {
-          ret = unvme_read(ns, 0, buf, (i*8) % 32768, 8);
-          assert(ret==0);
-       }
-       //double end = gettime();
-       //printf("%llu us\n", (end-start)*1e6/repeat);
-    }*/
+    ns = unvme_openq(sched::cpus.size(), ucache::maxQueueSize);
+    while(!ns){ ns = unvme_openq(sched::cpus.size(), ucache::maxQueueSize); };
+    //printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
+    //printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
+    printf("model: '%.40s', size : %lu GiB, blockcount: %lu, block size = %d, with %lu queues\n", ns->mn, (ns->blockcount*ns->blocksize)/(1024ull*1024*1024), ns->blockcount, ns->blocksize, ns->qcount);
 }
 
 void nvme::dump_config(void)
@@ -1874,8 +1821,13 @@ void nvme::parse_pci_config()
 hw_driver* nvme::probe(hw_device* dev)
 {
    if (auto pci_dev = dynamic_cast<pci::device*>(dev)) {
-      if ((pci_dev->get_base_class_code()==1) && (pci_dev->get_sub_class_code()==8) && (pci_dev->get_programming_interface()==2)) // detect NVMe device
-         return aligned_new<nvme>(*pci_dev);
+      if ((pci_dev->get_base_class_code()==1) && (pci_dev->get_sub_class_code()==8) && (pci_dev->get_programming_interface()==2)){ // detect NVMe device
+         nvme* device = aligned_new<nvme>(*pci_dev);
+         if(ucache::uCacheManager == NULL)
+             ucache::uCacheManager = new ucache::uCache();
+         ucache::uCacheManager->fs->add_device(device->ns);
+         return device;
+      }
    }
    return nullptr;
 }

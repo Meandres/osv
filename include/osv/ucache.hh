@@ -25,30 +25,55 @@
 #include <osv/power.hh>
 
 static const u64 maxPageSize = mmu::huge_page_size;
-#ifndef THRESHOLD_INVLPG_FLUSH
-#define THRESHOLD_INVLPG_FLUSH 1024
-#endif
 
 namespace ucache {
 
-extern int next_available_file_id;
-struct ucache_file{
+const u64 DEFAULT_LB_PER_STRIPE = 256;
+
+class ucache_file{
+    public:
     int id;
     std::string name;
-    u64 start_lba;
+    u64 start_vlba;    
     u64 num_lb;
     u64 size;
-    
-    u64 lba_size;
+   
     u64 current_seek_pos;
+    inline static u64 next_available_file_id;
 
-    ucache_file(std::string n, u64 slba, u64 size, u64 blksize): id(next_available_file_id++), name(n), start_lba(slba), num_lb(ceil(size/(blksize+0.0))), size(size), lba_size(blksize), current_seek_pos(0)
+    ucache_file(std::string n, u64 v_slba, u64 num_lb, u64 size): id(next_available_file_id++), name(n), start_vlba(v_slba), num_lb(num_lb), size(size), current_seek_pos(0)
     {
     }
 };
 
-extern u64 next_available_slba;
-extern std::vector<ucache_file*> available_nvme_files;
+struct StorageLocation{
+    u64 device_id;
+    u64 stripe;
+    u64 offset_in_stripe;
+};
+
+class ucache_fs{
+    public:
+    std::vector<ucache_file*> available_files;
+    std::vector<const unvme_ns_t*> devices;
+    u64 last_available_vlba;
+    u64 lb_size = 512;
+    u64 lb_per_stripe; 
+    u64 specified_nb_devices;
+
+    ucache_fs();
+
+    void discover_ucache_files();
+    void add_device(const unvme_ns_t* ns);
+    ucache_file* find_file(const char* name);
+    u64 findSpace(u64 nb_lb);
+    ucache_file* create_file(u64 size);
+    void computeStorageLocation(StorageLocation& loc, ucache_file* f, void* addr, void* start);
+    void read(ucache_file* f, void* addr, void* start, u64 size);
+    unvme_iod_t aread(ucache_file* f, void* addr, void* start, u64 size);
+    unvme_iod_t awrite(ucache_file* f, void* addr, void* start, u64 size, bool ring);
+    void poll(unvme_iod_t iod, bool writing);
+};
 
 typedef u64 phys_addr;
 typedef u64* virt_addr;
@@ -238,70 +263,45 @@ enum BufferState{
     TBD // just something to work with
 };
 
-static BufferState computePTEState(PTE pte){
-    if(pte.inserting == 1 && pte.evicting == 0 && pte.io == 0){
-        return BufferState::Inserting;
-    }
-    if(pte.inserting == 0 && pte.evicting == 0 && pte.io == 1 && pte.present == 0 && pte.phys != 0){
-        return BufferState::Reading;
-    }
-    if(pte.inserting == 0 && pte.evicting == 0 && pte.io == 0 && pte.present == 0 && pte.phys != 0){
-        return BufferState::ReadyToInsert;
-    }
-    if(pte.inserting == 0 && pte.evicting == 1 && pte.io == 0){
-        return BufferState::Evicting;
-    }
-    if(pte.inserting == 0 && pte.evicting == 1 && pte.io == 1){
-        return BufferState::Writing;
-    }
-    if(pte.inserting == 0 && pte.evicting == 0 && pte.io == 0 && pte.present == 1 && pte.phys != 0){
-        return BufferState::Cached;
-    }
-    if(pte.inserting == 0 && pte.evicting == 0 && pte.io == 0 && pte.present == 0 && pte.phys == 0){
-        return BufferState::Uncached;
-    }
-    return BufferState::Inconsistent;
-}
-
 struct VMA;
 
+struct BufferSnapshot {
+    PTE *ptes;
+    BufferState state;
+
+    BufferSnapshot(u64 nbPages){
+        ptes = (PTE*)malloc(nbPages * sizeof(PTE));
+        for(u64 i = 0; i<nbPages; i++)
+            ptes[i] = PTE(0);
+    }
+
+    ~BufferSnapshot(){
+        delete ptes;
+    }
+};
+
 struct Buffer {
-    std::vector<std::atomic<u64>*> pteRefs; 
-    std::vector<PTE> ptes;
+    std::atomic<u64>* pteRefs;
     void* baseVirt;
     VMA* vma;
-    BufferState state; 
+    BufferSnapshot *snap; // only used during eviction to avoid passing std::pair around
 
     Buffer(void* addr, u64 size, VMA* vma);
     ~Buffer(){}
 
-    void updateSnapshot(){
-        state = BufferState::TBD;
-        for(size_t i = 0; i < pteRefs.size(); i++){
-            ptes[i] = PTE(pteRefs[i]->load());
-            BufferState w = computePTEState(ptes[i]);
-            if(state == BufferState::TBD){
-                state = w;
-            }else{
-                if(w != state && state != BufferState::Inserting && state != BufferState::Reading && state != BufferState::ReadyToInsert && state != BufferState::Evicting && state != BufferState::Writing){
-                    state = BufferState::Inconsistent;
-                    return;
-                }
-            }
-        }
-    }
+    void updateSnapshot(BufferSnapshot* bs=NULL);
 
     u64 getPrefetcher(){
-        PTE pte(*pteRefs[0]);
+        PTE pte(*pteRefs);
         return pte.prefetcher;
     }
 
-   void tryClearAccessed();
+   void tryClearAccessed(BufferSnapshot* bs);
 
-   bool tryMap(u64 phys);
-   u64 tryUnmap();
+   bool UncachedToInserting(u64 phys, BufferSnapshot* bs);
+   u64 EvictingToUncached(BufferSnapshot* bs);
 
-   int getAccessed();
+   int getAccessed(BufferSnapshot* bs);
 
    // for non-concurrent scenarios
    void map(u64 phys);
@@ -309,17 +309,17 @@ struct Buffer {
    void invalidateTLBEntries();
 
    // Transitions
-   bool toInserting();
-   bool toPrefetching(u64 phys);
-   bool toEvicting();
-   bool toCached();
-   bool ReadyToCached();
+   bool UncachedToPrefetching(u64 phys, BufferSnapshot* bs);
+   bool CachedToEvicting(BufferSnapshot* bs);
+   bool InsertingToCached(BufferSnapshot* bs);
+   bool ReadyToInsertToCached(BufferSnapshot* bs);
+   bool EvictingToCached(BufferSnapshot* bs);
 
    bool setIO();
-   bool clearIO();
+   bool clearIO(bool dirty=false);
 };
 
-static const int16_t maxQueueSize = 256;
+static const int16_t maxQueueSize = 896;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
@@ -364,13 +364,10 @@ inline void* alignPage(void* addr, u64 pageSize){
 typedef std::vector<Buffer*>& PrefetchList;
 typedef std::vector<Buffer*>& EvictList;
 
-typedef float (*custom_score_func)(Buffer*);
-typedef bool (*isAccessed_func)(Buffer* virt);
-typedef bool (*isDirty_func)(Buffer* virt);
-typedef void (*clearDirty_func)(Buffer* virt);
-typedef void (*setDirty_func)(Buffer* virt);
 typedef void (*alloc_func)(VMA*, void*, PrefetchList, void*);
 typedef void (*evict_func)(VMA*, u64, EvictList);
+typedef bool (*conditional_callback) (Buffer* buf);
+typedef void (*unconditional_callback) (Buffer* buf);
 
 class ResidentSet{
     public:
@@ -380,7 +377,7 @@ class ResidentSet{
     virtual bool insert(Buffer*) = 0;
     virtual bool remove(Buffer*) = 0;
     virtual u64 getNextBatch(u64 batchsize) = 0;
-    virtual void getNextValidEntry(std::pair<u64, Entry*>*) = 0;
+    virtual void getNextValidEntry(u64*, Entry*, u64) = 0;
 };
 
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
@@ -403,8 +400,22 @@ class HashTableResidentSet: public ResidentSet {
     bool contains(Buffer* buf);
     bool remove(Buffer* buf) override;
     u64 getNextBatch(u64 batch) override;
-    void getNextValidEntry(std::pair<u64, Entry*>* entry) override;
+    void getNextValidEntry(u64*, Entry*, u64) override;
 };
+
+struct callbacks {
+    conditional_callback isDirty_implem;
+    unconditional_callback clearDirty_implem;
+    unconditional_callback setDirty_implem;
+    conditional_callback canBeEvicted_implem;
+	  unconditional_callback post_EvictingToUncached_callback_implem;
+	  conditional_callback pre_CachedToEvicting_callback_implem;
+    unconditional_callback post_EvictingToCached_callback_implem;
+
+    alloc_func prefetch_pol;
+    evict_func evict_pol;
+};
+extern callbacks default_callbacks;
 
 class VMA {
     public:
@@ -412,22 +423,18 @@ class VMA {
     u64 size;
     struct ucache_file* file;
     u64 pageSize;
+    u64 nbPages;
     u64 id;
     std::atomic<u64> usedPhysSize;
+    std::vector<Buffer*> buffers;
 
     // policy related
     ResidentSet* residentSet;
-    isDirty_func isDirty_implem; 
-    clearDirty_func clearDirty_implem;
-    setDirty_func setDirty_implem;
-    isAccessed_func isAccessed_implem;
-    alloc_func prefetch_pol;
-    evict_func evict_pol;
+    callbacks callback_implems;
 
     void* prefetchObject;
 
-    VMA(u64, u64, isDirty_func, clearDirty_func, setDirty_func, isAccessed_func,
-        ResidentSet*, struct ucache_file*, alloc_func, evict_func);
+    VMA(u64, u64, ResidentSet*, struct ucache_file*, callbacks);
     static VMA* newVMA(u64 size, u64 page_size);
     static VMA* newVMA(const char* name, u64 page_size);
     ~VMA(){}
@@ -438,78 +445,105 @@ class VMA {
         return a >= s && a < s + size;
     }
 
-    u64 getStorageLocation(void* addr){
-        return file->start_lba + ((uintptr_t)addr-(uintptr_t)start)/file->lba_size;
-    } 
+    Buffer* getBuffer(void* addr){
+        if(buffers.empty())
+            return new Buffer(addr, this->pageSize, this);
+        else
+            return buffers.at(((uintptr_t)addr-(uintptr_t)start)/pageSize);
+    }
 
-    bool isAccessed(Buffer* buf){
-        return isAccessed_implem(buf);
+    bool canBeEvicted(Buffer* buf){
+        return callback_implems.canBeEvicted_implem(buf);
     }
     
     bool isDirty(Buffer* buf){
-        return isDirty_implem(buf);
+        return callback_implems.isDirty_implem(buf);
     }
 
     void clearDirty(Buffer* buf){
-        return clearDirty_implem(buf);
+        callback_implems.clearDirty_implem(buf);
     }
 
     void setDirty(Buffer* buf){
-        return setDirty_implem(buf);
+        callback_implems.setDirty_implem(buf);
+    }
+
+    void post_EvictingToUncached_callback(Buffer* buf){
+        callback_implems.post_EvictingToUncached_callback_implem(buf);
+    }
+
+    bool pre_CachedToEvicting_callback(Buffer* buf){
+        return callback_implems.pre_CachedToEvicting_callback_implem(buf);
+    }
+
+    void post_EvictingToCached_callback(Buffer* buf){
+        callback_implems.post_EvictingToCached_callback_implem(buf);
     }
 
     void choosePrefetchingCandidates(void* addr, PrefetchList pl){
-        prefetch_pol(this, addr, pl, prefetchObject);
+        callback_implems.prefetch_pol(this, addr, pl, prefetchObject);
     }
 
     void chooseEvictionCandidates(u64 sizeToEvict, EvictList el){
-        evict_pol(this, sizeToEvict, el);
+        callback_implems.evict_pol(this, sizeToEvict, el);
     }
 
-    bool addEvictionCandidate(Buffer* buf, EvictList el){
-        //buf->updateSnapshot();
+    bool addEvictionCandidate(Buffer* buf, BufferSnapshot* bs, EvictList el){
         if(residentSet->remove(buf)){
-            if(buf->toEvicting()){
+            if(buf->CachedToEvicting(bs)){
+                assert_crash(buf->snap == NULL);
+                buf->snap = bs;
                 el.push_back(buf);
                 return true;
             }else{
                 assert(residentSet->insert(buf));
             }
         }
+        printf("didn't : %p\n", buf->baseVirt);
         return false;
     }
 };
 
 inline bool pte_isDirty(Buffer* buf){
 	int dirty = 0;
-	for(size_t i=0; i<buf->pteRefs.size(); i++){
-		dirty += buf->ptes[i].dirty;
+	for(size_t i=0; i<buf->vma->nbPages; i++){
+		dirty += buf->snap->ptes[i].dirty;
 	}
 	return dirty > 0;
 }
 
 inline bool pte_isAccessed(Buffer* buf){
     int accessed = 0;
-	  for(size_t i=0; i<buf->pteRefs.size(); i++){
-		    accessed += buf->ptes[i].accessed;
+	  for(size_t i=0; i<buf->vma->nbPages; i++){
+		    accessed += buf->snap->ptes[i].accessed;
 	  }
 	  return accessed > 0;
 }
 
 inline void pte_clearDirty(Buffer* buf){
-  for(size_t i = 0; i < buf->pteRefs.size(); i++){ // just try to 
-		PTE pte = buf->ptes[i];
-		if(pte.dirty == 0){ // simply skip
-			continue;
-		}
-		PTE newPTE = PTE(pte.word);
-		newPTE.dirty = 0; 
-		buf->pteRefs[i]->compare_exchange_strong(pte.word, newPTE.word); // best effort 
-	}
+    if(buf->snap == NULL){
+        BufferSnapshot* bs = new BufferSnapshot(buf->vma->nbPages);
+        buf->updateSnapshot(bs);
+        buf->snap = bs;
+    }
+    for(size_t i = 0; i < buf->vma->nbPages; i++){ // just try to 
+		    PTE pte = buf->snap->ptes[i];
+		    if(pte.dirty == 0){ // simply skip
+			      continue;
+		    }
+		    PTE newPTE = PTE(pte.word);
+		    newPTE.dirty = 0; 
+        std::atomic<u64>* ref = buf->pteRefs+i;
+		    ref->compare_exchange_strong(pte.word, newPTE.word); // best effort 
+	  }
 }
 
-inline void pte_setDirty(Buffer* buf){
+inline void empty_unconditional_callback(Buffer* buf){
     return;
+}
+
+inline bool empty_conditional_callback(Buffer* buf){
+    return true;
 }
 
 // by default -> no prefetching
@@ -527,6 +561,7 @@ class uCache {
   
     // accessory
    	u64 batch;
+    ucache_fs* fs;
 
    	// accounting
 	  std::atomic<u64> usedPhysSize;
@@ -535,22 +570,22 @@ class uCache {
     std::atomic<u64> pageFaults;
     std::atomic<u64> tlbFlush;
 
-   	uCache(u64 physSize, int batch);
+   	uCache();
+    void init(u64 physSize, int batch);
    	~uCache();
 
     void* addVMA(u64 virtSize, u64 pageSize);
     VMA* getOrCreateVMA(const char* name);
     VMA* getVMA(void* addr);
 
-    const unvme_ns_t* ns;
-	  
     // Functions
    	void ensureFreePages(u64 additionalSize);
    	void readBuffer(Buffer* buf);
     void readBufferToTmp(Buffer* buf, Buffer* tmp);
     void flush(std::vector<Buffer*> toWrite);
     
-    void handleFault(u64 vmaID, void* addr, exception_frame *ef); // called from the page fault handler
+    void handlePageFault(u64 vmaID, void* addr, exception_frame *ef); // called from the page fault handler
+    void handleFault(VMA* vma, Buffer* buffer, bool newPage=false);
     void prefetch(VMA* vma, PrefetchList pl);
    	void evict();
 
@@ -559,36 +594,5 @@ class uCache {
 extern uCache* uCacheManager;
 
 void createCache(u64 physSize, int batch);
-
-inline void discover_ucache_files(){
-    std::ifstream files("/nvme_files.txt");
-    std::string name;
-    u64 slba, size;
-    std::string initial_text = "Available files on the ssd:\n";
-    bool printed_initial=false;
-    while(files >> name >> slba >> size){
-        if(!printed_initial)
-            std::cout << initial_text;
-        ucache_file* file = new ucache_file(name, slba, size, uCacheManager->ns->blocksize);
-        std::cout << name << ": from " << slba << ", size: " << size << std::endl;
-        available_nvme_files.push_back(file);
-        next_available_slba += file->num_lb + 1;
-    }
-    if(!printed_initial){
-        printf("No files available on the SSD\n");
-    }
-
-}
-
-inline struct ucache_file* find_ucache_file(const char* name){
-    for(struct ucache_file* file: available_nvme_files){
-        if(strcmp(file->name.c_str(), name) == 0){
-            //printf("Found file: %s from %lu with %lu blocks (of size %u)\n", file->name.c_str(), file->start_lba, file->num_lb, uCacheManager->ns->blocksize);
-            return file;
-        }
-    }
-    //printf("Error: could not find %s\n", name);
-    return NULL;
-}
 }; // namespace ucache
 #endif

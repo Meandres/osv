@@ -159,7 +159,6 @@ static bool opt_strace = false;
 static bool opt_mount = true;
 static bool opt_pivot = true;
 static std::string opt_rootfs;
-static int opt_ucache_phys_size;
 static bool opt_random = true;
 static bool opt_init = true;
 static std::string opt_console = "all";
@@ -197,7 +196,6 @@ static void usage()
         "  --nomount                don't mount the root file system\n"
         "  --nopivot                do not pivot the root from bootfs to the root fs\n"
         "  --rootfs=arg             root filesystem to use (zfs, rofs, ramfs or virtiofs)\n"
-        "  --ucache_phys_size=arg   create ucache with the specified size of physical memory available (in MiB)\n" 
         "  --assign-net             assign virtio network to the application\n"
         "  --maxnic=arg             maximum NIC number\n"
         "  --norandom               don't initialize any random device\n"
@@ -335,10 +333,6 @@ static void parse_options(int loader_argc, char** loader_argv)
             printf("Ignoring '--rootfs' options after the first.");
         }
         opt_rootfs = v.front();
-    }
-
-    if (options::option_value_exists(options_values, "ucache_phys_size")) {
-        opt_ucache_phys_size = options::extract_option_int_value(options_values, "ucache_phys_size", handle_parse_error);
     }
 
     if (options::option_value_exists(options_values, "mount-fs")) {
@@ -705,9 +699,7 @@ void* do_main_thread(void *_main_args)
                  init_commands.begin(), init_commands.end());
     }
 
-    if(opt_ucache_phys_size!=0){
-        ucache::createCache(opt_ucache_phys_size*1024ul*1024, 64);
-    }
+    //ucache::uCacheManager = new ucache::uCache();
 
     // run each payload in order
     // Our parse_command_line() leaves at the end of each command a delimiter,

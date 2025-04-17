@@ -16,6 +16,7 @@
 #include <osv/elf.hh>
 #include "exceptions.hh"
 #include <algorithm>
+#include <osv/percpu.hh>
 
 void page_fault(exception_frame *ef)
 {
@@ -52,10 +53,11 @@ void invlpg_tlb_entry(void* addr){
 	asm volatile("invlpg (%0)" :: "r" (addr) : "memory");
 }
 
-mutex tlb_invlpg_mutex;
+std::atomic_flag tlb_invlpg_mutex = ATOMIC_FLAG_INIT;
+//mutex tlb_invlpg_mutex;
 sched::thread_handle tlb_invlpg_waiter;
 std::atomic<int> tlb_invlpg_pendingconfirms;
-static const int max_pages = 1024;
+bool acknowledged[64];
 std::vector<void*>* pages = NULL;
 
 void invlpg_tlb_local(){
@@ -68,15 +70,16 @@ void invlpg_tlb_local(){
 
 inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
 	  invlpg_tlb_local();
-    //tlb_invlpg_pendingconfirms.fetch_sub(1);
-    if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
+    acknowledged[sched::cpu::current()->id]= true;
+    tlb_invlpg_pendingconfirms.fetch_sub(1);
+    /*if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
 			tlb_invlpg_waiter.wake_from_kernel_or_with_irq_disabled();
-		}
+		}*/
 	}
 };
 
 void invlpg_tlb_all(std::vector<void*>* addresses){
-    assert(addresses->size() <= max_pages);
+    assert(addresses->size() <= invlpg_max_pages);
     if (sched::cpus.size() <= 1) {
         pages = addresses; 
 		    invlpg_tlb_local();
@@ -84,18 +87,27 @@ void invlpg_tlb_all(std::vector<void*>* addresses){
     }
 
     SCOPE_LOCK(migration_lock);
-    std::lock_guard<mutex> guard(tlb_invlpg_mutex);
+    //std::lock_guard<mutex> guard(tlb_invlpg_mutex);
+    while(tlb_invlpg_mutex.test_and_set(std::memory_order_acquire)){}
     tlb_invlpg_waiter.reset(*sched::thread::current());
     pages = addresses;
 
+    for(int i=0; i<64; i++){
+        acknowledged[i] = false;
+    }
     tlb_invlpg_pendingconfirms.store(sched::cpus.size()-1);
     tlb_invlpg_ipi.send_allbutself();
+    acknowledged[sched::cpu::current()->id] = true;
     invlpg_tlb_local();
 
-    sched::thread::wait_until([] {
+    while(tlb_invlpg_pendingconfirms > 0){
+        _mm_pause();
+    }
+    /*sched::thread::wait_until([] {
             return tlb_invlpg_pendingconfirms.load() == 0;
-    });
+    });*/
     tlb_invlpg_waiter.clear();
+    tlb_invlpg_mutex.clear(std::memory_order_release);
 }
 
 void flush_tlb_local() {

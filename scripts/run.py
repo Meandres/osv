@@ -208,8 +208,9 @@ def start_osv_qemu(options):
         "-device", "nvme,serial=deadbeef,drive=nvm1,"]
 
     if options.pass_pci:
-        args += [
-        "-device", "vfio-pci,host=%s" % (options.pass_pci)]
+        devices = options.pass_pci.split(",")
+        for d in devices:
+            args += ["-device", "vfio-pci,host=%s" % (d)]
 
     if options.no_shutdown:
         args += ["-no-reboot", "-no-shutdown"]
@@ -650,7 +651,7 @@ if __name__ == "__main__":
     parser.add_argument("--second-nvme-image", action="store",
                         help="Path to an optional disk image that should be attached to the instance as NVMe device")
     parser.add_argument("--pass-pci", action="store",
-                        help="passthrough a pci device in given slot if bound to vfio driver")
+                        help="passthrough pci devices in given slots if bound to vfio driver (can be a list separated by comas)")
     cmdargs = parser.parse_args()
 
     cmdargs.opt_path = "debug" if cmdargs.debug else "release" if cmdargs.release else "last"
