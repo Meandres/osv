@@ -1694,18 +1694,23 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     }
 #endif
     addr = align_down(addr, mmu::page_size);
-    //WITH_LOCK(sb_mgr->vma_lock(addr).for_read()) {
+    if(ucache::uCacheManager != NULL){
+        ucache::VMA* vma = ucache::uCacheManager->getVMA((void*)addr);
+        if(vma != NULL){
+            ucache::uCacheManager->handlePageFault(vma, (void*)addr, ef);
+            trace_mmu_vm_fault_ret(addr, ef->get_error());
+            return;
+        }
+    }
+    WITH_LOCK(sb_mgr->vma_lock(addr).for_read()) {
         auto vma = sb_mgr->find_intersecting_vma(addr);
         if (vma == sb_mgr->vma_end_iterator(addr) || access_fault(*vma, ef->get_error())) {
             vm_sigsegv(addr, ef);
             trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "slow");
             return;
         }
-        if(vma->id() != 0)
-            ucache::uCacheManager->handlePageFault(vma->id(), (void*)addr, ef);
-        else
-            vma->fault(addr, ef);
-    //}
+        vma->fault(addr, ef);
+    }
     trace_mmu_vm_fault_ret(addr, ef->get_error());
 }
 

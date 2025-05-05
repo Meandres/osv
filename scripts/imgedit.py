@@ -9,9 +9,6 @@ from random import randint
 
 _devnull = open('/dev/null', 'w')
 
-cmd = sys.argv[1]
-args = sys.argv[2:]
-
 args_offset = 512
 
 def chs(x):
@@ -138,71 +135,75 @@ class nbd_file(object):
     def size(self):
         self._client.size()
 
-if cmd == 'setargs':
-    img = args[0]
-    args = args[1:]
-    argstr = str.join(' ', args)
-    with nbd_file(img) as f:
-        f.seek(args_offset)
-        write_cstr(f, argstr)
-elif cmd == 'getargs':
-    img = args[0]
-    with nbd_file(img) as f:
-        f.seek(args_offset)
-        print(read_cstr(f))
-elif cmd == 'setsize':
-    img = args[0]
-    size = int(args[1])
-    block_size = 32 * 1024
-    blocks = (size + block_size - 1) // block_size
-    f = nbd_file(img)
-    f.seek(0x10)
-    f.write(struct.pack('H', blocks))
-    f.close()
-elif cmd == 'setsize_aarch64':
-    img = args[0]
-    size = int(args[1])
-    f = nbd_file(img)
-    f.seek(0x10)
-    f.write(struct.pack('<Q', size))
-    f.close()
-elif cmd == 'setpartition':
-    img = args[0]
-    partition = int(args[1])
-    start = int(args[2])
-    size = int(args[3])
-    partition = 0x1be + ((partition - 1) * 0x10)
-    f = nbd_file(img)
+if __name__ == "__main__":
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
 
-    fsize = f.size()
+    if cmd == 'setargs':
+        img = args[0]
+        args = args[1:]
+        argstr = str.join(' ', args)
+        with nbd_file(img) as f:
+            f.seek(args_offset)
+            write_cstr(f, argstr)
+    elif cmd == 'getargs':
+        img = args[0]
+        with nbd_file(img) as f:
+            f.seek(args_offset)
+            print(read_cstr(f))
+    elif cmd == 'setsize':
+        img = args[0]
+        size = int(args[1])
+        block_size = 32 * 1024
+        blocks = (size + block_size - 1) // block_size
+        f = nbd_file(img)
+        f.seek(0x10)
+        f.write(struct.pack('H', blocks))
+        f.close()
+    elif cmd == 'setsize_aarch64':
+        img = args[0]
+        size = int(args[1])
+        f = nbd_file(img)
+        f.seek(0x10)
+        f.write(struct.pack('<Q', size))
+        f.close()
+    elif cmd == 'setpartition':
+        img = args[0]
+        partition = int(args[1])
+        start = int(args[2])
+        size = int(args[3])
+        partition = 0x1be + ((partition - 1) * 0x10)
+        f = nbd_file(img)
 
-    cyl, head, sec = chs(start // 512)
-    cyl_end, head_end, sec_end = chs((start + size) // 512)
+        fsize = f.size()
 
-    f.seek(partition + 1)
-    f.write(struct.pack('B', head))
-    f.seek(partition + 5)
-    f.write(struct.pack('B', head_end))
+        cyl, head, sec = chs(start // 512)
+        cyl_end, head_end, sec_end = chs((start + size) // 512)
 
-    f.seek(partition + 2)
-    f.write(struct.pack('H', (cyl << 6) | sec))
-    f.seek(partition + 6)
-    f.write(struct.pack('H', (cyl_end << 6) | sec_end))
+        f.seek(partition + 1)
+        f.write(struct.pack('B', head))
+        f.seek(partition + 5)
+        f.write(struct.pack('B', head_end))
 
-    system_id = 0x83
-    f.seek(partition + 4)
-    f.write(struct.pack('B', system_id))
+        f.seek(partition + 2)
+        f.write(struct.pack('H', (cyl << 6) | sec))
+        f.seek(partition + 6)
+        f.write(struct.pack('H', (cyl_end << 6) | sec_end))
 
-    f.seek(partition + 8)
-    f.write(struct.pack('I', start // 512))
-    f.seek(partition + 12)
-    f.write(struct.pack('I', size // 512))
-    f.close()
-elif cmd == 'getpartition_offset':
-    img = args[0]
-    partition = int(args[1])
-    partition = 0x1be + ((partition - 1) * 0x10)
-    with nbd_file(img) as f:
+        system_id = 0x83
+        f.seek(partition + 4)
+        f.write(struct.pack('B', system_id))
+
         f.seek(partition + 8)
-        (offset,) = struct.unpack("I", f.read(4))
-        print(offset * 512)
+        f.write(struct.pack('I', start // 512))
+        f.seek(partition + 12)
+        f.write(struct.pack('I', size // 512))
+        f.close()
+    elif cmd == 'getpartition_offset':
+        img = args[0]
+        partition = int(args[1])
+        partition = 0x1be + ((partition - 1) * 0x10)
+        with nbd_file(img) as f:
+            f.seek(partition + 8)
+            (offset,) = struct.unpack("I", f.read(4))
+            print(offset * 512)

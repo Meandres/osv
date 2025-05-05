@@ -895,7 +895,7 @@ int unvme_check_completion(const unvme_ns_t* ns, int qid, int timeout=0);
 
 
 #define UNVME_TIMEOUT   60          ///< default timeout in seconds
-#define UNVME_SHORT_TIMEOUT 3
+#define UNVME_SHORT_TIMEOUT 5
 #define UNVME_QSIZE     256         ///< default I/O queue size
 
 
@@ -911,6 +911,7 @@ int unvme_write(const unvme_ns_t* ns, int qid, const void* buf, u64 slba, u32 nl
 int unvme_read(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb);
 int unvme_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6], u32* cqe_cs);
 
+void unvme_ring_sq_doorbell(const unvme_ns_t* ns, int qid);
 unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid, const void* buf, u64 slba, u32 nlb, bool ring=true);
 unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb, bool ring=true);
 unvme_iod_t unvme_acmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);

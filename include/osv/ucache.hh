@@ -28,7 +28,7 @@ static const u64 maxPageSize = mmu::huge_page_size;
 
 namespace ucache {
 
-const u64 DEFAULT_LB_PER_STRIPE = 256;
+inline const u64 DEFAULT_LB_PER_STRIPE = 256;
 
 class ucache_file{
     public:
@@ -53,6 +53,8 @@ struct StorageLocation{
 };
 
 class ucache_fs{
+    private:
+    bool scanned_for_files;
     public:
     std::vector<ucache_file*> available_files;
     std::vector<const unvme_ns_t*> devices;
@@ -71,8 +73,9 @@ class ucache_fs{
     void computeStorageLocation(StorageLocation& loc, ucache_file* f, void* addr, void* start);
     void read(ucache_file* f, void* addr, void* start, u64 size);
     unvme_iod_t aread(ucache_file* f, void* addr, void* start, u64 size);
-    unvme_iod_t awrite(ucache_file* f, void* addr, void* start, u64 size, bool ring);
+    unvme_iod_t awrite(ucache_file* f, void* addr, void* start, u64 size, bool ring, std::vector<int>& devs);
     void poll(unvme_iod_t iod, bool writing);
+    void commit_io(std::vector<int> &devices);
 };
 
 typedef u64 phys_addr;
@@ -276,7 +279,7 @@ struct BufferSnapshot {
     }
 
     ~BufferSnapshot(){
-        delete ptes;
+        free(ptes);
     }
 };
 
@@ -374,10 +377,11 @@ class ResidentSet{
     struct Entry {
         std::atomic<Buffer*> buf;
     };
+    u64 mask;
     virtual bool insert(Buffer*) = 0;
     virtual bool remove(Buffer*) = 0;
     virtual u64 getNextBatch(u64 batchsize) = 0;
-    virtual void getNextValidEntry(u64*, Entry*, u64) = 0;
+    virtual Buffer* getEntry(int) = 0;
 };
 
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
@@ -388,7 +392,7 @@ class HashTableResidentSet: public ResidentSet {
 
     Entry* ht;
     u64 count;
-    u64 mask;
+    //u64 mask;
     std::atomic<u64> clockPos;
 
     HashTableResidentSet(u64 maxCount);
@@ -400,7 +404,7 @@ class HashTableResidentSet: public ResidentSet {
     bool contains(Buffer* buf);
     bool remove(Buffer* buf) override;
     u64 getNextBatch(u64 batch) override;
-    void getNextValidEntry(u64*, Entry*, u64) override;
+    Buffer* getEntry(int) override;
 };
 
 struct callbacks {
@@ -446,10 +450,7 @@ class VMA {
     }
 
     Buffer* getBuffer(void* addr){
-        if(buffers.empty())
-            return new Buffer(addr, this->pageSize, this);
-        else
-            return buffers.at(((uintptr_t)addr-(uintptr_t)start)/pageSize);
+        return buffers.at(((uintptr_t)addr-(uintptr_t)start)/pageSize);
     }
 
     bool canBeEvicted(Buffer* buf){
@@ -497,9 +498,9 @@ class VMA {
                 return true;
             }else{
                 assert(residentSet->insert(buf));
+                assert_crash(buf->snap == NULL);
             }
         }
-        printf("didn't : %p\n", buf->baseVirt);
         return false;
     }
 };
@@ -520,8 +521,13 @@ inline bool pte_isAccessed(Buffer* buf){
 	  return accessed > 0;
 }
 
+inline bool pte_canBeEvicted(Buffer* buf){
+    return !pte_isAccessed(buf);
+}
+
 inline void pte_clearDirty(Buffer* buf){
     if(buf->snap == NULL){
+        printf("shouldn't happen\n");
         BufferSnapshot* bs = new BufferSnapshot(buf->vma->nbPages);
         buf->updateSnapshot(bs);
         buf->snap = bs;
@@ -582,9 +588,9 @@ class uCache {
    	void ensureFreePages(u64 additionalSize);
    	void readBuffer(Buffer* buf);
     void readBufferToTmp(Buffer* buf, Buffer* tmp);
-    void flush(std::vector<Buffer*> toWrite);
+    void flush(std::vector<Buffer*>& toWrite);
     
-    void handlePageFault(u64 vmaID, void* addr, exception_frame *ef); // called from the page fault handler
+    void handlePageFault(VMA* vma, void* addr, exception_frame *ef); // called from the page fault handler
     void handleFault(VMA* vma, Buffer* buffer, bool newPage=false);
     void prefetch(VMA* vma, PrefetchList pl);
    	void evict();

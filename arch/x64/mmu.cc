@@ -53,11 +53,10 @@ void invlpg_tlb_entry(void* addr){
 	asm volatile("invlpg (%0)" :: "r" (addr) : "memory");
 }
 
-std::atomic_flag tlb_invlpg_mutex = ATOMIC_FLAG_INIT;
-//mutex tlb_invlpg_mutex;
+//std::atomic_flag tlb_invlpg_mutex = ATOMIC_FLAG_INIT;
+mutex tlb_invlpg_mutex;
 sched::thread_handle tlb_invlpg_waiter;
 std::atomic<int> tlb_invlpg_pendingconfirms;
-bool acknowledged[64];
 std::vector<void*>* pages = NULL;
 
 void invlpg_tlb_local(){
@@ -70,11 +69,10 @@ void invlpg_tlb_local(){
 
 inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
 	  invlpg_tlb_local();
-    acknowledged[sched::cpu::current()->id]= true;
-    tlb_invlpg_pendingconfirms.fetch_sub(1);
-    /*if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
+    //tlb_invlpg_pendingconfirms.fetch_sub(1);
+    if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
 			tlb_invlpg_waiter.wake_from_kernel_or_with_irq_disabled();
-		}*/
+		}
 	}
 };
 
@@ -85,29 +83,50 @@ void invlpg_tlb_all(std::vector<void*>* addresses){
 		    invlpg_tlb_local();
 		    return;
     }
+    
+    static std::vector<sched::cpu*> ipis(sched::max_cpus);
 
     SCOPE_LOCK(migration_lock);
-    //std::lock_guard<mutex> guard(tlb_invlpg_mutex);
-    while(tlb_invlpg_mutex.test_and_set(std::memory_order_acquire)){}
+    //while(tlb_invlpg_mutex.test_and_set(std::memory_order_acquire)){}
+    std::lock_guard<mutex> guard(tlb_invlpg_mutex);
     tlb_invlpg_waiter.reset(*sched::thread::current());
+    int count;
     pages = addresses;
+    
+    if (sched::thread::current()->is_app()) {
+        ipis.clear();
+        std::copy_if(sched::cpus.begin(), sched::cpus.end(), std::back_inserter(ipis),
+                [](sched::cpu* c) {
+            if (c == sched::cpu::current()) {
+                return false;
+            }
 
-    for(int i=0; i<64; i++){
-        acknowledged[i] = false;
+            if (!c->app_thread.load(std::memory_order_seq_cst)) {
+                return false;
+            }
+            return true;
+        });
+        count = ipis.size();
+    } else {
+        count = sched::cpus.size() - 1;
     }
-    tlb_invlpg_pendingconfirms.store(sched::cpus.size()-1);
-    tlb_invlpg_ipi.send_allbutself();
-    acknowledged[sched::cpu::current()->id] = true;
+    tlb_invlpg_pendingconfirms.store(count);
+    if (count == (int)sched::cpus.size() - 1) {
+        tlb_invlpg_ipi.send_allbutself();
+    } else {
+        for (auto&& c: ipis) {
+            tlb_invlpg_ipi.send(c);
+        }
+    }
     invlpg_tlb_local();
-
-    while(tlb_invlpg_pendingconfirms > 0){
+    /*while(tlb_invlpg_pendingconfirms.load() > 0){
         _mm_pause();
     }
-    /*sched::thread::wait_until([] {
+    tlb_invlpg_mutex.clear(std::memory_order_release);*/
+    sched::thread::wait_until([] {
             return tlb_invlpg_pendingconfirms.load() == 0;
-    });*/
+    });
     tlb_invlpg_waiter.clear();
-    tlb_invlpg_mutex.clear(std::memory_order_release);
 }
 
 void flush_tlb_local() {

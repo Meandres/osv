@@ -258,6 +258,12 @@ static int nvme_submit_cmd(nvme_queue_t* q, bool ring=true)
     return 0;
 }
 
+void unvme_ring_sq_doorbell(const unvme_ns_t* ns, int qid){
+    unvme_queue_t* q = ((unvme_session_t*)ns->ses)->dev->ioqs + qid;
+    nvme_queue_t* nvmeq = q->nvmeq;
+    w32(nvmeq->dev, nvmeq->sq_doorbell, nvmeq->sq_tail);
+}
+
 /**
  * Check a completion queue and return the completed command id and status.
  * @param   q           queue
@@ -883,8 +889,8 @@ static int unvme_check_completion(unvme_queue_t* q, int timeout, u32* cqe_cs, bo
     } while (processor::rdtsc() < endtsc);
 
     if (cid < 0){
-        if(broken){
-            printf("broken\n");
+        if(!broken){
+            printf("timeout\n");
         }
         ucache::assert_crash(false);
         return cid;
