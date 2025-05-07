@@ -651,7 +651,7 @@ VMA* uCache::getVMA(void* addr){
 	return NULL;
 }
 
-static bool checkPipeline(Buffer* buffer, BufferSnapshot* bs){
+static bool checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs){
 	if(bs->state == BufferState::Inconsistent){
 		do{
 			buffer->updateSnapshot(bs);
@@ -660,10 +660,16 @@ static bool checkPipeline(Buffer* buffer, BufferSnapshot* bs){
 			return true;
 	}	
 	if(bs->state == BufferState::Reading){
-		do{ // wait for the prefetcher to poll the completion of the IO request
-			_mm_pause();
-			buffer->updateSnapshot(bs);
-		} while(bs->state == BufferState::Reading);
+		if(buffer->getPrefetcher() == sched::cpu::current()->id){ // this core started the prefettching
+			fs->poll(buffer->snap->iod, false);
+			delete buffer->snap;
+			buffer->snap = NULL;
+		}else{
+			do{ // wait for the prefetcher to poll the completion of the IO request
+				_mm_pause();
+				buffer->updateSnapshot(bs);
+			} while(bs->state == BufferState::Reading);
+		}
 	}
 
 	if(bs->state == BufferState::ReadyToInsert){
@@ -691,16 +697,16 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 	buffer->updateSnapshot(&bs);
 	phys_addr phys;
 
-	if(checkPipeline(buffer, &bs)){
+	if(checkPipeline(fs, buffer, &bs)){
 		return;
 	}
 	
-	//pl.reserve(batch);
+	pl.reserve(batch);
 	vma->choosePrefetchingCandidates(buffer->baseVirt, pl);
 	ensureFreePages(vma->pageSize *(1 + pl.size())); // make enough room for the page being faulted and the prefetched ones
 
 	buffer->updateSnapshot(&bs);
-	if(checkPipeline(buffer, &bs)){
+	if(checkPipeline(fs, buffer, &bs)){
 		return;
 	}
 
@@ -712,7 +718,7 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 		vma->usedPhysSize += vma->pageSize;
 		assert_crash(vma->isValidPtr(buffer->baseVirt));
 		assert_crash(vma->residentSet->insert(buffer));
-		//prefetch(vma, pl);
+		prefetch(vma, pl);
 	}else{
 		frames_free_phys_addr(phys, vma->pageSize);
 		while(PTE(*(buffer->pteRefs+vma->nbPages-1)).present == 0){
@@ -724,15 +730,17 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 void uCache::prefetch(VMA *vma, PrefetchList pl){
 	u64 prefetchedSize = 0;
 	for(Buffer* buf: pl){
-		BufferSnapshot bs(vma->nbPages);
-		buf->updateSnapshot(&bs);
+		BufferSnapshot* bs = new BufferSnapshot(vma->nbPages);
+		buf->updateSnapshot(bs);
 		u64 phys = frames_alloc_phys_addr(vma->pageSize);
-		if(buf->UncachedToPrefetching(phys, &bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
-			fs->aread(vma->file, buf->baseVirt, vma->start, vma->pageSize);
+		if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
+			buf->snap = bs;
+			buf->snap->iod = fs->aread(vma->file, buf->baseVirt, vma->start, vma->pageSize);
 			usedPhysSize += vma->pageSize;
 			prefetchedSize += vma->pageSize;
 		}else{
 			frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
+			delete bs;
 		}
 	}
 	vma->usedPhysSize += prefetchedSize;
@@ -855,7 +863,7 @@ void uCache::readBuffer(Buffer* buf){
 }
 
 void uCache::flush(std::vector<Buffer*>& toWrite){
-	std::vector<std::pair<unvme_iod_t,Buffer*>> requests;
+	std::vector<Buffer*> requests;
 	std::vector<int> devices;
 	u64 sizeWritten = 0;
 	requests.reserve(toWrite.size());
@@ -869,16 +877,16 @@ void uCache::flush(std::vector<Buffer*>& toWrite){
 			// best case, the last buffer is dirty and we can ring the doorbell directly
 			// note that this is only possible when there is one device, if not then we have to ring each of the doorbells at the end
 			if(fs->devices.size() == 1 && i == toWrite.size()-1) { ring_doorbell = true; } 
-			unvme_iod_t iod = fs->awrite(buf->vma->file, buf->baseVirt, buf->vma->start, buf->vma->pageSize, ring_doorbell, devices);
-			assert_crash(iod);
-			requests.push_back({iod, buf});
+			buf->snap->iod = fs->awrite(buf->vma->file, buf->baseVirt, buf->vma->start, buf->vma->pageSize, ring_doorbell, devices);
+			assert_crash(buf->snap->iod);
+			requests.push_back(buf);
 		}
 	}
 	if(!ring_doorbell) // if the last buffer was clean need to manually ring the doorbell
 		fs->commit_io(devices);
-	for(auto &p: requests){
-		fs->poll(p.first, true);
-		sizeWritten += p.second->vma->pageSize;
+	for(Buffer *p: requests){
+		fs->poll(p->snap->iod, true);
+		sizeWritten += p->vma->pageSize;
 	}
 	writeSize += sizeWritten;
 }

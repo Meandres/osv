@@ -270,6 +270,7 @@ struct VMA;
 
 struct BufferSnapshot {
     PTE *ptes;
+    unvme_iod_t iod;
     BufferState state;
 
     BufferSnapshot(u64 nbPages){
