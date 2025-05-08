@@ -628,7 +628,7 @@ void* uCache::addVMA(u64 virtSize, u64 pageSize){
 		return vma->start;
 }
 
-VMA* uCache::getOrCreateVMA(const char* name){
+VMA* uCache::getOrCreateVMA(const char* name, u64 pageSize){
 	VMA* vma;
 	for(auto p: vmas){
 		vma = p.second;
@@ -636,7 +636,7 @@ VMA* uCache::getOrCreateVMA(const char* name){
 			return vma;
 		}
 	}
-  vma = VMA::newVMA(name, mmu::page_size);
+  vma = VMA::newVMA(name, pageSize);
   vmas.insert({vma->id, vma});
   cout << "Added a vm_area @ " << vma->start << " of size: " << vma->file->size << ", with pageSize: " << vma->pageSize << ", for file: " << name << endl;
 	return vma;

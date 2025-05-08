@@ -323,7 +323,7 @@ struct Buffer {
    bool clearIO(bool dirty=false);
 };
 
-static const int16_t maxQueueSize = 896;
+static const int16_t maxQueueSize = 960;
 static const int16_t blockSize = 512;
 static const u64 maxIOs = 4096;
 
@@ -582,7 +582,7 @@ class uCache {
    	~uCache();
 
     void* addVMA(u64 virtSize, u64 pageSize);
-    VMA* getOrCreateVMA(const char* name);
+    VMA* getOrCreateVMA(const char* name, u64 pageSize=mmu::page_size);
     VMA* getVMA(void* addr);
 
     // Functions

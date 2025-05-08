@@ -53,11 +53,35 @@ void invlpg_tlb_entry(void* addr){
 	asm volatile("invlpg (%0)" :: "r" (addr) : "memory");
 }
 
-//std::atomic_flag tlb_invlpg_mutex = ATOMIC_FLAG_INIT;
-mutex tlb_invlpg_mutex;
-sched::thread_handle tlb_invlpg_waiter;
-std::atomic<int> tlb_invlpg_pendingconfirms;
+std::atomic_flag tlb_mutex = ATOMIC_FLAG_INIT;
+//mutex tlb_mutex;
+//sched::thread_handle tlb_waiter;
+std::atomic<int> tlb_pendingconfirms;
 std::vector<void*>* pages = NULL;
+    
+static void takeTLBLock(){
+    while(tlb_mutex.test_and_set(std::memory_order_acquire)){}
+    //std::lock_guard<mutex> guard(tlb_mutex);
+    //tlb_waiter.reset(*sched::thread::current());
+}
+
+static void waitTLB(){
+    while(tlb_pendingconfirms.load() > 0){
+        _mm_pause();
+    }
+    tlb_mutex.clear(std::memory_order_release);
+    /*sched::thread::wait_until([] {
+            return tlb_pendingconfirms.load() == 0;
+    });
+    tlb_waiter.clear();*/
+}
+
+static void ackTLB(){
+    tlb_pendingconfirms.fetch_sub(1);
+    /*if(tlb_pendingconfirms.fetch_sub(1) == 1){
+			tlb_waiter.wake_from_kernel_or_with_irq_disabled();
+		}*/
+}
 
 void invlpg_tlb_local(){
   assert(pages != NULL);
@@ -69,10 +93,7 @@ void invlpg_tlb_local(){
 
 inter_processor_interrupt tlb_invlpg_ipi{IPI_TLB_INVLPG, []{
 	  invlpg_tlb_local();
-    //tlb_invlpg_pendingconfirms.fetch_sub(1);
-    if(tlb_invlpg_pendingconfirms.fetch_sub(1) == 1){
-			tlb_invlpg_waiter.wake_from_kernel_or_with_irq_disabled();
-		}
+    ackTLB();
 	}
 };
 
@@ -87,9 +108,7 @@ void invlpg_tlb_all(std::vector<void*>* addresses){
     static std::vector<sched::cpu*> ipis(sched::max_cpus);
 
     SCOPE_LOCK(migration_lock);
-    //while(tlb_invlpg_mutex.test_and_set(std::memory_order_acquire)){}
-    std::lock_guard<mutex> guard(tlb_invlpg_mutex);
-    tlb_invlpg_waiter.reset(*sched::thread::current());
+    takeTLBLock();
     int count;
     pages = addresses;
     
@@ -110,7 +129,7 @@ void invlpg_tlb_all(std::vector<void*>* addresses){
     } else {
         count = sched::cpus.size() - 1;
     }
-    tlb_invlpg_pendingconfirms.store(count);
+    tlb_pendingconfirms.store(count);
     if (count == (int)sched::cpus.size() - 1) {
         tlb_invlpg_ipi.send_allbutself();
     } else {
@@ -119,14 +138,7 @@ void invlpg_tlb_all(std::vector<void*>* addresses){
         }
     }
     invlpg_tlb_local();
-    /*while(tlb_invlpg_pendingconfirms.load() > 0){
-        _mm_pause();
-    }
-    tlb_invlpg_mutex.clear(std::memory_order_release);*/
-    sched::thread::wait_until([] {
-            return tlb_invlpg_pendingconfirms.load() == 0;
-    });
-    tlb_invlpg_waiter.clear();
+    waitTLB();
 }
 
 void flush_tlb_local() {
@@ -139,15 +151,10 @@ void flush_tlb_local() {
 // processors confirm flushing their TLB. This is slow, but necessary for
 // correctness so that, for example, after mprotect() returns, no thread on
 // no cpu can write to the protected page.
-mutex tlb_flush_mutex;
-sched::thread_handle tlb_flush_waiter;
-std::atomic<int> tlb_flush_pendingconfirms;
 
 inter_processor_interrupt tlb_flush_ipi{IPI_TLB_FLUSH, [] {
-        mmu::flush_tlb_local();
-        if (tlb_flush_pendingconfirms.fetch_add(-1) == 1) {
-            tlb_flush_waiter.wake_from_kernel_or_with_irq_disabled();
-        }
+    mmu::flush_tlb_local();
+    ackTLB();
 }};
 
 void flush_tlb_all()
@@ -161,8 +168,7 @@ void flush_tlb_all()
 
     SCOPE_LOCK(migration_lock);
     mmu::flush_tlb_local();
-    std::lock_guard<mutex> guard(tlb_flush_mutex);
-    tlb_flush_waiter.reset(*sched::thread::current());
+    takeTLBLock();
     int count;
     if (sched::thread::current()->is_app()) {
         ipis.clear();
@@ -185,7 +191,7 @@ void flush_tlb_all()
     } else {
         count = sched::cpus.size() - 1;
     }
-    tlb_flush_pendingconfirms.store(count);
+    tlb_pendingconfirms.store(count);
     if (count == (int)sched::cpus.size() - 1) {
         tlb_flush_ipi.send_allbutself();
     } else {
@@ -193,10 +199,7 @@ void flush_tlb_all()
             tlb_flush_ipi.send(c);
         }
     }
-    sched::thread::wait_until([] {
-            return tlb_flush_pendingconfirms.load() == 0;
-    });
-    tlb_flush_waiter.clear();
+    waitTLB();
 }
 
 static pt_element<4> page_table_root __attribute__((init_priority((int)init_prio::pt_root)));
