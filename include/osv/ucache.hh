@@ -61,7 +61,6 @@ class ucache_fs{
     u64 last_available_vlba;
     u64 lb_size = 512;
     u64 lb_per_stripe; 
-    u64 specified_nb_devices;
 
     ucache_fs();
 

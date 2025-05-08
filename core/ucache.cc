@@ -48,7 +48,6 @@ void free_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->free_range(a
 
 
 ucache_fs::ucache_fs(){
-	specified_nb_devices = 1;
 	lb_per_stripe = DEFAULT_LB_PER_STRIPE;
 	scanned_for_files = false;
 }
@@ -893,7 +892,6 @@ void uCache::flush(std::vector<Buffer*>& toWrite){
 
 void createCache(u64 physSize, int batch){
 	ucache_file::next_available_file_id = 0;
-	assert_crash(uCacheManager->fs->specified_nb_devices == 0 || uCacheManager->fs->specified_nb_devices == uCacheManager->fs->devices.size());
 	uCacheManager->init(physSize, batch);
 	default_callbacks.isDirty_implem = pte_isDirty;
 	default_callbacks.clearDirty_implem = pte_clearDirty;
