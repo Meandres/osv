@@ -690,19 +690,33 @@ void uCache::handlePageFault(VMA* vma, void* faultingAddr, exception_frame *ef){
 	handleFault(vma, buffer);
 }
 
+u64 *percore_count = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_init = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_alloc = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_map = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_read = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_end = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+
 void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
+	u64 start=0,m1=0,m2=0,m3=0,m4=0,m5=0,end=0;
+	if(debug)
+		start = processor::rdtsc();
 	std::vector<Buffer*> pl; // need those here for goto to work 
 	BufferSnapshot bs(vma->nbPages);
 	buffer->updateSnapshot(&bs);
 	phys_addr phys;
-
 	if(checkPipeline(fs, buffer, &bs)){
 		return;
 	}
 	
+	if(debug)
+		m1 = processor::rdtsc();
 	pl.reserve(batch);
 	vma->choosePrefetchingCandidates(buffer->baseVirt, pl);
 	ensureFreePages(vma->pageSize *(1 + pl.size())); // make enough room for the page being faulted and the prefetched ones
+	if(debug)
+		m2 = processor::rdtsc();
 
 	buffer->updateSnapshot(&bs);
 	if(checkPipeline(fs, buffer, &bs)){
@@ -710,19 +724,51 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 	}
 
 	phys = frames_alloc_phys_addr(vma->pageSize);
+	if(debug)
+		m3 = processor::rdtsc();
 	if(buffer->UncachedToInserting(phys, &bs)){
+		if(debug)
+			m4 = processor::rdtsc();
 		if(!newPage) { readBuffer(buffer); }
+		if(debug)
+			m5 = processor::rdtsc();
 		assert_crash(buffer->InsertingToCached(&bs));
 		usedPhysSize += vma->pageSize;
 		vma->usedPhysSize += vma->pageSize;
 		assert_crash(vma->isValidPtr(buffer->baseVirt));
 		assert_crash(vma->residentSet->insert(buffer));
 		prefetch(vma, pl);
+		if(debug){
+			end = processor::rdtsc();
+			percore_init[sched::cpu::current()->id] += (m1 - start);
+			percore_evict[sched::cpu::current()->id] += (m2 - m1);
+			percore_alloc[sched::cpu::current()->id] += (m3 - m2);
+			percore_map[sched::cpu::current()->id] += (m4 - m3);
+			percore_read[sched::cpu::current()->id] += (m5 - m4);
+			percore_end[sched::cpu::current()->id] += (end - m5);
+			percore_count[sched::cpu::current()->id]++;
+		}
 	}else{
 		frames_free_phys_addr(phys, vma->pageSize);
 		while(PTE(*(buffer->pteRefs+vma->nbPages-1)).present == 0){
 			_mm_pause();
 		}
+	}
+}
+
+void print_stats(){
+	if(debug){
+		u64 init=0, evict=0, alloc=0, map=0, read=0, end=0, count=0;
+		for(u64 i=0; i<sched::cpus.size(); i++){
+			init += percore_init[i];
+			evict += percore_evict[i];
+			alloc += percore_alloc[i];
+			map += percore_map[i];
+			read += percore_read[i];
+			end += percore_end[i];
+			count += percore_count[i];	
+		}
+		printf("%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n", init/(count+0.0), evict/(count+0.0), alloc/(count+0.0), map/(count+0.0), read/(count+0.0), end/(count+0.0), count);
 	}
 }
 
@@ -868,6 +914,8 @@ void uCache::flush(std::vector<Buffer*>& toWrite){
 	requests.reserve(toWrite.size());
 	devices.reserve(fs->devices.size());
 	bool ring_doorbell = false;
+	if(batch_io_request)
+		ring_doorbell = true;
 	for(u64 i=0; i<toWrite.size(); i++){
 		Buffer* buf = toWrite[i];
 		buf->updateSnapshot(buf->snap);

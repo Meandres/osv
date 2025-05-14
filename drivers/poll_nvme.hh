@@ -892,6 +892,7 @@ int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs, bool writing=false);
 unvme_desc_t* unvme_do_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc, void* buff, u64 slba, u32 nlb);
 int unvme_check_completion(const unvme_ns_t* ns, int qid, int timeout=0);
+void unvme_print_stats();
 
 
 #define UNVME_TIMEOUT   60          ///< default timeout in seconds

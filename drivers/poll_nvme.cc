@@ -283,14 +283,17 @@ int nvme_check_completion(nvme_queue_t* q, int* stat, u32* cqe_cs)
         q->cq_phase = !q->cq_phase;
     }
     if (cqe_cs) *cqe_cs = cqe->cs;
-    //w32(q->dev, q->cq_doorbell, q->cq_head);
-    
-    if(q->id == 0){ // adminq
+   
+    if(!ucache::batch_io_request){
         w32(q->dev, q->cq_doorbell, q->cq_head);
     }else{
-        if((unsigned)q->cq_head == q->last_cq_doorbelled){
-            q->last_cq_doorbelled = q->cq_head == 0 ? q->size-1 : q->cq_head-1;
+        if(q->id == 0){ // adminq
             w32(q->dev, q->cq_doorbell, q->cq_head);
+        }else{
+            if((unsigned)q->cq_head == q->last_cq_doorbelled){
+                q->last_cq_doorbelled = q->cq_head == 0 ? q->size-1 : q->cq_head-1;
+                w32(q->dev, q->cq_doorbell, q->cq_head);
+            }
         }
     }
 
@@ -1792,8 +1795,8 @@ nvme::nvme(pci::device &dev)
    command |= 0x4 | 0x2 | 0x400;
    dev.set_command(command);
 
-    ns = unvme_openq(sched::cpus.size(), ucache::maxQueueSize);
-    while(!ns){ ns = unvme_openq(sched::cpus.size(), ucache::maxQueueSize); };
+    ns = unvme_openq(sched::max_cpus, ucache::maxQueueSize);
+    while(!ns){ ns = unvme_openq(sched::max_cpus, ucache::maxQueueSize); };
     //printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
     //printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
     printf("model: '%.40s', size : %lu GiB, blockcount: %lu, block size = %d, with %lu queues\n", ns->mn, (ns->blockcount*ns->blocksize)/(1024ull*1024*1024), ns->blockcount, ns->blocksize, ns->qcount);

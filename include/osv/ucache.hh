@@ -30,6 +30,10 @@ namespace ucache {
 
 inline const u64 DEFAULT_LB_PER_STRIPE = 256;
 
+const bool debug = false;
+const bool batch_io_request = true;
+void print_stats();
+
 class ucache_file{
     public:
     int id;
