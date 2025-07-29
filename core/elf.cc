@@ -98,6 +98,8 @@ void* symbol_module::relocated_addr() const
         break;
     case STT_IFUNC:
         return reinterpret_cast<void *(*)()>(base + symbol->st_value)();
+    case STT_TLS:
+        return obj->tls_addr() + symbol->st_value;
     default:
         abort("Unknown symbol type %d\n", symbol_type(*symbol));
     }
@@ -126,6 +128,7 @@ object::object(program& prog, std::string pathname)
     , _eh_frame(0)
     , _visibility_thread(nullptr)
     , _visibility_level(VisibilityLevel::Public)
+    , _dlopen_ed(false)
 {
     elf_debug("Instantiated\n");
 }
@@ -627,6 +630,16 @@ T* object::dynamic_ptr(unsigned tag)
     return static_cast<T*>(_base + dynamic_tag(tag).d_un.d_ptr);
 }
 
+template <typename T>
+T* object::opt_dynamic_ptr(unsigned tag)
+{
+    auto r = _dynamic_tag(tag);
+    if (r) {
+        return static_cast<T*>(_base + r->d_un.d_ptr);
+    }
+    return nullptr;
+}
+
 Elf64_Xword object::dynamic_val(unsigned tag)
 {
     return dynamic_tag(tag).d_un.d_val;
@@ -764,6 +777,37 @@ void object::relocate_rela()
     elf_debug("Relocated %d symbols in DT_RELA\n", nb);
 }
 
+void object::relocate_relr()
+{
+    //SHT_RELR: The section holds an array of relocation entries, used to encode
+    //relative relocations that do not require explicit addends or other information.
+    auto relr = dynamic_ptr<Elf64_Relr>(DT_RELR);
+    unsigned nb = dynamic_val(DT_RELRSZ) / sizeof(Elf64_Relr);
+    void **reloc_addr = 0;
+    for (auto p = relr; p < relr + nb; ++p) {
+        // - An even entry indicates a location which needs a relocation
+        //   and sets up where for subsequent odd entries.
+        // - An odd entry indicates a bitmap encoding up to 63 locations following where.
+        // - Odd entries can be chained.
+        auto entry = *p;
+        if ((entry & 1) == 0) {
+            reloc_addr = static_cast<void**>(_base + entry);
+            u64 val = *reinterpret_cast<u64*>(reloc_addr);
+            *reloc_addr++ = _base + val;
+        } else {
+            int bit_idx = 0;
+            for (size_t bitmap = entry; (bitmap >>= 1); bit_idx++) {
+                if (bitmap & 1) {
+                    u64 val = *reinterpret_cast<u64*>(reloc_addr + bit_idx);
+                    *(reloc_addr + bit_idx) = _base + val;
+                }
+            }
+            reloc_addr += (8 * sizeof(Elf64_Addr) - 1);
+	}
+    }
+    elf_debug("Relocated %d symbols in DT_RELR\n", nb);
+}
+
 extern "C" { void __elf_resolve_pltgot(void); }
 
 void object::relocate_pltgot()
@@ -864,6 +908,9 @@ void object::relocate()
     if (dynamic_exists(DT_RELA)) {
         relocate_rela();
     }
+    if (dynamic_exists(DT_RELR)) {
+        relocate_relr();
+    }
 }
 
 unsigned long
@@ -880,27 +927,6 @@ elf64_hash(const char *name)
     return h;
 }
 
-constexpr Elf64_Versym old_version_symbol_mask = Elf64_Versym(1) << 15;
-
-Elf64_Sym* object::lookup_symbol_old(const char* name)
-{
-    auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
-    auto strtab = dynamic_ptr<char>(DT_STRTAB);
-    auto hashtab = dynamic_ptr<Elf64_Word>(DT_HASH);
-    auto nbucket = hashtab[0];
-    auto buckets = hashtab + 2;
-    auto chain = buckets + nbucket;
-    for (auto ent = buckets[elf64_hash(name) % nbucket];
-            ent != STN_UNDEF;
-            ent = chain[ent]) {
-        auto &sym = symtab[ent];
-        if (strcmp(name, &strtab[sym.st_name]) == 0) {
-            return &sym;
-        }
-    }
-    return nullptr;
-}
-
 uint_fast32_t
 dl_new_hash(const char *s)
 {
@@ -911,56 +937,80 @@ dl_new_hash(const char *s)
     return h & 0xffffffff;
 }
 
-Elf64_Sym* object::lookup_symbol_gnu(const char* name, bool self_lookup)
+constexpr Elf64_Versym old_version_symbol_mask = Elf64_Versym(1) << 15;
+
+// Lookup the given name in the ELF symbol hash table. Two formats of
+// hash tables are supported:
+// 1. Traditional UNIX System V ELF format (the "DT_HASH" dynamic tag).
+// 2. Newer "DT_GNU_HASH" dynamic tag introduced in 2006 in GNU binutils.
+// The newer format has recently become the default because it does
+// faster lookups when the symbol table is large.
+static Elf64_Sym*
+lookup_symbol(const char* name, Elf64_Sym* symtab, const char* strtab,
+              const Elf64_Word* dt_hash, const Elf64_Word* dt_gnu_hash,
+              const Elf64_Versym* version_symtab)
 {
-    auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
-    auto strtab = dynamic_ptr<char>(DT_STRTAB);
-    auto hashtab = dynamic_ptr<Elf64_Word>(DT_GNU_HASH);
-    auto nbucket = hashtab[0];
-    auto symndx = hashtab[1];
-    auto maskwords = hashtab[2];
-    auto shift2 = hashtab[3];
-    auto bloom = reinterpret_cast<const Elf64_Xword*>(hashtab + 4);
-    auto C = sizeof(*bloom) * 8;
-    auto hashval = dl_new_hash(name);
-    auto bword = bloom[(hashval / C) % maskwords];
-    auto hashbit1 = hashval % C;
-    auto hashbit2 = (hashval >> shift2) % C;
-    if ((bword >> hashbit1) == 0 || (bword >> hashbit2) == 0) {
-        return nullptr;
+    if (dt_gnu_hash) { // prefer DT_GNU_HASH, if it exists
+        auto nbucket = dt_gnu_hash[0];
+        auto symndx = dt_gnu_hash[1];
+        auto maskwords = dt_gnu_hash[2];
+        auto shift2 = dt_gnu_hash[3];
+        auto bloom = reinterpret_cast<const Elf64_Xword*>(dt_gnu_hash + 4);
+        auto C = sizeof(*bloom) * 8;
+        auto hashval = dl_new_hash(name);
+        auto bword = bloom[(hashval / C) % maskwords];
+        auto hashbit1 = hashval % C;
+        auto hashbit2 = (hashval >> shift2) % C;
+        if ((bword >> hashbit1) == 0 || (bword >> hashbit2) == 0) {
+            return nullptr;
+        }
+        auto buckets = reinterpret_cast<const Elf64_Word*>(bloom + maskwords);
+        auto chains = buckets + nbucket - symndx;
+        auto idx = buckets[hashval % nbucket];
+        if (idx == 0) {
+            return nullptr;
+        }
+        do {
+            if ((chains[idx] & ~1) != (hashval & ~1)) {
+                continue;
+            }
+            if (version_symtab && version_symtab[idx] & old_version_symbol_mask) { //Ignore old version symbols
+                continue;
+            }
+            if (strcmp(&strtab[symtab[idx].st_name], name) == 0) {
+                return &symtab[idx];
+            }
+        } while ((chains[idx++] & 1) == 0);
+    } else { // DT_HASH:
+        auto nbucket = dt_hash[0];
+        auto buckets = dt_hash + 2;
+        auto chain = buckets + nbucket;
+        for (auto ent = buckets[elf64_hash(name) % nbucket];
+                ent != STN_UNDEF;
+                ent = chain[ent]) {
+            auto &sym = symtab[ent];
+            if (strcmp(name, &strtab[sym.st_name]) == 0) {
+                return &sym;
+            }
+        }
     }
-    auto buckets = reinterpret_cast<const Elf64_Word*>(bloom + maskwords);
-    auto chains = buckets + nbucket - symndx;
-    auto idx = buckets[hashval % nbucket];
-    if (idx == 0) {
-        return nullptr;
-    }
-    auto version_symtab = (!self_lookup && dynamic_exists(DT_VERSYM)) ? dynamic_ptr<Elf64_Versym>(DT_VERSYM) : nullptr;
-    do {
-        if ((chains[idx] & ~1) != (hashval & ~1)) {
-            continue;
-        }
-        if (version_symtab && version_symtab[idx] & old_version_symbol_mask) { //Ignore old version symbols
-            continue;
-        }
-        if (strcmp(&strtab[symtab[idx].st_name], name) == 0) {
-            return &symtab[idx];
-        }
-    } while ((chains[idx++] & 1) == 0);
     return nullptr;
 }
+
 
 Elf64_Sym* object::lookup_symbol(const char* name, bool self_lookup)
 {
     if (!visible()) {
         return nullptr;
     }
-    Elf64_Sym* sym;
-    if (dynamic_exists(DT_GNU_HASH)) {
-        sym = lookup_symbol_gnu(name, self_lookup);
-    } else {
-        sym = lookup_symbol_old(name);
-    }
+    Elf64_Sym* symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
+    char* strtab = dynamic_ptr<char>(DT_STRTAB);
+    Elf64_Word* dt_hash = opt_dynamic_ptr<Elf64_Word>(DT_HASH);
+    Elf64_Word* dt_gnu_hash = opt_dynamic_ptr<Elf64_Word>(DT_GNU_HASH);
+    Elf64_Versym* version_symtab = (!self_lookup) ? opt_dynamic_ptr<Elf64_Versym>(DT_VERSYM) : nullptr;
+
+    Elf64_Sym* sym = elf::lookup_symbol(name, symtab, strtab, dt_hash,
+                                        dt_gnu_hash, version_symtab);
     if (sym && sym->st_shndx == SHN_UNDEF) {
         sym = nullptr;
     }
@@ -1230,11 +1280,19 @@ void* object::tls_addr()
 
 void object::alloc_static_tls()
 {
+    if (is_core()) {
+        return;
+    }
+
     auto tls_size = get_tls_size();
     if (!_static_tls && tls_size) {
         _static_tls = true;
-        _static_tls_offset = _static_tls_alloc.fetch_add(tls_size, std::memory_order_relaxed);
-        elf_debug("Allocated static TLS at offset: 0x%x of size: 0x%x\n", _static_tls_offset, tls_size);
+        if (_is_dynamically_linked_executable) {
+            elf_debug("Marked static TLS for a PIE of size: 0x%x\n", tls_size);
+        } else {
+            _static_tls_offset = _static_tls_alloc.fetch_add(tls_size, std::memory_order_relaxed);
+            elf_debug("Allocated static TLS at offset: 0x%x of size: 0x%x\n", _static_tls_offset, tls_size);
+        }
     }
 }
 
@@ -1262,8 +1320,9 @@ void object::init_static_tls()
         _initial_tls_size = 0;
         return;
     }
-    assert(_initial_tls_size);
-    _initial_tls.reset(new char[_initial_tls_size]);
+    if (_initial_tls_size) {
+        _initial_tls.reset(new char[_initial_tls_size]);
+    }
     for (auto&& obj : deps) {
         if (obj->is_core()) {
             continue;
@@ -1272,7 +1331,7 @@ void object::init_static_tls()
             obj->prepare_local_tls(_initial_tls_offsets);
             elf_debug("Initialized local-exec static TLS for %s\n", obj->pathname().c_str());
         }
-        else {
+        else if (_initial_tls_size) {
             obj->prepare_initial_tls(_initial_tls.get(), _initial_tls_size,
                                      _initial_tls_offsets);
             elf_debug("Initialized initial-exec static TLS for %s of size: 0x%x\n", obj->pathname().c_str(), _initial_tls_size);
@@ -1411,7 +1470,7 @@ static std::string canonicalize(std::string p)
 // get_library() will run the init functions later.
 std::shared_ptr<elf::object>
 program::load_object(std::string name, std::vector<std::string> extra_path,
-        std::vector<std::shared_ptr<object>> &loaded_objects)
+        std::vector<std::shared_ptr<object>> &loaded_objects, bool dlopen)
 {
     fileref f;
     if (_files.count(name)) {
@@ -1452,6 +1511,7 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
                 [=](object *obj) { remove_object(obj); });
         ef->set_base(_next_alloc);
         ef->set_visibility(ThreadOnly);
+        ef->set_dlopen_ed(dlopen);
         // We need to push the object at the end of the list (so that the main
         // shared object gets searched before the shared libraries it uses),
         // with one exception: the kernel needs to remain at the end of the
@@ -1470,13 +1530,9 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
             _next_alloc = ef->end();
         add_debugger_obj(ef.get());
         loaded_objects.push_back(ef);
-        //Do not relocate static executables as they are linked with its own
-        //dynamic linker. Also do not try to load any dependant libraries
-        //as they do not apply to statically linked executables.
+        // Do not try to load any dependant libraries for static executable, they don't apply here.
         if (!ef->is_statically_linked_executable() && !ef->is_linux_dl()) {
             ef->load_needed(loaded_objects);
-            ef->relocate();
-            ef->fix_permissions();
         }
         _files[name] = ef;
         _files[ef->soname()] = ef;
@@ -1487,7 +1543,7 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
 }
 
 std::shared_ptr<object>
-program::get_library(std::string name, std::vector<std::string> extra_path, bool delay_init)
+program::get_library(std::string name, std::vector<std::string> extra_path, bool delay_init, bool dlopen)
 {
     SCOPE_LOCK(_mutex);
     //
@@ -1503,8 +1559,17 @@ program::get_library(std::string name, std::vector<std::string> extra_path, bool
     // structure so each init_library call gets it's corresponding list of objects to operate on.
     //
     std::vector<std::shared_ptr<object>> loaded_objects;
-    auto ret = load_object(name, extra_path, loaded_objects);
+    auto ret = load_object(name, extra_path, loaded_objects, dlopen);
     _loaded_objects_stack.push(loaded_objects);
+
+    // Relocate objects *after* loading all objects, otherwise, we cannot resolve circluar relocations.
+    for (auto ef : loaded_objects) {
+        // Do not relocate static executables as they are linked with its own dynamic linker.
+        if (!ef->is_statically_linked_executable() && !ef->is_linux_dl()) {
+            ef->relocate();
+            ef->fix_permissions();
+        }
+    }
 
     if (ret) {
         ret->init_static_tls();
@@ -1714,22 +1779,9 @@ program* get_program()
 
 const Elf64_Sym *init_dyn_tabs::lookup(u32 sym)
 {
-    auto nbucket = this->hashtab[0];
-    auto buckets = hashtab + 2;
-    auto chain = buckets + nbucket;
-    auto name = strtab + symtab[sym].st_name;
-
-    for (auto ent = buckets[elf64_hash(name) % nbucket];
-         ent != STN_UNDEF;
-         ent = chain[ent]) {
-
-        auto &sym = symtab[ent];
-        if (strcmp(name, &strtab[sym.st_name]) == 0) {
-            return &sym;
-        }
-    }
-
-    return nullptr;
+    const char *name = strtab + symtab[sym].st_name;
+    return elf::lookup_symbol(name, symtab, strtab, dt_hash,
+                              dt_gnu_hash, nullptr/*version_symtab*/);
 };
 
 init_table get_init(Elf64_Ehdr* header)
@@ -1749,7 +1801,7 @@ init_table get_init(Elf64_Ehdr* header)
             auto dyn = reinterpret_cast<Elf64_Dyn*>(phdr->p_vaddr);
             unsigned ndyn = phdr->p_memsz / sizeof(*dyn);
             ret.dyn_tabs = {
-                .symtab = nullptr, .hashtab = nullptr, .strtab = nullptr,
+                .symtab = nullptr, .dt_hash = nullptr, .dt_gnu_hash = nullptr, .strtab = nullptr,
             };
             const Elf64_Rela* rela = nullptr;
             const Elf64_Rela* jmp = nullptr;
@@ -1771,10 +1823,13 @@ init_table get_init(Elf64_Ehdr* header)
                     nrela = d->d_un.d_val / sizeof(*rela);
                     break;
                 case DT_SYMTAB:
-                    ret.dyn_tabs.symtab = reinterpret_cast<const Elf64_Sym*>(d->d_un.d_ptr);
+                    ret.dyn_tabs.symtab = reinterpret_cast<Elf64_Sym*>(d->d_un.d_ptr);
                     break;
                 case DT_HASH:
-                    ret.dyn_tabs.hashtab = reinterpret_cast<const Elf64_Word*>(d->d_un.d_ptr);
+                    ret.dyn_tabs.dt_hash = reinterpret_cast<const Elf64_Word*>(d->d_un.d_ptr);
+                    break;
+                case DT_GNU_HASH:
+                    ret.dyn_tabs.dt_gnu_hash = reinterpret_cast<const Elf64_Word*>(d->d_un.d_ptr);
                     break;
                 case DT_STRTAB:
                     ret.dyn_tabs.strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
@@ -1924,16 +1979,24 @@ void* elf_resolve_pltgot(unsigned long index, elf::object* obj)
     }
 }
 
-struct module_and_offset {
-    ulong module;
-    ulong offset;
-};
-
 char *object::setup_tls()
 {
     elf_debug("Setting up dynamic TLS of %d bytes\n", _tls_init_size + _tls_uninit_size);
     return (char *) sched::thread::current()->setup_tls(
             _module_index, _tls_segment, _tls_init_size, _tls_uninit_size);
+}
+
+
+extern "C" OSV_LD_LINUX_x86_64_API
+void* __tls_dynamic_setup(module_and_offset* mao)
+{
+    // Invocation of dynamic TLS descriptor can happen with a dirty fpu
+    sched::fpu_lock fpu;
+    WITH_LOCK(fpu) {
+        object *obj = get_program()->tls_object(mao->module);
+        assert(mao->module == obj->module_index());
+        return obj->setup_tls();
+    }
 }
 
 extern "C" OSV_LD_LINUX_x86_64_API

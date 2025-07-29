@@ -27,6 +27,11 @@
 /// PLT entries so OSv APIs like preempt_disable() can be used
 #define OSV_ELF_MLOCK_OBJECT() asm(".pushsection .note.osv-mlock, \"a\"; .long 0, 0, 0; .popsection")
 
+struct module_and_offset {
+    ulong module;
+    ulong offset;
+};
+
 /**
  * elf namespace
  */
@@ -152,6 +157,8 @@ public:
     Elf64_Word n_type;
 };
 
+typedef Elf64_Xword Elf64_Relr;
+
 enum {
     DT_NULL = 0, // ignored Marks the end of the dynamic array
     DT_NEEDED = 1, // d_val The string table offset of the name of a needed library.Dynamic table 15
@@ -196,6 +203,9 @@ enum {
     DT_FINI_ARRAYSZ = 28, // d_val Size, in bytes, of the array of termination functions.
     DT_RUNPATH = 29, // d_val The string table offset of a shared library search path string.
     DT_FLAGS = 30, // value is various flags, bits from DF_*.
+    DT_RELRSZ = 35,
+    DT_RELR = 36,
+    DT_RELRENT = 37,
     DT_FLAGS_1 = 0x6ffffffb, // value is various flags, bits from DF_1_*.
     DT_VERSYM = 0x6ffffff0, // d_ptr Address of the version symbol table.
     DT_LOOS = 0x60000000, // Defines a range of dynamic table tags that are reserved for
@@ -430,10 +440,12 @@ protected:
     bool has_non_writable_text_relocations();
     unsigned get_segment_mmap_permissions(const Elf64_Phdr& phdr);
 private:
-    Elf64_Sym* lookup_symbol_old(const char* name);
-    Elf64_Sym* lookup_symbol_gnu(const char* name, bool self_lookup);
     template <typename T>
     T* dynamic_ptr(unsigned tag);
+    // opt_dynamic_ptr() is the same as dynamic_ptr() but returns nullptr
+    // instead of throwing when the given tag is missing.
+    template <typename T>
+    T* opt_dynamic_ptr(unsigned tag);
     Elf64_Xword dynamic_val(unsigned tag);
     const char* dynamic_str(unsigned tag);
     bool dynamic_exists(unsigned tag);
@@ -444,6 +456,7 @@ private:
     symbol_module symbol_other(unsigned idx);
     Elf64_Xword symbol_tls_module(unsigned idx);
     void relocate_rela();
+    void relocate_relr();
     void relocate_pltgot();
     unsigned symtab_len();
     void collect_dependencies(std::unordered_set<elf::object*>& ds);
@@ -510,8 +523,10 @@ private:
     std::atomic<void*> _visibility_thread;
     std::atomic<VisibilityLevel> _visibility_level;
     bool visible(void) const;
+    bool _dlopen_ed;
 public:
     void set_visibility(VisibilityLevel);
+    void set_dlopen_ed(bool dlopen_ed) { _dlopen_ed = dlopen_ed; }
 };
 
 class file : public object {
@@ -611,7 +626,7 @@ public:
      *                        the init functions are executed right away.
      */
     std::shared_ptr<elf::object>
-    get_library(std::string lib, std::vector<std::string> extra_path = {}, bool delay_init = false);
+    get_library(std::string lib, std::vector<std::string> extra_path = {}, bool delay_init = false, bool dlopen = false);
 
     /**
      * Execute init functions of the library itself and its dependencies.
@@ -665,7 +680,8 @@ private:
     void free_dtv(object* obj);
     std::shared_ptr<object> load_object(std::string name,
             std::vector<std::string> extra_path,
-            std::vector<std::shared_ptr<object>> &loaded_objects);
+            std::vector<std::shared_ptr<object>> &loaded_objects,
+            bool dlopen = false);
     void initialize_libvdso();
 private:
     mutex _mutex;
@@ -712,8 +728,9 @@ program* get_program();
 
 /* tables needed for initial dynamic segment relocations */
 struct init_dyn_tabs {
-    const Elf64_Sym *symtab;
-    const Elf64_Word *hashtab;
+    Elf64_Sym *symtab;
+    const Elf64_Word *dt_hash;
+    const Elf64_Word *dt_gnu_hash;
     const char *strtab;
     const Elf64_Sym *lookup(u32 sym);
 };

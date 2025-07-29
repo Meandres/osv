@@ -100,6 +100,11 @@ outlink = build/$(mode)
 outlink2 = build/last
 
 ifneq ($(MAKECMDGOALS),menuconfig)
+# Include the kernel configuration file if present, otherwise generate a default one
+ifeq (,$(wildcard $(out)/gen/config/kernel_conf.mk))
+    $(info Generating default kernel configuration file)
+    $(shell make -f conf/Makefile -j1 config 1>/dev/null)
+endif
 include $(out)/gen/config/kernel_conf.mk
 endif
 #
@@ -148,12 +153,19 @@ endif
 quiet = $(if $V, $1, @echo " $2"; $1)
 very-quiet = $(if $V, $1, @$1)
 
+ifeq ($(fs),zfs)
 all: $(out)/loader.img links $(out)/zfs_builder-stripped.elf
 ifeq ($(arch),x64)
 all: $(out)/vmlinuz.bin
 endif
 ifeq ($(arch),aarch64)
 all: $(out)/zfs_builder.img
+endif
+else
+all: $(out)/loader.img links
+ifeq ($(arch),x64)
+all: $(out)/vmlinuz.bin
+endif
 endif
 .PHONY: all
 
@@ -896,6 +908,7 @@ drivers += drivers/pci-generic.o
 drivers += drivers/pci-device.o
 drivers += drivers/pci-function.o
 drivers += drivers/pci-bridge.o
+drivers += drivers/msi.o
 endif
 drivers += drivers/driver.o
 
@@ -997,11 +1010,19 @@ endif
 ifeq ($(conf_drivers_mmio),1)
 drivers += drivers/virtio-mmio.o
 endif
+ifeq ($(conf_drivers_nvme),1)
+drivers += drivers/nvme.o
+drivers += drivers/nvme-queue.o
+endif
 drivers += drivers/virtio-vring.o
 drivers += drivers/virtio-rng.o
 drivers += drivers/virtio-blk.o
+drivers += drivers/virtio-scsi.o
 drivers += drivers/virtio-net.o
 drivers += drivers/virtio-fs.o
+endif
+ifeq ($(conf_drivers_scsi),1)
+drivers += drivers/scsi-common.o
 endif
 endif # aarch64
 
@@ -1014,6 +1035,7 @@ objects += arch/$(arch)/arch-cpu.o
 objects += arch/$(arch)/backtrace.o
 objects += arch/$(arch)/smp.o
 objects += arch/$(arch)/elf-dl.o
+objects += arch/$(arch)/tlsdesc.o
 objects += arch/$(arch)/entry.o
 objects += arch/$(arch)/mmu.o
 objects += arch/$(arch)/exceptions.o
@@ -1046,12 +1068,11 @@ objects += arch/$(arch)/gic-v2.o
 objects += arch/$(arch)/gic-v3.o
 objects += arch/$(arch)/arch-dtb.o
 objects += arch/$(arch)/hypercall.o
+ifeq ($(conf_memory_optimize),1)
 objects += arch/$(arch)/memset.o
 objects += arch/$(arch)/memcpy.o
-ifeq ($(conf_memory_optimize),1)
 objects += arch/$(arch)/memmove.o
 endif
-objects += arch/$(arch)/tlsdesc.o
 objects += arch/$(arch)/sched.o
 objects += $(libfdt)
 endif
@@ -1105,7 +1126,7 @@ ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif
 objects += core/printf.o
-ifeq ($(conf_tracepoints),1)
+ifeq ($(conf_tracepoints_sampler),1)
 objects += core/sampler.o
 endif
 
@@ -1117,7 +1138,9 @@ objects += core/kprintf.o
 ifeq ($(conf_tracepoints),1)
 objects += core/trace.o
 objects += core/trace-count.o
+ifeq ($(conf_tracepoints_strace),1)
 objects += core/strace.o
+endif
 objects += core/callstack.o
 endif
 objects += core/poll.o
@@ -2181,7 +2204,7 @@ $(out)/dummy-shlib.so: $(out)/dummy-shlib.o
 	$(call quiet, $(CXX) -nodefaultlibs -shared $(gcc-sysroot) -o $@ $^, LINK $@)
 
 stage1_targets = $(out)/arch/$(arch)/boot.o $(out)/loader.o $(out)/runtime.o $(drivers:%=$(out)/%) $(objects:%=$(out)/%) $(out)/dummy-shlib.so
-stage1: $(stage1_targets) links $(out)/default_version_script
+stage1: $(stage1_targets) links
 .PHONY: stage1
 
 loader_options_dep = $(out)/arch/$(arch)/loader_options.ld
@@ -2203,9 +2226,6 @@ ifneq ($(shell cmp $(out)/version_script $(conf_version_script)),)
 $(shell cp $(conf_version_script) $(out)/version_script)
 endif
 else
-ifeq ($(shell test -e $(out)/version_script || echo -n no),no)
-$(shell cp $(out)/default_version_script $(out)/version_script)
-endif
 ifneq ($(shell cmp $(out)/version_script $(out)/default_version_script),)
 $(shell cp $(out)/default_version_script $(out)/version_script)
 endif
@@ -2223,9 +2243,6 @@ linker_archives_options = --whole-archive $(libstdc++.a) $(libgcc_eh.a) $(boost-
 musl += locale/iconv.o
 musl += locale/iconv_close.o
 endif
-
-$(out)/default_version_script: exported_symbols/*.symbols exported_symbols/$(arch)/*.symbols
-	$(call quiet, scripts/generate_version_script.sh $(out)/default_version_script, GEN default_version_script)
 
 ifeq ($(arch),aarch64)
 def_symbols = --defsym=OSV_KERNEL_VM_BASE=$(kernel_vm_base)
@@ -2292,8 +2309,15 @@ ifeq ($(filter /%,$(libgcc_s_dir)),)
 libgcc_s_dir := ../../$(aarch64_gccbase)/lib64
 endif
 
-$(out)/bootfs.bin: scripts/mkbootfs.py $(bootfs_manifest) $(bootfs_manifest_dep) $(tools:%=$(out)/%) \
-		$(out)/libenviron.so $(out)/libsolaris.so
+bootfs_dep := scripts/mkbootfs.py $(bootfs_manifest) $(bootfs_manifest_dep) $(out)/libenviron.so
+ifeq ($(fs),ext)
+bootfs_dep += $(out)/modules/libext/libext.so
+else
+ifeq ($(fs),zfs)
+bootfs_dep += $(tools:%=$(out)/%) $(out)/libsolaris.so
+endif
+endif
+$(out)/bootfs.bin: $(bootfs_dep)
 	$(call quiet, olddir=`pwd`; cd $(out); "$$olddir"/scripts/mkbootfs.py -o bootfs.bin -d bootfs.bin.d -m "$$olddir"/$(bootfs_manifest), MKBOOTFS $@)
 
 $(out)/bootfs.o: $(out)/bootfs.bin
@@ -2365,7 +2389,7 @@ perhaps-modify-version-h:
 # In either case, syscalls_config.h will contain list of '#define CONF_syscall_*' statements for each selected
 # syscall
 perhaps-modify-syscalls-h:
-	$(call quiet, sh scripts/gen-syscalls $(out)/gen/include/osv/ $(conf_syscalls_list_file), GEN gen/include/osv/syscall_*)
+	$(call quiet, bash scripts/gen-syscalls $(out)/gen/include/osv/ $(conf_syscalls_list_file), GEN gen/include/osv/syscall_*)
 .PHONY: perhaps-modify-syscalls-h
 
 # Using 'if ($(conf_drivers_*),1)' in the rules below is enough to include whole object

@@ -30,7 +30,7 @@ standard_ec2_post_install = ['pip install awscli &&'
 class Fedora(object):
     name = 'Fedora'
     pre_install = '(yum list installed compat-openssl10-devel 2>/dev/null && yum -y remove compat-openssl10-devel) || echo "package compat-openssl10-devel not found -> no need to remove it"'
-    install = 'yum -y install --allowerasing --forcearch x86_64'
+    install = 'yum -y install --allowerasing --forcearch ' + arch
     packages = [
                 'ant',
                 'autoconf',
@@ -165,8 +165,29 @@ class Fedora(object):
         ec2_post_install = None
         version = '39'
 
+    class Fedora_40(object):
+        packages = []
+        ec2_packages = []
+        test_packages = []
+        ec2_post_install = None
+        version = '40'
+
+    class Fedora_41(object):
+        packages = []
+        ec2_packages = []
+        test_packages = []
+        ec2_post_install = None
+        version = '41'
+
+    class Fedora_42(object):
+        packages = []
+        ec2_packages = []
+        test_packages = []
+        ec2_post_install = None
+        version = '42'
+
     versions = [
-        Fedora_27, Fedora_28, Fedora_29, Fedora_30, Fedora_31, Fedora_32, Fedora_33, Fedora_34, Fedora_35, Fedora_37, Fedora_38, Fedora_39
+        Fedora_27, Fedora_28, Fedora_29, Fedora_30, Fedora_31, Fedora_32, Fedora_33, Fedora_34, Fedora_35, Fedora_37, Fedora_38, Fedora_39, Fedora_40, Fedora_41, Fedora_42
     ]
 
 
@@ -308,6 +329,13 @@ class Ubuntu(object):
     test_packages = ['libssl-dev', 'zip']
     ec2_post_install = None
 
+    class Ubuntu_24_04(object):
+        packages = ['bridge-utils', 'libvirt-daemon-system', 'libvirt-clients', 'python3-dpkt']
+        ec2_packages = ['ec2-api-tools', 'awscli']
+        test_packages = []
+        ec2_post_install = None
+        version = '24.04'
+
     class Ubuntu_22_04(object):
         packages = ['bridge-utils', 'libvirt-daemon-system', 'libvirt-clients', 'python3-dpkt']
         ec2_packages = ['ec2-api-tools', 'awscli']
@@ -385,7 +413,7 @@ class Ubuntu(object):
         ec2_post_install = None
         version = '16.04'
 
-    versions = [Ubuntu_22_04, Ubuntu_21_10, Ubuntu_21_04, Ubuntu_20_10, Ubuntu_20_04, Ubuntu_19_10, Ubuntu_19_04, Ubuntu_18_10, Ubuntu_18_04, Ubuntu_17_04, Ubuntu_16_04]
+    versions = [Ubuntu_24_04, Ubuntu_22_04, Ubuntu_21_10, Ubuntu_21_04, Ubuntu_20_10, Ubuntu_20_04, Ubuntu_19_10, Ubuntu_19_04, Ubuntu_18_10, Ubuntu_18_04, Ubuntu_17_04, Ubuntu_16_04]
 
 class LinuxMint(Ubuntu):
     name = 'LinuxMint'

@@ -54,6 +54,7 @@ modules/dl_tests/usr.manifest
 .clang-format
 compile_commands.json
 downloaded_packages
+.firecracker
 .cache
 modules/java-base/jni/monitor.d
 docker_build

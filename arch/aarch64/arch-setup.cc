@@ -128,25 +128,15 @@ void arch_setup_free_memory()
 #endif
 
     //Locate GICv2 or GICv3 information in DTB and construct corresponding GIC driver
-    //and map relevant physical memory
-    u64 dist, redist, cpuif;
-    size_t dist_len, redist_len, cpuif_len;
-    if (dtb_get_gic_v3(&dist, &dist_len, &redist, &redist_len)) {
-        gic::gic = new gic::gic_v3_driver(dist, redist);
-        /* linear_map [TTBR0 - GIC REDIST] */
-        mmu::linear_map((void *)redist, (mmu::phys)redist, redist_len, "gic_redist", mmu::page_size,
-                        mmu::mattr::dev);
-    } else if (dtb_get_gic_v2(&dist, &dist_len, &cpuif, &cpuif_len)) {
-        gic::gic = new gic::gic_v2_driver(dist, cpuif);
-        /* linear_map [TTBR0 - GIC CPUIF] */
-        mmu::linear_map((void *)cpuif, (mmu::phys)cpuif, cpuif_len, "gic_cpuif", mmu::page_size,
-                        mmu::mattr::dev);
+    u64 dist, redist, cpuif, its, v2m;
+    size_t dist_len, redist_len, cpuif_len, its_len, v2m_len;
+    if (dtb_get_gic_v3(&dist, &dist_len, &redist, &redist_len, &its, &its_len)) {
+        gic::gic = new gic::gic_v3_driver(dist, dist_len, redist, redist_len, its, its_len);
+    } else if (dtb_get_gic_v2(&dist, &dist_len, &cpuif, &cpuif_len, &v2m, &v2m_len)) {
+        gic::gic = new gic::gic_v2_driver(dist, dist_len, cpuif, cpuif_len, v2m, v2m_len);
     } else {
         abort("arch-setup: failed to get GICv3 nor GiCv2 information from dtb.\n");
     }
-    /* linear_map [TTBR0 - GIC DIST] */
-    mmu::linear_map((void *)dist, (mmu::phys)dist, dist_len, "gic_dist", mmu::page_size,
-                    mmu::mattr::dev);
 
 #if CONF_drivers_pci
     if (!opt_pci_disabled) {
@@ -197,6 +187,9 @@ void arch_init_premain()
 #if CONF_drivers_virtio_blk
 #include "drivers/virtio-blk.hh"
 #endif
+#if CONF_drivers_virtio_scsi
+#include "drivers/virtio-scsi.hh"
+#endif
 #if CONF_networking_stack
 #if CONF_drivers_virtio_net
 #include "drivers/virtio-net.hh"
@@ -204,6 +197,9 @@ void arch_init_premain()
 #endif
 #if CONF_drivers_virtio_fs
 #include "drivers/virtio-fs.hh"
+#endif
+#if CONF_drivers_nvme
+#include "drivers/nvme.hh"
 #endif
 
 void arch_init_drivers()
@@ -249,6 +245,9 @@ void arch_init_drivers()
 #if CONF_drivers_virtio_blk
     drvman->register_driver(virtio::blk::probe);
 #endif
+#if CONF_drivers_virtio_scsi
+    drvman->register_driver(virtio::scsi::probe);
+#endif
 #if CONF_networking_stack
 #if CONF_drivers_virtio_net
     drvman->register_driver(virtio::net::probe);
@@ -256,6 +255,9 @@ void arch_init_drivers()
 #endif
 #if CONF_drivers_virtio_fs
     drvman->register_driver(virtio::fs::probe);
+#endif
+#if CONF_drivers_nvme
+    drvman->register_driver(nvme::driver::probe);
 #endif
     boot_time.event("drivers probe");
     drvman->load_all();
