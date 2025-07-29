@@ -285,6 +285,36 @@ struct BufferSnapshot {
     ~BufferSnapshot(){
         free(ptes);
     }
+    void print_state(){
+        switch(state){
+            case BufferState::Cached:
+                printf("Cached\n");
+                break;
+            case BufferState::Inserting:
+                printf("Inserting\n");
+                break;
+            case BufferState::Reading:
+                printf("Reading\n");
+                break;
+            case BufferState::ReadyToInsert:
+                printf("ReadyToInsert\n");
+                break;
+            case BufferState::Writing:
+                printf("Writing\n");
+                break;
+            case BufferState::Evicting:
+                printf("Evicting\n");
+                break;
+            case BufferState::Uncached:
+                printf("Uncached\n");
+                break;
+            case BufferState::Inconsistent:
+                printf("Inconsistent\n");
+                break;
+            default:
+                printf("Wtf\n");
+        }
+    }
 };
 
 struct Buffer {
@@ -371,7 +401,7 @@ inline void* alignPage(void* addr, u64 pageSize){
 typedef std::vector<Buffer*>& PrefetchList;
 typedef std::vector<Buffer*>& EvictList;
 
-typedef void (*alloc_func)(VMA*, void*, PrefetchList, void*);
+typedef void (*alloc_func)(VMA*, void*, PrefetchList);
 typedef void (*evict_func)(VMA*, u64, EvictList);
 typedef bool (*conditional_callback) (Buffer* buf);
 typedef void (*unconditional_callback) (Buffer* buf);
@@ -419,6 +449,8 @@ struct callbacks {
 	  unconditional_callback post_EvictingToUncached_callback_implem;
 	  conditional_callback pre_CachedToEvicting_callback_implem;
     unconditional_callback post_EvictingToCached_callback_implem;
+    unconditional_callback post_ReadyToInsertToCached_callback_implem;
+    unconditional_callback misprediction_callback_implem;
 
     alloc_func prefetch_pol;
     evict_func evict_pol;
@@ -439,8 +471,6 @@ class VMA {
     // policy related
     ResidentSet* residentSet;
     callbacks callback_implems;
-
-    void* prefetchObject;
 
     VMA(u64, u64, ResidentSet*, struct ucache_file*, callbacks);
     static VMA* newVMA(u64 size, u64 page_size);
@@ -485,8 +515,16 @@ class VMA {
         callback_implems.post_EvictingToCached_callback_implem(buf);
     }
 
+    void post_ReadyToInsertToCached_callback(Buffer* buf){
+        callback_implems.post_ReadyToInsertToCached_callback_implem(buf);
+    }
+    
+    void misprediction_callback(Buffer* buf){
+        callback_implems.misprediction_callback_implem(buf);
+    }
+
     void choosePrefetchingCandidates(void* addr, PrefetchList pl){
-        callback_implems.prefetch_pol(this, addr, pl, prefetchObject);
+        callback_implems.prefetch_pol(this, addr, pl);
     }
 
     void chooseEvictionCandidates(u64 sizeToEvict, EvictList el){
@@ -494,8 +532,15 @@ class VMA {
     }
 
     bool addEvictionCandidate(Buffer* buf, BufferSnapshot* bs, EvictList el){
+        if(bs->ptes[0].io == 1){
+            return false;
+        }
         if(residentSet->remove(buf)){
             if(buf->CachedToEvicting(bs)){
+                if(bs->ptes[0].present == 0 && buf->snap != NULL){ // misprediction where the IO bit was cleared when polling for another request
+                    delete buf->snap;
+                    buf->snap = NULL;
+                }
                 assert_crash(buf->snap == NULL);
                 buf->snap = bs;
                 el.push_back(buf);
@@ -557,7 +602,7 @@ inline bool empty_conditional_callback(Buffer* buf){
 }
 
 // by default -> no prefetching
-inline void default_prefetch(VMA* vma, void* addr, PrefetchList pl, void* obj){
+inline void default_prefetch(VMA* vma, void* addr, PrefetchList pl){
     return;
 }
 
@@ -571,6 +616,7 @@ class uCache {
   
     // accessory
    	u64 batch;
+    u64 prefetch_batch;
     ucache_fs* fs;
 
    	// accounting
@@ -579,6 +625,10 @@ class uCache {
    	std::atomic<u64> writeSize;
     std::atomic<u64> pageFaults;
     std::atomic<u64> tlbFlush;
+    std::atomic<u64> mispredictions;
+    std::atomic<u64> prefetchedSize;
+    std::atomic<u64> poll_depth;
+    std::atomic<u64> poll_depth_count;
 
    	uCache();
     void init(u64 physSize, int batch);
@@ -592,7 +642,9 @@ class uCache {
    	void ensureFreePages(u64 additionalSize);
    	void readBuffer(Buffer* buf);
     void readBufferToTmp(Buffer* buf, Buffer* tmp);
-    void flush(std::vector<Buffer*>& toWrite);
+    void flushBuffers(std::vector<Buffer*>& toWrite);
+
+    bool checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs);
     
     void handlePageFault(VMA* vma, void* addr, exception_frame *ef); // called from the page fault handler
     void handleFault(VMA* vma, Buffer* buffer, bool newPage=false);

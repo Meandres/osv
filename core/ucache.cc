@@ -245,6 +245,7 @@ static BufferState computePTEState(PTE pte){
 }
 
 void Buffer::updateSnapshot(BufferSnapshot* bs){
+	assert_crash(bs != NULL);
 	bs->state = BufferState::TBD;
 	assert_crash(vma != NULL);
   for(size_t i = 0; i < vma->nbPages; i++){
@@ -304,10 +305,15 @@ u64 Buffer::EvictingToUncached(BufferSnapshot* bs){
 	if(bs->state != BufferState::Evicting)
 		return 0;
 
+	if(bs->ptes[0].present == 0){ // misprediction
+		ucache::uCacheManager->mispredictions++;
+		vma->misprediction_callback(vma->getBuffer(baseVirt));
+	}
 	u64 phys = bs->ptes[0].phys;
 	for(size_t i = 0; i < vma->nbPages; i++){
 		PTE newPTE = PTE(bs->ptes[i].word);
 		newPTE.present = 0;
+		newPTE.prefetcher = 0;
 		newPTE.evicting = 0;
 		newPTE.phys = 0;
 		if(!(pteRefs+i)->compare_exchange_strong(bs->ptes[i].word, newPTE.word)){
@@ -356,16 +362,17 @@ bool Buffer::UncachedToPrefetching(u64 phys, BufferSnapshot* bs){
 		newPTE.present = 0;
 		newPTE.io = 1;
 		newPTE.phys = phys+i;
-		newPTE.prefetcher = sched::cpu::current()->id;
+		newPTE.prefetcher = sched::cpu::current()->id+1;
 		if(!(pteRefs+i)->compare_exchange_strong(bs->ptes[i].word, newPTE.word)){
 			return false;
 		}
 	}
+	bs->state = BufferState::Reading;
 	return true;
 }
 
 bool Buffer::CachedToEvicting(BufferSnapshot* bs){
-	if(bs->state != BufferState::Cached){
+	if(bs->state != BufferState::Cached && bs->state != BufferState::ReadyToInsert){
 		return false;
 	}
 	if(!vma->pre_CachedToEvicting_callback(vma->getBuffer(baseVirt)))
@@ -422,6 +429,7 @@ bool Buffer::ReadyToInsertToCached(BufferSnapshot* bs){
 		bs->ptes[i] = newPTE;
 	}
 	bs->state = BufferState::Cached;
+	vma->post_ReadyToInsertToCached_callback(vma->getBuffer(baseVirt));
 	return true;
 }
 
@@ -495,12 +503,11 @@ u64 HashTableResidentSet::hash(u64 k) {
 }
 
 bool HashTableResidentSet::insert(Buffer* buf) {
-		//assert_crash(buf != NULL && buf->snap == NULL);
 		u64 pos = hash((uintptr_t)buf) & mask;
   	while (true) {
         Buffer* curr = ht[pos].buf.load();
         if(curr == buf){
-            return false;
+        	return false;
         }
         assert_crash(curr != buf);
         if (((uintptr_t)curr == empty) || ((uintptr_t)curr == tombstone)){
@@ -527,7 +534,6 @@ bool HashTableResidentSet::contains(Buffer* buf) {
 }
 
 bool HashTableResidentSet::remove(Buffer* buf) {
-	assert_crash(buf->snap == NULL);
 	u64 pos = hash((uintptr_t)buf) & mask;
     while (true) {
     	Buffer* curr = ht[pos].buf.load();
@@ -578,6 +584,8 @@ VMA::VMA(u64 size, u64 page_size, ResidentSet* set, struct ucache_file* f, callb
 	callback_implems.post_EvictingToUncached_callback_implem = implems.post_EvictingToUncached_callback_implem;
 	callback_implems.pre_CachedToEvicting_callback_implem = implems.pre_CachedToEvicting_callback_implem;
 	callback_implems.post_EvictingToCached_callback_implem = implems.post_EvictingToCached_callback_implem;
+	callback_implems.post_ReadyToInsertToCached_callback_implem = implems.post_ReadyToInsertToCached_callback_implem;
+	callback_implems.misprediction_callback_implem = implems.misprediction_callback_implem;
 	callback_implems.prefetch_pol = implems.prefetch_pol;
 	callback_implems.evict_pol = implems.evict_pol;
 }
@@ -607,14 +615,19 @@ uCache::uCache() : totalPhysSize(0), batch(0){
    	usedPhysSize = 0;
    	readSize = 0;
    	writeSize = 0;
+		prefetchedSize = 0;
 		pageFaults = 0;
 		tlbFlush = 0;
+		mispredictions = 0;
+		poll_depth = 0;
+		poll_depth_count = 0;
 
 		fs = new ucache_fs();
 }
 
 void uCache::init(u64 physSize, int batch){
 	this->totalPhysSize = physSize;
+	this->prefetch_batch = 32;
 	this->batch = batch;
 }
 
@@ -650,16 +663,18 @@ VMA* uCache::getVMA(void* addr){
 	return NULL;
 }
 
-static bool checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs){
+#pragma GCC push_options
+#pragma GCC optimize("O0")
+bool uCache::checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs){
 	if(bs->state == BufferState::Inconsistent){
 		do{
 			buffer->updateSnapshot(bs);
 		} while(bs->state == BufferState::Inconsistent);
 		if(bs->state == BufferState::Cached)
 			return true;
-	}	
+	}
 	if(bs->state == BufferState::Reading){
-		if(buffer->getPrefetcher() == sched::cpu::current()->id){ // this core started the prefettching
+		if(buffer->getPrefetcher()-1 == sched::cpu::current()->id){ // this core started the prefetching
 			fs->poll(buffer->snap->iod, false);
 			delete buffer->snap;
 			buffer->snap = NULL;
@@ -669,13 +684,23 @@ static bool checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs){
 				buffer->updateSnapshot(bs);
 			} while(bs->state == BufferState::Reading);
 		}
+		//buffer->updateSnapshot(bs);
 	}
-
 	if(bs->state == BufferState::ReadyToInsert){
-		if(buffer->ReadyToInsertToCached(bs)){
-			assert_crash(buffer->vma->residentSet->insert(buffer));
-			return true;
+		if(buffer->getPrefetcher()-1 == sched::cpu::current()->id){ // this core started the prefetching
+			if(buffer->snap != NULL){
+				delete buffer->snap;
+				buffer->snap=NULL;
+			}
+			assert_crash(buffer->ReadyToInsertToCached(bs));
+			prefetchedSize += buffer->vma->pageSize;
+		}else{
+			do{ // wait for the prefetcher to poll the completion of the IO request
+				_mm_pause();
+				buffer->updateSnapshot(bs);
+			} while(bs->state == BufferState::ReadyToInsert);
 		}
+		return true;
 	}
 	if(bs->state == BufferState::Cached){
 			return true;
@@ -712,7 +737,6 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 	
 	if(debug)
 		m1 = processor::rdtsc();
-	pl.reserve(batch);
 	vma->choosePrefetchingCandidates(buffer->baseVirt, pl);
 	ensureFreePages(vma->pageSize *(1 + pl.size())); // make enough room for the page being faulted and the prefetched ones
 	if(debug)
@@ -750,11 +774,12 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 		}
 	}else{
 		frames_free_phys_addr(phys, vma->pageSize);
-		while(PTE(*(buffer->pteRefs+vma->nbPages-1)).present == 0){
+		/*while(PTE(*(buffer->pteRefs+vma->nbPages-1)).present == 0){
 			_mm_pause();
-		}
+		}*/
 	}
 }
+#pragma GCC pop_options
 
 void print_stats(){
 	if(debug){
@@ -773,7 +798,7 @@ void print_stats(){
 }
 
 void uCache::prefetch(VMA *vma, PrefetchList pl){
-	u64 prefetchedSize = 0;
+	if(pl.size() == 0){ return;}
 	for(Buffer* buf: pl){
 		BufferSnapshot* bs = new BufferSnapshot(vma->nbPages);
 		buf->updateSnapshot(bs);
@@ -781,14 +806,16 @@ void uCache::prefetch(VMA *vma, PrefetchList pl){
 		if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
 			buf->snap = bs;
 			buf->snap->iod = fs->aread(vma->file, buf->baseVirt, vma->start, vma->pageSize);
+			readSize += vma->pageSize;
 			usedPhysSize += vma->pageSize;
-			prefetchedSize += vma->pageSize;
+			vma->usedPhysSize += vma->pageSize;
+			assert_crash(vma->residentSet->insert(buf));
 		}else{
 			frames_free_phys_addr(phys, vma->pageSize); // put back unused candidates
 			delete bs;
 		}
 	}
-	vma->usedPhysSize += prefetchedSize;
+	//printf("prefetched %lu buffers\n", prefetchedSize/vma->pageSize);
 }
 
 void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
@@ -825,8 +852,7 @@ void uCache::evict(){
 		}
 
     // write single pages that are dirty.
-    assert_crash(toEvict.size() <= maxQueueSize);
-    flush(toEvict);
+    flushBuffers(toEvict);
     
     // checking if the page have been remapped only improve performance
     // we need to settle on which pages to flush from the TLB at some point anyway
@@ -907,14 +933,14 @@ void uCache::readBuffer(Buffer* buf){
 	readSize += buf->vma->pageSize;
 }
 
-void uCache::flush(std::vector<Buffer*>& toWrite){
+void uCache::flushBuffers(std::vector<Buffer*>& toWrite){
 	std::vector<Buffer*> requests;
 	std::vector<int> devices;
 	u64 sizeWritten = 0;
 	requests.reserve(toWrite.size());
 	devices.reserve(fs->devices.size());
 	bool ring_doorbell = false;
-	if(batch_io_request)
+	if(!batch_io_request)
 		ring_doorbell = true;
 	for(u64 i=0; i<toWrite.size(); i++){
 		Buffer* buf = toWrite[i];
@@ -948,6 +974,8 @@ void createCache(u64 physSize, int batch){
 	default_callbacks.post_EvictingToUncached_callback_implem = empty_unconditional_callback;
 	default_callbacks.pre_CachedToEvicting_callback_implem = empty_conditional_callback;
 	default_callbacks.post_EvictingToCached_callback_implem = empty_unconditional_callback;
+	default_callbacks.post_ReadyToInsertToCached_callback_implem = empty_unconditional_callback;
+	default_callbacks.misprediction_callback_implem = empty_unconditional_callback;
 	default_callbacks.prefetch_pol = default_prefetch;
 	default_callbacks.evict_pol = default_transparent_eviction;
 }

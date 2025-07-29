@@ -1443,12 +1443,16 @@ int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs, bool writing)
 
     PDEBUG("# POLL d={%d %d %#lx}", desc->id, desc->cidcount, *desc->cidmask);
     int err = 0;
+    int cnt = -desc->cidcount;
     while (desc->cidcount) {
         if ((err = unvme_check_completion(desc->q, timeout, cqe_cs, writing)) != 0){
             ucache::assert_crash(false);
             break;
         }
+        cnt++;
     }
+    ucache::uCacheManager->poll_depth += cnt;
+    ucache::uCacheManager->poll_depth_count++;
     if (desc->cidcount == 0) unvme_desc_put(desc);
     PDEBUG("# q%d +%d", desc->q->nvmeq->id, desc->q->desccount);
 

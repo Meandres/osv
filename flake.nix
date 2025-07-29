@@ -70,6 +70,7 @@
               bison
               ninja
               tbb
+              dpdk
             ];
 
             buildInputs = with pkgs; [
@@ -91,6 +92,7 @@
             XZ_DIR="${pkgs.xz.out}";
             LIBZ_DIR="${pkgs.libz}";
             LIBSELINUX_DIR="${pkgs.libselinux.out}";
+            DPDK_DIR="${pkgs.dpdk}";
 
             CAPSTAN_QEMU_PATH = "${pkgs.qemu}/bin/qemu-system-x86_64";
 
