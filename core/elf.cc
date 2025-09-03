@@ -37,7 +37,7 @@
 #include "cpuid.hh"
 
 #if CONF_elf_debug
-#define elf_debug(format,...) kprintf("ELF [tid:%d, mod:%d, %s]: " format, sched::thread::current()->id(), _module_index, _pathname.c_str(), ##__VA_ARGS__)
+#define elf_debug(format,...) printf("ELF [tid:%d, mod:%d, %s]: " format, sched::thread::current()->id(), _module_index, _pathname.c_str(), ##__VA_ARGS__)
 #else
 #define elf_debug(...)
 #endif

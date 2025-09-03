@@ -101,9 +101,9 @@ int vfs_file::ioctl(u_long com, void *data)
 	struct vnode *vp = fp->f_dentry->d_vnode;
 	int error;
 
-	vn_lock(vp);
+	//vn_lock(vp);
 	error = VOP_IOCTL(vp, fp, com, data);
-	vn_unlock(vp);
+	//vn_unlock(vp);
 
 	return error;
 }

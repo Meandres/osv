@@ -72,8 +72,9 @@ struct bio;
 #define	BIO_NOTCLASSIFIED		(void *)(~0UL)
 
 typedef void bio_task_t(void *);
+#ifndef __daddr_t_defined
 typedef uint64_t   daddr_t;    /* disk address */
-
+#endif
 
 /*
  * The bio structure describes an I/O operation in the kernel.

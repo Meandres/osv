@@ -278,6 +278,8 @@ ifeq ($(arch),x64)
 INCLUDES += -isystem external/$(arch)/acpica/source/include
 endif
 
+#CXX_INCLUDES += -Imodules/lwext4/upstream/lwext4/include -Imodules/lwext4/upstream/lwext4/build_lib_only/include
+
 ifeq ($(arch),aarch64)
 libfdt_base = external/$(arch)/libfdt
 INCLUDES += -isystem $(libfdt_base)
@@ -1118,9 +1120,10 @@ objects += core/llfree/local.o
 objects += core/llfree/lower.o
 objects += core/llfree/tree.o
 
-ifeq ($(conf_drivers_pollnvme),1)
+#ifeq ($(conf_drivers_pollnvme),1)
+objects += core/ufs.o
 objects += core/ucache.o
-endif
+#endif
 
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o

@@ -47,10 +47,11 @@ void free_contiguous_aligned(void* p);
 
 #include <algorithm>
 #include <set>
+#include <cstdio>
 
 //#define CONF_debug_ext 1
 #if CONF_debug_ext
-#define ext_debug(format,...) kprintf("[ext4] " format, ##__VA_ARGS__)
+#define ext_debug(format,...) printf("[ext4] " format, ##__VA_ARGS__)
 #else
 #define ext_debug(...)
 #endif
@@ -589,11 +590,19 @@ ext_write(vnode_t *vp, uio_t *uio, int ioflag)
     return ret;
 }
 
+struct ioctl_req{
+    uint64_t l_idx;
+    uint64_t p_idx;
+};
+
 static int
 ext_ioctl(vnode_t *vp, file_t *fp, u_long com, void *data)
 {
-    ext_debug("ioctl\n");
-    return (EINVAL);
+    struct ext4_fs *fs = (struct ext4_fs *)vp->v_mount->m_data;
+    auto_inode_ref ref(fs, vp->v_ino);
+    ioctl_req* req = (ioctl_req*)data;
+    int r = ext4_fs_get_inode_dblk_idx(&ref._ref, req->l_idx, &req->p_idx, true);
+    return r;
 }
 
 #define ext_fsync     ((vnop_fsync_t)vop_nullop)
@@ -905,17 +914,28 @@ ext_trunc_inode(struct ext4_fs *fs, uint32_t index, uint64_t new_size, bool *upd
         //or implement some other trick when we reserve number of blocks and then
         //read zeros if user reads relevant area of the file
         size_t extra_size = new_size - inode_size;
-        void *buf = alloc_contiguous_aligned(extra_size, alignof(std::max_align_t));
-        memset(buf, 0, extra_size);
-        size_t write_count = 0;
-
-        auto_inode_ref inode_ref2(fs, index);
-        if (inode_ref2._r != EOK) {
-            return inode_ref2._r;
-        }
-
         ext_debug("trunc_inode: expanding size of the node %d by %ld bytes\n", index, extra_size);
-        r = ext_internal_write(fs, &inode_ref2._ref, inode_size, buf, extra_size, &write_count);
+        size_t max_alloc_size = 2ul * 1024 * 1024; // 10GiB
+        void* buf;
+        if(extra_size <= max_alloc_size){
+            buf = alloc_contiguous_aligned(extra_size, 2ul*1024*1024);
+            memset(buf, 0, extra_size);
+        }else{
+            buf = alloc_contiguous_aligned(max_alloc_size, 2ul*1024*1024);
+            memset(buf, 0, max_alloc_size);
+        }
+        while(extra_size > 0){
+            size_t iter_size = extra_size > max_alloc_size ? max_alloc_size : extra_size;
+            size_t write_count = 0;
+
+            auto_inode_ref inode_ref2(fs, index);
+            if (inode_ref2._r != EOK) {
+                return inode_ref2._r;
+            }
+
+            r = ext_internal_write(fs, &inode_ref2._ref, inode_size, buf, iter_size, &write_count);
+            extra_size -= iter_size;
+        }
         free_contiguous_aligned(buf);
         return r;
     }

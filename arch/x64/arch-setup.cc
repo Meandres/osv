@@ -411,9 +411,6 @@ void arch_init_drivers()
 #if CONF_drivers_nvme
     drvman->register_driver(nvme::driver::probe);
 #endif
-#if CONF_drivers_pollnvme
-    drvman->register_driver(nvme::probe);
-#endif
     boot_time.event("drivers probe");
     drvman->load_all();
     drvman->list_drivers();

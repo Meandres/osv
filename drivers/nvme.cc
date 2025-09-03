@@ -21,6 +21,7 @@
 
 #include <osv/sched.hh>
 #include <osv/trace.hh>
+#include <osv/ucache.hh>
 #include <osv/aligned_new.hh>
 
 #include <osv/device.h>
@@ -54,7 +55,12 @@ struct nvme_priv {
 static void nvme_strategy(struct bio* bio) {
     auto* prv = reinterpret_cast<struct nvme_priv*>(bio->bio_dev->private_data);
     trace_nvme_strategy(bio, bio->bio_bcount);
-    prv->drv->make_request(bio);
+    if(prv->drv->poll_mode){
+        prv->drv->make_async_request(bio);
+        prv->drv->poll_req(bio);
+    }else{
+        prv->drv->make_request(bio);
+    }
 }
 
 static int
@@ -122,6 +128,7 @@ driver::driver(pci::device &pci_dev)
     assert(parse_ok);
 
     enable_msix();
+    poll_mode = false;
 
     _id = _instance++;
 
@@ -153,7 +160,7 @@ driver::driver(pci::device &pci_dev)
         set_interrupt_coalescing(20, 2);
     }
 
-    std::string dev_name("vblk");
+    std::string dev_name("nvme");
     dev_name += std::to_string(_disk_idx++);
 
     struct device* dev = device_create(&_driver, dev_name.c_str(), D_BLK);
@@ -447,7 +454,56 @@ int driver::make_request(bio* bio, u32 nsid)
     }
 
     unsigned int qidx = sched::current_cpu->id % _io_queues.size();
-    return _io_queues[qidx]->make_request(bio, nsid);
+    int ret = _io_queues[qidx]->make_request(bio, nsid);
+    bio->bio_offset = bio->bio_offset << _ns_data[nsid]->blockshift;
+    bio->bio_bcount = bio->bio_bcount << _ns_data[nsid]->blockshift;
+    return ret;
+}
+
+void driver::switch_to_interrupt_mode(){
+    for(auto&& qp: _io_queues){
+        qp->enable_interrupts();
+    }
+    poll_mode = false;
+}
+
+void driver::switch_to_poll_mode(){
+    for(auto&& qp: _io_queues){
+        qp->disable_interrupts();
+    }
+    poll_mode = true;
+}
+
+int driver::make_async_request(struct bio* bio, u32 nsid){
+    if (bio->bio_bcount % _ns_data[nsid]->blocksize || bio->bio_offset % _ns_data[nsid]->blocksize) {
+        NVME_ERROR("bio request not block-aligned length=%d, offset=%d blocksize=%d\n",bio->bio_bcount, bio->bio_offset, _ns_data[nsid]->blocksize);
+        return EINVAL;
+    }
+    bio->bio_offset = bio->bio_offset >> _ns_data[nsid]->blockshift;
+    bio->bio_bcount = bio->bio_bcount >> _ns_data[nsid]->blockshift;
+
+    assert((bio->bio_offset + bio->bio_bcount) <= _ns_data[nsid]->blockcount);
+
+    if (bio->bio_cmd == BIO_FLUSH && (_identify_controller->vwc == 0 || !NVME_VWC_ENABLED )) {
+        biodone(bio, true);
+        return 0;
+    }
+
+    unsigned int qidx = sched::current_cpu->id % _io_queues.size();
+    int ret =  _io_queues[qidx]->make_async_request(bio, nsid);
+    bio->bio_offset = bio->bio_offset << _ns_data[nsid]->blockshift;
+    bio->bio_bcount = bio->bio_bcount << _ns_data[nsid]->blockshift;
+    return ret;
+}
+
+void driver::poll_req(struct bio* bio, u32 nsid){
+    unsigned int qidx = sched::current_cpu->id % _io_queues.size();
+    while((bio->bio_flags & BIO_DONE) == 0 && (bio->bio_flags & BIO_ERROR) == 0){
+        _io_queues[qidx]->poll_cq();
+    }
+    if((bio->bio_flags & BIO_ERROR) == 1){
+        printf("io error\n");
+    }
 }
 
 void driver::register_admin_interrupt()
@@ -577,8 +633,14 @@ hw_driver* driver::probe(hw_device* dev)
     if (auto pci_dev = dynamic_cast<pci::device*>(dev)) {
         if ((pci_dev->get_base_class_code() == pci::function::PCI_CLASS_STORAGE) &&
             (pci_dev->get_sub_class_code() == pci::function::PCI_SUB_CLASS_STORAGE_NVMC) &&
-            (pci_dev->get_programming_interface() == 2))// detect NVMe device
-            return aligned_new<driver>(*pci_dev);
+            (pci_dev->get_programming_interface() == 2)){ // detect NVMe device
+            driver* drv = aligned_new<driver>(*pci_dev);
+            if(ucache::uCacheManager == NULL){
+                ucache::uCacheManager = new ucache::uCache();
+            }
+            ucache::uCacheManager->fs->add_device(drv);
+            return drv;
+        }
     }
     return nullptr;
 }

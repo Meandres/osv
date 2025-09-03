@@ -90,7 +90,6 @@ def generate_manifests(modules, basic_apps, usrskel='default'):
                     append_manifest(module_manifest, manifest, os.getenv('libgcc_s_dir'), variables={
                         'MODULE_DIR': module.local_path,
                         'OSV_BASE': resolve.get_osv_base(),
-                        'DPDK_DIR': os.environ["DPDK_DIR"]
                     })
 
                 filemap_attr = '%s_files' % manifest_type

@@ -159,6 +159,7 @@ static bool opt_strace = false;
 #endif
 #endif
 static bool opt_mount = true;
+static bool opt_nvme_ext = false;
 static bool opt_pivot = true;
 static std::string opt_rootfs;
 static bool opt_random = true;
@@ -196,11 +197,11 @@ static void usage()
 #if CONF_tracepoints_strace
         "  --strace              start a thread to print tracepoints to the console on the fly\n"
 #endif
-#endif
 #if CONF_memory_tracker
         "  --leak                   start leak detector after boot\n"
 #endif
         "  --nomount                don't mount the root file system\n"
+        "  --mount-nvme-ext         mount the ext partition on the nvme device\n"
         "  --nopivot                do not pivot the root from bootfs to the root fs\n"
         "  --rootfs=arg             root filesystem to use (zfs, rofs, ramfs or virtiofs)\n"
         "  --assign-net             assign virtio network to the application\n"
@@ -325,6 +326,7 @@ static void parse_options(int loader_argc, char** loader_argv)
 #endif
 
     opt_mount = !extract_option_flag(options_values, "nomount");
+    opt_nvme_ext = extract_option_flag(options_values, "mount-nvme-ext");
     opt_pivot = !extract_option_flag(options_values, "nopivot");
     opt_random = !extract_option_flag(options_values, "norandom");
     opt_init = !extract_option_flag(options_values, "noinit");
@@ -517,7 +519,20 @@ static int load_zfs_library_and_mount_zfs_root(bool pivot_when_error = false)
     });
 }
 
-
+/*
+static int load_ext_library_and_mount_additional_ext(){
+    bool pivot_when_error = false;
+    return load_fs_library("/usr/lib/fs/libext.so", [pivot_when_error]() {
+        auto error = mount_rootfs("/nvme", "/dev/nvme0", "ext", 0, nullptr, false);
+        if (error) {
+            debug("Could not mount ext filesystem.\n");
+        } else {
+            boot_time.event("additional EXT mounted");
+        }
+        return error;
+    });
+}
+*/
 static int load_ext_library_and_mount_ext_root(bool pivot_when_error = false)
 {
     // Load and initialize EXT filesystem driver implemented in libext.so
@@ -549,7 +564,6 @@ void* do_main_thread(void *_main_args)
     if (opt_random) {
         randomdev::randomdev_init();
     }
-    boot_time.event("drivers loaded");
 
     if (opt_mount) {
         unmount_devfs();
@@ -610,6 +624,11 @@ void* do_main_thread(void *_main_args)
             fprintf(stderr, "Failed to preload ZFS library. Powering off.\n");
             osv::poweroff();
         }
+    }
+    
+    if(opt_nvme_ext){
+        mount_rootfs("/nvme", "/dev/nvme0", "ext", 0, nullptr, false);
+        //load_ext_library_and_mount_additional_ext();
     }
 
 #if CONF_networking_stack
@@ -746,8 +765,6 @@ void* do_main_thread(void *_main_args)
         commands.insert(commands.begin(),
                  init_commands.begin(), init_commands.end());
     }
-
-    //ucache::uCacheManager = new ucache::uCache();
 
     // run each payload in order
     // Our parse_command_line() leaves at the end of each command a delimiter,

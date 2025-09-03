@@ -143,6 +143,9 @@ public:
 
     int make_request(struct bio* bio, u32 nsid);
     void req_done();
+
+    int make_async_request(struct bio* bio, u32 nsid);
+    void poll_cq();
 private:
     void init_pending_bios(u32 level);
 

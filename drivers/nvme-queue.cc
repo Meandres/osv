@@ -16,6 +16,7 @@
 #include <osv/trace.hh>
 #include <osv/mempool.hh>
 #include <osv/align.hh>
+#include <osv/ucache.hh>
 
 #include "nvme-queue.hh"
 
@@ -129,7 +130,18 @@ void queue_pair::wait_for_completion_queue_entries()
 
 void queue_pair::map_prps(nvme_sq_entry_t* cmd, struct bio* bio, u64 datasize)
 {
-    void* data = (void*)mmu::virt_to_phys(bio->bio_data);
+    u64 addr;
+    if(ucache::uCacheManager != NULL && ucache::uCacheManager->getVMA(bio->bio_data) != NULL){
+        addr = ucache::walk(bio->bio_data).phys << 12;
+        //printf("addr: %lu\n");
+        cmd->rw.common.prp1 = addr;
+        cmd->rw.common.prp2 = 0;
+        bio->bio_private = nullptr;
+    }else{
+        void* data = (void*)mmu::virt_to_phys(bio->bio_data);
+        addr = (u64) data;
+    }
+    assert(addr != 0);
     bio->bio_private = nullptr;
 
     // Depending on the datasize, we map PRPs (Physical Region Page) as follows:
@@ -138,7 +150,6 @@ void queue_pair::map_prps(nvme_sq_entry_t* cmd, struct bio* bio, u64 datasize)
     // 2. If data falls within 2 pages then set prp2 to the second 4K-aligned part of data
     // 3. Otherwise, allocate a physically contigous array long enough to hold addresses
     //    of remaining 4K pages of data
-    u64 addr = (u64) data;
     cmd->rw.common.prp1 = addr;
     cmd->rw.common.prp2 = 0;
 
@@ -155,7 +166,7 @@ void queue_pair::map_prps(nvme_sq_entry_t* cmd, struct bio* bio, u64 datasize)
         // Allocate PRP list as the request is larger than 8K
         // For now we can only accomodate datasize <= 2MB so single page
         // should be exactly enough to map up to 512 pages of the request data
-        assert(num_of_pages / 512 == 0);
+        assert(num_of_pages == 512 || num_of_pages / 512 == 0);
         u64* prp_list = nullptr;
         _free_prp_lists.pop(prp_list);
         if (!prp_list) { // No free pre-allocated ones, so allocate new one
@@ -316,6 +327,109 @@ int io_queue_pair::make_request(struct bio* bio, u32 nsid = 1)
         return ENOTBLK;
     }
     return 0;
+}
+
+int io_queue_pair::make_async_request(struct bio* bio, u32 nsid = 1)
+{
+    u64 slba = bio->bio_offset;
+    u32 nlb = bio->bio_bcount; //do the blockshift in nvme_driver
+    ucache::assert_crash(slba != ~0ul);
+
+    SCOPE_LOCK(_lock);
+    if (_sq_full) {
+        poll_cq();
+    }
+    assert((((_sq._tail + 1) % _qsize) != _sq._head));
+    //
+    // We need to check if there is an outstanding command that uses
+    // _sq._tail as command id.
+    // This happens if:
+    // 1. The SQ is full. Then we just have to wait for an open slot (see above)
+    // 2. The Controller already read a SQE but didnt post a CQE yet.
+    //    This means we could post the command but need a different cid. To still
+    //    use the cid as index to find the corresponding bios we use a matrix
+    //    adding columns if we need them
+    u16 cid = _sq._tail;
+    while (_pending_bios[cid_to_row(cid)][cid_to_col(cid)].load()) {
+        trace_nvme_cid_conflict(_driver_id, _id, cid);
+        cid += _qsize;
+        auto level = cid_to_row(cid);
+        assert(level < max_pending_levels);
+        // Allocate next row of _pending_bios if needed
+        if (!_pending_bios[cid_to_row(cid)]) {
+            init_pending_bios(level);
+        }
+    }
+    //Save bio
+    _pending_bios[cid_to_row(cid)][cid_to_col(cid)] = bio;
+
+    switch (bio->bio_cmd) {
+    case BIO_READ:
+        trace_nvme_read_write_cmd_submit(_driver_id, _id, cid, bio, slba, nlb, false);
+        submit_read_write_cmd(cid, nsid, NVME_CMD_READ, slba, nlb, bio);
+        break;
+
+    case BIO_WRITE:
+        trace_nvme_read_write_cmd_submit(_driver_id, _id, cid, bio, slba, nlb, true);
+        submit_read_write_cmd(cid, nsid, NVME_CMD_WRITE, slba, nlb, bio);
+        break;
+
+    case BIO_FLUSH:
+        submit_flush_cmd(cid, nsid);
+        break;
+
+    default:
+        NVME_ERROR("Operation not implemented\n");
+        return ENOTBLK;
+    }
+    return 0;
+}
+
+void io_queue_pair::poll_cq()
+{
+    nvme_cq_entry_t* cqep = nullptr;
+    while(cqep == nullptr){
+        cqep = get_completion_queue_entry();
+        _mm_pause();
+    }
+    // Read full CQ entry onto stack so we can advance CQ head ASAP
+    // and release the CQ slot
+    nvme_cq_entry_t cqe = *cqep;
+    advance_cq_head();
+    mmio_setl(_cq._doorbell, _cq._head);
+
+    auto old_sq_head = _sq._head.exchange(cqe.sqhd); //update sq_head
+    if (old_sq_head != cqe.sqhd && _sq_full) {
+        _sq_full = false;
+    }
+            
+    // Read cid and release it
+    u16 cid = cqe.cid;
+    auto pending_bio = _pending_bios[cid_to_row(cid)][cid_to_col(cid)].exchange(nullptr);
+    ucache::assert_crash(pending_bio != nullptr);
+            
+    // Save for future re-use or free PRP list saved under bio_private if any
+    if (pending_bio->bio_private != nullptr) {
+        if (!_free_prp_lists.push((u64*)pending_bio->bio_private)) {
+            free_page(pending_bio->bio_private); //_free_prp_lists is full so free the page
+            trace_nvme_prp_free(_driver_id, _id, pending_bio->bio_private);
+        }
+    }
+            
+    // Call biodone
+    if (cqe.sct != 0 || cqe.sc != 0) {
+        trace_nvme_req_done_error(_driver_id, _id, cid, cqe.sct, cqe.sc, pending_bio);
+        pending_bio->bio_flags |= BIO_DONE;
+        pending_bio->bio_flags |= BIO_ERROR;
+        printf("I/O queue: cid=%d, sct=%#x, sc=%#x, bio=%#x, slba=%llu, nlb=%llu\n",
+            cqe.cid, cqe.sct, cqe.sc, pending_bio,
+            pending_bio ? pending_bio->bio_offset>>9 : 0,
+            pending_bio ? pending_bio->bio_bcount>>9 : 0);
+        ucache::assert_crash(false);
+    } else {
+        trace_nvme_req_done_success(_driver_id, _id, cid, pending_bio);
+        pending_bio->bio_flags |= BIO_DONE;
+    }
 }
 
 void io_queue_pair::req_done()

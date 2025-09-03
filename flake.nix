@@ -29,7 +29,6 @@
               binutils
               bisoncpp
               gcc13
-              libgcc
               gdb # gnu debugger
               cmake
               gnumake
@@ -71,6 +70,12 @@
               ninja
               tbb
               dpdk
+              snappy
+              zstd
+              zlib
+              bzip2
+              glog
+              lz4
             ];
 
             buildInputs = with pkgs; [

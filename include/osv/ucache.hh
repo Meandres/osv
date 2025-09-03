@@ -15,7 +15,6 @@
 #include <bitset>
 #include <fstream>
 #include <sys/mman.h>
-#include "drivers/poll_nvme.hh"
 
 #include <osv/types.h>
 #include <osv/sched.hh>
@@ -23,6 +22,7 @@
 #include <osv/percpu.hh>
 #include <osv/llfree.h>
 #include <osv/power.hh>
+#include <osv/ufs.hh>
 
 static const u64 maxPageSize = mmu::huge_page_size;
 
@@ -33,53 +33,6 @@ inline const u64 DEFAULT_LB_PER_STRIPE = 256;
 const bool debug = false;
 const bool batch_io_request = true;
 void print_stats();
-
-class ucache_file{
-    public:
-    int id;
-    std::string name;
-    u64 start_vlba;    
-    u64 num_lb;
-    u64 size;
-   
-    u64 current_seek_pos;
-    inline static u64 next_available_file_id;
-
-    ucache_file(std::string n, u64 v_slba, u64 num_lb, u64 size): id(next_available_file_id++), name(n), start_vlba(v_slba), num_lb(num_lb), size(size), current_seek_pos(0)
-    {
-    }
-};
-
-struct StorageLocation{
-    u64 device_id;
-    u64 stripe;
-    u64 offset_in_stripe;
-};
-
-class ucache_fs{
-    private:
-    bool scanned_for_files;
-    public:
-    std::vector<ucache_file*> available_files;
-    std::vector<const unvme_ns_t*> devices;
-    u64 last_available_vlba;
-    u64 lb_size = 512;
-    u64 lb_per_stripe; 
-
-    ucache_fs();
-
-    void discover_ucache_files();
-    void add_device(const unvme_ns_t* ns);
-    ucache_file* find_file(const char* name);
-    u64 findSpace(u64 nb_lb);
-    ucache_file* create_file(u64 size);
-    void computeStorageLocation(StorageLocation& loc, ucache_file* f, void* addr, void* start);
-    void read(ucache_file* f, void* addr, void* start, u64 size);
-    unvme_iod_t aread(ucache_file* f, void* addr, void* start, u64 size);
-    unvme_iod_t awrite(ucache_file* f, void* addr, void* start, u64 size, bool ring, std::vector<int>& devs);
-    void poll(unvme_iod_t iod, bool writing);
-    void commit_io(std::vector<int> &devices);
-};
 
 typedef u64 phys_addr;
 typedef u64* virt_addr;
@@ -273,7 +226,7 @@ struct VMA;
 
 struct BufferSnapshot {
     PTE *ptes;
-    unvme_iod_t iod;
+    aio_req_t* reqs;
     BufferState state;
 
     BufferSnapshot(u64 nbPages){
@@ -461,7 +414,7 @@ class VMA {
     public:
     void* start;
     u64 size;
-    struct ucache_file* file;
+    ufile* file;
     u64 pageSize;
     u64 nbPages;
     u64 id;
@@ -472,9 +425,7 @@ class VMA {
     ResidentSet* residentSet;
     callbacks callback_implems;
 
-    VMA(u64, u64, ResidentSet*, struct ucache_file*, callbacks);
-    static VMA* newVMA(u64 size, u64 page_size);
-    static VMA* newVMA(const char* name, u64 page_size);
+    VMA(u64, u64, ResidentSet*, ufile*, callbacks);
     ~VMA(){}
 
     bool isValidPtr(void* addr){
@@ -541,6 +492,7 @@ class VMA {
                     delete buf->snap;
                     buf->snap = NULL;
                 }
+                assert_crash(bs->state == BufferState::Evicting);
                 assert_crash(buf->snap == NULL);
                 buf->snap = bs;
                 el.push_back(buf);
@@ -615,9 +567,9 @@ class uCache {
    	u64 totalPhysSize;
   
     // accessory
-   	u64 batch;
+   	u64 evict_batch;
     u64 prefetch_batch;
-    ucache_fs* fs;
+    ufs* fs;
 
    	// accounting
 	  std::atomic<u64> usedPhysSize;
@@ -634,8 +586,7 @@ class uCache {
     void init(u64 physSize, int batch);
    	~uCache();
 
-    void* addVMA(u64 virtSize, u64 pageSize);
-    VMA* getOrCreateVMA(const char* name, u64 pageSize=mmu::page_size);
+    VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size);
     VMA* getVMA(void* addr);
 
     // Functions
@@ -644,7 +595,7 @@ class uCache {
     void readBufferToTmp(Buffer* buf, Buffer* tmp);
     void flushBuffers(std::vector<Buffer*>& toWrite);
 
-    bool checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs);
+    bool checkPipeline(Buffer* buffer, BufferSnapshot* bs);
     
     void handlePageFault(VMA* vma, void* addr, exception_frame *ef); // called from the page fault handler
     void handleFault(VMA* vma, Buffer* buffer, bool newPage=false);
@@ -656,5 +607,7 @@ class uCache {
 extern uCache* uCacheManager;
 
 void createCache(u64 physSize, int batch);
+void initFile(const char* name, size_t size);
 }; // namespace ucache
+
 #endif

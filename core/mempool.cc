@@ -1057,7 +1057,9 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     void* ret;
     size_t requested_size{size};
     size_t offset;
-    if (alignment < page_size) {
+    if (alignment >= 2ul * 1024 * 1024){
+        offset = 0;
+    } else if (alignment < page_size) {
         offset = align_up(sizeof(page_range), alignment);
     } else {
         offset = page_size;
@@ -1308,7 +1310,9 @@ static inline void* std_malloc(size_t size, size_t alignment)
     if (memory::smp_allocator && size <= memory::pool::max_object_size && alignment <= minimum_size) {
         unsigned n = ilog2_roundup(minimum_size);
         ret = memory::malloc_pools[n].alloc();
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
+        if(mmu::get_mem_area(ret) != mmu::mem_area::mempool){
+            ret = translate_mem_area(mmu::get_mem_area(ret), mmu::mem_area::mempool, ret);
+        }
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
     } else if (memory::smp_allocator && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
         unsigned n = ilog2_roundup(alignment);

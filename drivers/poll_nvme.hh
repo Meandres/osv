@@ -888,7 +888,7 @@ unvme_ns_t* unvme_do_open(int nsid, int qcount, int qsize);
 int unvme_do_close(const unvme_ns_t* ns);
 void* unvme_do_alloc(const unvme_ns_t* ns, u64 size);
 int unvme_do_free(const unvme_ns_t* ses, void* buf);
-int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs, bool writing=false);
+int unvme_do_poll(unvme_desc_t* desc, int sec, u32* cqe_cs);
 unvme_desc_t* unvme_do_cmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 unvme_desc_t* unvme_do_rw(const unvme_ns_t* ns, int qid, int opc, void* buff, u64 slba, u32 nlb);
 int unvme_check_completion(const unvme_ns_t* ns, int qid, int timeout=0);
@@ -917,7 +917,7 @@ unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid, const void* buf, u64 slb
 unvme_iod_t unvme_aread(const unvme_ns_t* ns, int qid, void* buf, u64 slba, u32 nlb, bool ring=true);
 unvme_iod_t unvme_acmd(const unvme_ns_t* ns, int qid, int opc, int nsid, void* buf, u64 bufsz, u32 cdw10_15[6]);
 
-int unvme_apoll(unvme_iod_t iod, int timeout, bool writing=false);
+int unvme_apoll(unvme_iod_t iod, int timeout);
 int unvme_apoll_cs(unvme_iod_t iod, int timeout, u32* cqe_cs);
 
 extern nvme_controller_reg_t* globalReg;
@@ -957,6 +957,7 @@ private:
     static int _instance;
     int _id;
     struct ifnet* _ifn;
+    static int __disk_idx;
 
     pci::device& _dev;
 

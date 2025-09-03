@@ -700,6 +700,7 @@ class osv_syms(gdb.Command):
             base = to_int(obj['_base'])
             obj_path = obj['_pathname']['_M_dataplus']['_M_p'].string()
             path = translate(obj_path)
+            print(path)
             if not path:
                 print('ERROR: Unable to locate object file for:', obj_path, hex(base))
             else:
@@ -1234,6 +1235,8 @@ def setup_libstdcxx():
     # But because OSv is statically linked, we miss that auto-loading, so we
     #  need to look for, and run, this script explicitly.
     gcc_python_dirs = glob('/usr/share/gcc-*/python')
+    if len(gcc_python_dirs) == 0:
+        gcc_python_dirs = os.environ.get("GOMP_DIR")
     if len(gcc_python_dirs) == 0: #If the above does not work try different place
         gcc_python_dirs = glob('/usr/share/gcc/python')
     if len(gcc_python_dirs) == 0:

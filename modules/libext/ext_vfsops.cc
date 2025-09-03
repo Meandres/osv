@@ -29,7 +29,7 @@ void free_contiguous_aligned(void* p);
 
 //#define CONF_debug_ext 1
 #if CONF_debug_ext
-#define ext_debug(format,...) kprintf("[ext4] " format, ##__VA_ARGS__)
+#define ext_debug(format,...) printf("[ext4] " format, ##__VA_ARGS__)
 #else
 #define ext_debug(...)
 #endif

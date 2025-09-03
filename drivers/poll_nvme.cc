@@ -70,6 +70,7 @@ static FILE*                log_fp = NULL;  ///< log file pointer
 static int                  log_count = 0;  ///< log open count
 static pthread_mutex_t      log_lock = PTHREAD_MUTEX_INITIALIZER; ///< log lock
 nvme_controller_reg_t* globalReg;
+int nvme::__disk_idx = 0;
 //std::vector<u32> last_cq_doorbelled;
 
 /// IO descriptor debug print
@@ -1436,7 +1437,7 @@ int unvme_do_free(const unvme_ns_t* ns, void* buf)
  * @param   cqe_cs      CQE command specific DW0 returned
  * @return  0 if ok else error status (-1 means timeout).
  */
-int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs, bool writing)
+int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs)
 {
     if (desc->sentinel != desc)
         FATAL("bad IO descriptor");
@@ -1445,6 +1446,7 @@ int unvme_do_poll(unvme_desc_t* desc, int timeout, u32* cqe_cs, bool writing)
     int err = 0;
     int cnt = -desc->cidcount;
     while (desc->cidcount) {
+        bool writing = (desc->opc == NVME_CMD_WRITE);
         if ((err = unvme_check_completion(desc->q, timeout, cqe_cs, writing)) != 0){
             ucache::assert_crash(false);
             break;
@@ -1659,9 +1661,9 @@ unvme_iod_t unvme_awrite(const unvme_ns_t* ns, int qid,
  * @param   timeout     in seconds
  * @return  0 if ok else error status (-1 for timeout).
  */
-int unvme_apoll(unvme_iod_t iod, int timeout, bool writing)
+int unvme_apoll(unvme_iod_t iod, int timeout)
 {
-    return unvme_do_poll((unvme_desc_t*)iod, timeout, NULL, writing);
+    return unvme_do_poll((unvme_desc_t*)iod, timeout, NULL);
 }
 
 /**
@@ -1789,6 +1791,32 @@ static inline double gettime(void) {
   return ((double)now_tv.tv_sec) + ((double)now_tv.tv_usec)/1000000.0;
 }
 
+static int nvme_read(struct device *dev, struct uio *uio, int io_flags){
+    return bdev_read(dev, uio, io_flags);
+}
+
+static int nvme_write(struct device *dev, struct uio *uio, int io_flags){
+    return bdev_write(dev, uio, io_flags);
+}
+
+static int nvme_open(struct device* dev, int io_flags){
+    return 0;
+}
+
+static struct devops nvme_devops {
+    nvme_open,
+    no_close,
+    nvme_read,
+    nvme_write,
+    no_ioctl,
+    no_devctl
+};
+
+struct driver nvme_driver {
+    "nvme",
+    &nvme_devops
+};
+
 nvme::nvme(pci::device &dev)
     : _dev(dev)
 {
@@ -1803,6 +1831,12 @@ nvme::nvme(pci::device &dev)
     while(!ns){ ns = unvme_openq(sched::max_cpus, ucache::maxQueueSize); };
     //printf("model: '%.40s' sn: '%.20s' fr: '%.8s' ", ns->mn, ns->sn, ns->fr);
     //printf("page size = %d, queue count = %d/%d (max queue count), queue size = %d/%d (max queue size), block count = %#lx, block size = %d, max block io = %d\n", ns->pagesize, ns->qcount, ns->maxqcount, ns->qsize, ns->maxqsize, ns->blockcount, ns->blocksize, ns->maxbpio);
+    
+    std::string dev_name("nvme");
+    dev_name += std::to_string(__disk_idx);
+    struct device* osv_dev = device_create(&nvme_driver, dev_name.c_str(), D_BLK);
+    read_partition_table(osv_dev);
+
     printf("model: '%.40s', size : %lu GiB, blockcount: %lu, block size = %d, with %lu queues\n", ns->mn, (ns->blockcount*ns->blocksize)/(1024ull*1024*1024), ns->blockcount, ns->blocksize, ns->qcount);
 }
 
