@@ -46,6 +46,117 @@ void allocate_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->allocate
 uintptr_t reserve_range(const u64 size, size_t alignment){ return mmu::sb_mgr->reserve_range(size); }
 void free_range(const uintptr_t addr, const u64 size){ mmu::sb_mgr->free_range(addr, size); }
 
+
+ucache_fs::ucache_fs(){
+	lb_per_stripe = DEFAULT_LB_PER_STRIPE;
+	scanned_for_files = false;
+}
+
+void ucache_fs::discover_ucache_files(){
+		scanned_for_files = true;
+		std::ifstream files("/nvme_files.txt");
+		assert_crash(files.is_open());
+		std::string name;
+		u64 s_vlba, size, n_lb;
+		std::string initial_text = "Available files on the ssd:\n";
+		bool printed_initial=false;
+		assert_crash(lb_per_stripe != 0);
+		while(files >> name >> s_vlba >> size >> n_lb){
+				if(!printed_initial)
+						std::cout << initial_text;
+				ucache_file* file = new ucache_file(name, s_vlba, n_lb, size);
+				std::cout << name << ": from " << s_vlba << ", size: " << size << std::endl;
+				available_files.push_back(file);
+				printed_initial = true;
+		}
+		if(!printed_initial){
+				printf("No files available on the SSD\n");
+		}
+}
+
+void ucache_fs::add_device(const unvme_ns_t* ns){
+		devices.push_back(ns);
+		last_available_vlba += ns->blockcount;
+}
+
+ucache_file* ucache_fs::find_file(const char* name){
+		if(!scanned_for_files){
+			discover_ucache_files();
+		}
+		for(struct ucache_file* file: available_files){
+				if(strcmp(file->name.c_str(), name) == 0){
+						return file;
+				}
+		}
+		return NULL;
+}
+
+u64 ucache_fs::findSpace(u64 nb_lb){
+		if(available_files.empty()){
+				return 0;
+		}
+		u64 end_previous_file = 0;
+		for(ucache_file* f: available_files){
+				if(f->start_vlba - end_previous_file > nb_lb){
+						return end_previous_file;
+				}
+				end_previous_file = f->start_vlba+f->num_lb;
+		}
+		// couldn't find before any of the files, look after the last one.
+		ucache_file* f = available_files.back();
+		if(last_available_vlba - f->start_vlba+f->num_lb > nb_lb){
+				return f->start_vlba + f->num_lb;
+		}
+		assert_crash(false); // out of space
+		return 0; // unreachable
+}
+
+ucache_file* ucache_fs::create_file(u64 size){
+		u64 num_lb = align_up(size/lb_size, lb_size);
+		u64 start_vlba = findSpace(num_lb);
+		ucache_file* f = new ucache_file("tmp", start_vlba, num_lb, size);
+		return f;
+}
+
+void ucache_fs::computeStorageLocation(StorageLocation& loc, ucache_file* f, void* addr, void* start){
+		u64 v_lba = f->start_vlba + reinterpret_cast<u64>((uintptr_t)addr - (uintptr_t)start)/lb_size;
+		loc.device_id = (v_lba / lb_per_stripe) % devices.size();
+		loc.stripe = v_lba / (devices.size() * lb_per_stripe);
+		loc.offset_in_stripe = v_lba % lb_per_stripe;
+}
+
+void ucache_fs::read(ucache_file* f, void* addr, void* start, u64 size){
+		StorageLocation loc;
+		computeStorageLocation(loc, f, addr, start);
+		int ret = unvme_read(devices[loc.device_id], sched::cpu::current()->id, addr, loc.stripe*lb_per_stripe + loc.offset_in_stripe, size/lb_size);
+		assert_crash(ret == 0);
+}
+
+unvme_iod_t ucache_fs::aread(ucache_file* f, void* addr, void* start, u64 size){
+		StorageLocation loc;
+		computeStorageLocation(loc, f, addr, start);
+		return unvme_aread(devices[loc.device_id], sched::cpu::current()->id, addr, loc.stripe*lb_per_stripe + loc.offset_in_stripe, size/lb_size);
+}
+
+unvme_iod_t ucache_fs::awrite(ucache_file* f, void* addr, void* start, u64 size, bool ring, std::vector<int>& devs){
+		StorageLocation loc;
+		computeStorageLocation(loc, f, addr, start);
+		bool insert = true;
+		for(int i: devs){ if((u64)i==loc.device_id) { insert = false; } }
+		if(insert){	devs.push_back(loc.device_id); }
+		return unvme_awrite(devices[loc.device_id], sched::cpu::current()->id, addr, loc.stripe*lb_per_stripe + loc.offset_in_stripe, size/lb_size, ring);
+}
+
+void ucache_fs::poll(unvme_iod_t iod, bool writing){
+		assert_crash(unvme_apoll(iod, UNVME_SHORT_TIMEOUT, writing) == 0);
+}
+
+void ucache_fs::commit_io(std::vector<int> &devs){
+	for(int i: devs){
+		unvme_ring_sq_doorbell(devices[i], sched::cpu::current()->id);
+	}
+}
+
 /* Walks the page table and allocates pt elements if necessary.
  * Operates in a range between [virt, virt+size-page_size]
  * 
@@ -457,10 +568,11 @@ Buffer* HashTableResidentSet::getEntry(int i){
 
 static u64 nextVMAid = 1; // 0 is reserved for other vmas
 
-VMA::VMA(u64 size, u64 page_size, ResidentSet* set, ufile* f, callbacks implems):
+VMA::VMA(u64 size, u64 page_size, ResidentSet* set, struct ucache_file* f, callbacks implems):
 	size(size), file(f), pageSize(page_size), id(nextVMAid++), residentSet(set)
 {
 	assert_crash(isSupportedPageSize(page_size));
+	assert_crash(page_size <= uCacheManager->fs->lb_per_stripe*uCacheManager->fs->lb_size); // check that one page fits on a single stripe
 	bool huge = page_size == 2ul*1024*1024 ? true : false;
 	start = createVMA(id, size, page_size, false, huge);
 	nbPages = page_size/mmu::page_size;
@@ -478,7 +590,28 @@ VMA::VMA(u64 size, u64 page_size, ResidentSet* set, ufile* f, callbacks implems)
 	callback_implems.evict_pol = implems.evict_pol;
 }
 
-uCache::uCache() : totalPhysSize(0), evict_batch(0), prefetch_batch(0){
+VMA* VMA::newVMA(u64 size, u64 page_size)
+{
+    struct ucache_file* f = uCacheManager->fs->create_file(size);
+		VMA* vma = new VMA(size, page_size, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_callbacks);
+		for(u64 i = 0; i < vma->size / vma->pageSize; i++){
+			vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
+		}
+		return vma;
+}
+
+VMA* VMA::newVMA(const char* name, u64 page_size)
+{
+	assert_crash(name != NULL);
+	struct ucache_file* f = uCacheManager->fs->find_file(name);
+	VMA* vma = new VMA(align_up(f->size, page_size), page_size, new HashTableResidentSet(uCacheManager->totalPhysSize/page_size), f, default_callbacks);
+	for(u64 i = 0; i < vma->size / vma->pageSize; i++){
+		vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
+	}
+	return vma;
+}
+
+uCache::uCache() : totalPhysSize(0), batch(0){
    	usedPhysSize = 0;
    	readSize = 0;
    	writeSize = 0;
@@ -489,31 +622,33 @@ uCache::uCache() : totalPhysSize(0), evict_batch(0), prefetch_batch(0){
 		poll_depth = 0;
 		poll_depth_count = 0;
 
-		fs = new ufs();
+		fs = new ucache_fs();
 }
 
 void uCache::init(u64 physSize, int batch){
 	this->totalPhysSize = physSize;
 	this->prefetch_batch = 32;
-	this->evict_batch = batch;
+	this->batch = batch;
 }
 
 uCache::~uCache(){};
 
-VMA* uCache::mmap(const char* name, u64 pageSize){
-	assert_crash(name != NULL);
+void* uCache::addVMA(u64 virtSize, u64 pageSize){
+    VMA* vma = VMA::newVMA(virtSize, pageSize);
+    vmas.insert({vma->id, vma});
+    cout << "Added a vm_area @ " << vma->start << " of size: " << virtSize/(1024ull*1024*1024) << "GB, with pageSize: " << pageSize << endl;
+		return vma->start;
+}
+
+VMA* uCache::getOrCreateVMA(const char* name, u64 pageSize){
 	VMA* vma;
 	for(auto p: vmas){
 		vma = p.second;
-		if(strcmp(vma->file->name, name) == 0){
+		if(strcmp(vma->file->name.c_str(), name) == 0){
 			return vma;
 		}
 	}
-	ufile* f = fs->open_ufile(name);
-	vma = new VMA(align_up(f->size, pageSize), pageSize, new HashTableResidentSet(uCacheManager->totalPhysSize/pageSize), f, default_callbacks);
-	for(u64 i = 0; i < vma->size / vma->pageSize; i++){
-		vma->buffers.push_back(new Buffer(vma->start+(i*vma->pageSize), vma->pageSize, vma));
-	}
+  vma = VMA::newVMA(name, pageSize);
   vmas.insert({vma->id, vma});
   cout << "Added a vm_area @ " << vma->start << " of size: " << vma->file->size << ", with pageSize: " << vma->pageSize << ", for file: " << name << endl;
 	return vma;
@@ -530,7 +665,7 @@ VMA* uCache::getVMA(void* addr){
 
 #pragma GCC push_options
 #pragma GCC optimize("O0")
-bool uCache::checkPipeline(Buffer* buffer, BufferSnapshot* bs){
+bool uCache::checkPipeline(ucache_fs* fs, Buffer* buffer, BufferSnapshot* bs){
 	if(bs->state == BufferState::Inconsistent){
 		do{
 			buffer->updateSnapshot(bs);
@@ -540,8 +675,7 @@ bool uCache::checkPipeline(Buffer* buffer, BufferSnapshot* bs){
 	}
 	if(bs->state == BufferState::Reading){
 		if(buffer->getPrefetcher()-1 == sched::cpu::current()->id){ // this core started the prefetching
-			buffer->vma->file->poll(buffer->snap->reqs);
-			delete buffer->snap->reqs;
+			fs->poll(buffer->snap->iod, false);
 			delete buffer->snap;
 			buffer->snap = NULL;
 		}else{
@@ -597,7 +731,7 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 	BufferSnapshot bs(vma->nbPages);
 	buffer->updateSnapshot(&bs);
 	phys_addr phys;
-	if(checkPipeline(buffer, &bs)){
+	if(checkPipeline(fs, buffer, &bs)){
 		return;
 	}
 	
@@ -609,7 +743,7 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 		m2 = processor::rdtsc();
 
 	buffer->updateSnapshot(&bs);
-	if(checkPipeline(buffer, &bs)){
+	if(checkPipeline(fs, buffer, &bs)){
 		return;
 	}
 
@@ -671,7 +805,7 @@ void uCache::prefetch(VMA *vma, PrefetchList pl){
 		u64 phys = frames_alloc_phys_addr(vma->pageSize);
 		if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
 			buf->snap = bs;
-			buf->snap->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt - (u64)vma->start, vma->pageSize);
+			buf->snap->iod = fs->aread(vma->file, buf->baseVirt, vma->start, vma->pageSize);
 			readSize += vma->pageSize;
 			usedPhysSize += vma->pageSize;
 			vma->usedPhysSize += vma->pageSize;
@@ -710,11 +844,11 @@ void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
 
 void uCache::evict(){
 		std::vector<Buffer*> toEvict;
-    toEvict.reserve(evict_batch*1.5);
+    toEvict.reserve(batch*1.5);
 
 		// 0. find candidates
 		for(const auto& p: vmas){
-			p.second->chooseEvictionCandidates(evict_batch/vmas.size(), toEvict);
+			p.second->chooseEvictionCandidates(batch/vmas.size(), toEvict);
 		}
 
     // write single pages that are dirty.
@@ -795,14 +929,16 @@ void uCache::ensureFreePages(u64 additionalSize) {
 
 void uCache::readBuffer(Buffer* buf){
 	assert_crash(buf->vma != NULL);
-	buf->vma->file->read(buf->baseVirt, (u64)buf->baseVirt - (u64)buf->vma->start, buf->vma->pageSize);
+	fs->read(buf->vma->file, buf->baseVirt, buf->vma->start, buf->vma->pageSize);
 	readSize += buf->vma->pageSize;
 }
 
 void uCache::flushBuffers(std::vector<Buffer*>& toWrite){
 	std::vector<Buffer*> requests;
+	std::vector<int> devices;
 	u64 sizeWritten = 0;
 	requests.reserve(toWrite.size());
+	devices.reserve(fs->devices.size());
 	bool ring_doorbell = false;
 	if(!batch_io_request)
 		ring_doorbell = true;
@@ -813,23 +949,23 @@ void uCache::flushBuffers(std::vector<Buffer*>& toWrite){
 			assert_crash(buf->setIO());
 			// best case, the last buffer is dirty and we can ring the doorbell directly
 			// note that this is only possible when there is one device, if not then we have to ring each of the doorbells at the end
-			if(i == toWrite.size()-1) { ring_doorbell = true; } 
-			buf->snap->reqs = buf->vma->file->awrite(buf->baseVirt, (u64)buf->baseVirt - (u64)buf->vma->start, buf->vma->pageSize);
-			assert_crash(buf->snap->reqs);
+			if(fs->devices.size() == 1 && i == toWrite.size()-1) { ring_doorbell = true; } 
+			buf->snap->iod = fs->awrite(buf->vma->file, buf->baseVirt, buf->vma->start, buf->vma->pageSize, ring_doorbell, devices);
+			assert_crash(buf->snap->iod);
 			requests.push_back(buf);
 		}
 	}
 	if(!ring_doorbell) // if the last buffer was clean need to manually ring the doorbell
-		requests[0]->vma->file->commit_io();
+		fs->commit_io(devices);
 	for(Buffer *p: requests){
-		p->vma->file->poll(p->snap->reqs);
-		delete p->snap->reqs;
+		fs->poll(p->snap->iod, true);
 		sizeWritten += p->vma->pageSize;
 	}
 	writeSize += sizeWritten;
 }
 
 void createCache(u64 physSize, int batch){
+	ucache_file::next_available_file_id = 0;
 	uCacheManager->init(physSize, batch);
 	default_callbacks.isDirty_implem = pte_isDirty;
 	default_callbacks.clearDirty_implem = pte_clearDirty;
