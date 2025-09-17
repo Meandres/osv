@@ -1317,11 +1317,15 @@ static inline void* std_malloc(size_t size, size_t alignment)
     } else if (memory::smp_allocator && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
         unsigned n = ilog2_roundup(alignment);
         ret = memory::malloc_pools[n].alloc();
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
+        if(mmu::get_mem_area(ret) != mmu::mem_area::mempool){
+            ret = translate_mem_area(mmu::get_mem_area(ret), mmu::mem_area::mempool, ret);
+        }
         trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
     } else if (memory::will_fit_in_early_alloc_page(size,alignment) && !memory::smp_allocator) {
         ret = memory::early_alloc_object(size, alignment);
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool, ret);
+        if(mmu::get_mem_area(ret) != mmu::mem_area::mempool){
+            ret = translate_mem_area(mmu::get_mem_area(ret), mmu::mem_area::mempool, ret);
+        }
     } else if (minimum_size <= memory::page_size && alignment <= memory::page_size && memory::use_linear_map) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page, memory::alloc_page());
         trace_memory_malloc_page(ret, size, memory::page_size, alignment);

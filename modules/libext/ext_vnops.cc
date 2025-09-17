@@ -19,6 +19,7 @@
 //The libext does not implement journal (we can integrate it later and make it optional)
 //nor xattr which is not even supported by OSv VFS layer.
 
+#include <osv/ucache.hh>
 extern "C" {
 #define USE_C_INTERFACE 1
 #include <osv/device.h>
@@ -590,19 +591,30 @@ ext_write(vnode_t *vp, uio_t *uio, int ioflag)
     return ret;
 }
 
-struct ioctl_req{
-    uint64_t l_idx;
-    uint64_t p_idx;
-};
-
 static int
 ext_ioctl(vnode_t *vp, file_t *fp, u_long com, void *data)
 {
-    struct ext4_fs *fs = (struct ext4_fs *)vp->v_mount->m_data;
-    auto_inode_ref ref(fs, vp->v_ino);
-    ioctl_req* req = (ioctl_req*)data;
-    int r = ext4_fs_get_inode_dblk_idx(&ref._ref, req->l_idx, &req->p_idx, true);
-    return r;
+    if(com == req_create_ucache){
+        ucache::ioctl_req_ucache* req = (ucache::ioctl_req_ucache*)data;
+        if(ucache::uCacheManager->totalPhysSize == 0){
+            ucache::createCache(req->physSize, req->batch);
+        }
+        ucache::VMA* vma = ucache::uCacheManager->mmap(req->filename.c_str(), req->virtSize, req->bufsize);
+        req->ret = (void*)vma->start;
+    }
+    if(com == req_close_file){
+        ucache::ioctl_req_ucache* req = (ucache::ioctl_req_ucache*)data;
+        ucache::VMA* vma = ucache::uCacheManager->getVMA(req->ret);
+        close(vma->file->fd);
+    }
+    if(com == req_lba){
+        ucache::ioctl_req_lba* req = (ucache::ioctl_req_lba*)data;
+        struct ext4_fs *fs = (struct ext4_fs *)vp->v_mount->m_data;
+        auto_inode_ref ref(fs, vp->v_ino);
+        int r = ext4_fs_get_inode_dblk_idx(&ref._ref, req->l_idx, &req->p_idx, true);
+        return r;
+    }
+    return 0;
 }
 
 #define ext_fsync     ((vnop_fsync_t)vop_nullop)

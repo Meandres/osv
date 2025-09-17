@@ -32,9 +32,19 @@ const u64 ext4_block_size = 4096;
 const bool ring = true;
 
 
-#define req_inode_ref 0
-#define req_lba 1
-struct ioctl_req{
+#define req_create_ucache 0
+#define req_close_file 1
+#define req_lba 2
+struct ioctl_req_ucache{
+    u64 physSize;
+    u64 batch;
+    std::string filename;
+    u64 virtSize;
+    u64 bufsize;
+    void* ret;
+};
+
+struct ioctl_req_lba{
     u64 l_idx;
     u64 p_idx;
 };
@@ -59,11 +69,12 @@ class ufile {
 
     u64 current_seek_pos;
 
+    ufile(ufs*);
     ufile(const char* name, u64 req_size, ufs* fs);
     void read(void* buf, u64 offset, u64 size);
     void write(void* buf, u64 offset, u64 size);
-    aio_req_t* aread(void* buf, u64 offset, u64 size);
-    aio_req_t* awrite(void* buf, u64 offset, u64 size);
+    aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring);
+    aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring);
     void poll(aio_req_t* reqs);
     //void commit_io();//std::vector<int> &devices); 
 

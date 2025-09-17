@@ -57,7 +57,6 @@
               libselinux.out
               libz
               boost175
-              #glibc.static
               unixODBC
               numactl
               python311Packages.numpy
@@ -74,6 +73,7 @@
               zstd
               zlib
               bzip2
+              curl
               glog
               lz4
             ];
@@ -88,7 +88,8 @@
 
             LD_LIBRARY_PATH = "${pkgs.readline}/lib";
             LUA_LIB_PATH = "${pkgs.lua53Packages.lua}/lib";
-            GOMP_DIR = pkgs.libgcc.lib;
+            GOMP_DIR = pkgs.libgcc.out;
+            STATIC_LIBC= pkgs.glibc.static;
             boost_base = "${pkgs.osv-boost}";
             BOOST_SO_DIR="${pkgs.boost175}/lib";
             OPENSSL_DIR="${pkgs.osv-ssl}";

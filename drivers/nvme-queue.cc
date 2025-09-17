@@ -425,7 +425,6 @@ void io_queue_pair::poll_cq()
             cqe.cid, cqe.sct, cqe.sc, pending_bio,
             pending_bio ? pending_bio->bio_offset>>9 : 0,
             pending_bio ? pending_bio->bio_bcount>>9 : 0);
-        ucache::assert_crash(false);
     } else {
         trace_nvme_req_done_success(_driver_id, _id, cid, pending_bio);
         pending_bio->bio_flags |= BIO_DONE;

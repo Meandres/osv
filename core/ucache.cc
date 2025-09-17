@@ -528,22 +528,13 @@ VMA* uCache::mmap(const char* name, u64 req_size, u64 pageSize){
 }
 
 VMA* uCache::getVMA(void* addr){
-	auto low = vmas.lower_bound((u64)addr);
-	if(low == vmas.end()){ // not found
-		if(!vmas.empty() && vmas.begin()->second->isValidPtr(addr)){ // if there is only one VMA and addr is in it
-			return vmas.begin()->second;
-		}
-		return NULL; // nothing found
-	}
-	if(low->second->isValidPtr(addr)){ // addr is at the start
-		return low->second;
-	}
-	if(low == vmas.begin()){ // the first element does not have a predecessor
+	if(addr == NULL || vmas.empty()){
 		return NULL;
 	}
-	auto prev = std::prev(low);
-	if(prev->second->isValidPtr(addr)){
-		return prev->second;
+	for(auto& p: vmas){
+		if(p.second->isValidPtr(addr)){
+			return p.second;
+		}
 	}
 	return NULL;
 }
@@ -599,12 +590,32 @@ void uCache::handlePageFault(VMA* vma, void* faultingAddr, exception_frame *ef){
 }
 
 u64 *percore_count = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict_count = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_init = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_evict = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict_choose = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict_write = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict_tlb = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+u64 *percore_evict_unmap = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_alloc = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_map = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_read = (u64*)calloc(sched::cpus.size(), sizeof(u64));
 u64 *percore_end = (u64*)calloc(sched::cpus.size(), sizeof(u64));
+
+void reset_stats(int i){
+	percore_count[i] = 0;
+	percore_evict_count[i] = 0;
+	percore_init[i] = 0;
+	percore_evict[i] = 0;
+	percore_evict_choose[i] = 0;
+	percore_evict_write[i] = 0;
+	percore_evict_tlb[i] = 0;
+	percore_evict_unmap[i] = 0;
+	percore_alloc[i] = 0;
+	percore_map[i] = 0;
+	percore_read[i] = 0;
+	percore_end[i] = 0;
+}
 
 void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 	u64 start=0,m1=0,m2=0,m3=0,m4=0,m5=0,end=0;
@@ -665,7 +676,7 @@ void uCache::handleFault(VMA* vma, Buffer* buffer, bool newPage){
 
 void print_stats(){
 	if(debug){
-		u64 init=0, evict=0, alloc=0, map=0, read=0, end=0, count=0;
+		u64 init=0, evict=0, evict_choose=0, evict_write=0, evict_tlb=0, evict_unmap=0, alloc=0, map=0, read=0, end=0, evict_count=0, count=0;
 		for(u64 i=0; i<sched::cpus.size(); i++){
 			init += percore_init[i];
 			evict += percore_evict[i];
@@ -673,9 +684,17 @@ void print_stats(){
 			map += percore_map[i];
 			read += percore_read[i];
 			end += percore_end[i];
-			count += percore_count[i];	
+			count += percore_count[i];
+			evict_choose += percore_evict_choose[i];
+			evict_write += percore_evict_write[i];
+			evict_tlb += percore_evict_tlb[i];
+			evict_unmap += percore_evict_unmap[i];
+			evict_count += percore_evict_count[i];
 		}
-		printf("%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu\n", init/(count+0.0), evict/(count+0.0), alloc/(count+0.0), map/(count+0.0), read/(count+0.0), end/(count+0.0), count);
+		printf("init: %.2f\nevict: %.2f\nevict_choose: %.2f\nevict_write: %.2f\nevict_tlb: %.2f\nevict_unmap: %.2f\nalloc: %.2f\nmap: %.2f\nread: %.2f\nend: %.2f\ncount: %lu\nevict_count: %lu\n", init/(count+0.0), evict/(count+0.0), evict_choose/(evict_count+0.0), evict_write/(evict_count+0.0), evict_tlb/(evict_count+0.0), evict_unmap/(evict_count+0.0), alloc/(count+0.0), map/(count+0.0), read/(count+0.0), end/(count+0.0), count, evict_count);
+		u64 total = init + evict + alloc + map + read + end;
+		printf("Ratio io: %.2f\n", (read+evict_write)/(total+0.0));
+		printf("Ratio tlb: %.4f\n", (evict_tlb)/(total+0.0));
 	}
 }
 
@@ -687,7 +706,7 @@ void uCache::prefetch(VMA *vma, PrefetchList pl){
 		u64 phys = frames_alloc_phys_addr(vma->pageSize);
 		if(buf->UncachedToPrefetching(phys, bs)){ // this can fail if another thread already resolved the prefetched buffer concurrently
 			buf->snap = bs;
-			buf->snap->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt-(u64)vma->start, vma->pageSize);
+			buf->snap->reqs = vma->file->aread(buf->baseVirt, (u64)buf->baseVirt-(u64)vma->start, vma->pageSize, false);
 			readSize += vma->pageSize;
 			usedPhysSize += vma->pageSize;
 			vma->usedPhysSize += vma->pageSize;
@@ -701,7 +720,7 @@ void uCache::prefetch(VMA *vma, PrefetchList pl){
 }
 
 void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
-    while (el.size() < nbToEvict) {
+    while (el.size() < nbToEvict && nbToEvict*vma->pageSize < vma->usedPhysSize) {
 			u64 stillToFind = nbToEvict - el.size();
 			u64 initial = vma->residentSet->getNextBatch(stillToFind);
 			for(u64 i = 0; i<stillToFind; i++){
@@ -724,17 +743,50 @@ void default_transparent_eviction(VMA* vma, u64 nbToEvict, EvictList el){
   	}
 }
 
+/*static const int nbCandidates = 5;
+void uCache::getVMACandidates(std::vector<VMACandidate*> *vmaCandidates){
+    std::priority_queue<RegionWithSize, std::vector<RegionWithSize>, decltype(comp)> pq(comp);
+	for(const VMA* c: vmas){
+			vmaCandidates[size] = new VMACandidate(c, evict_batch/nbCandidates);
+				size++;
+			}else{
+				int i = nbCandidates-1;
+				while(vma->usedPhysSize > vmaCandidates[i] && i >= 0){
+						
+				}
+			}
+		}
+	}
+}
+*/
+
 void uCache::evict(){
+		u64 start=0,m1=0,m2=0,m3=0,end=0;
 		std::vector<Buffer*> toEvict;
     toEvict.reserve(evict_batch*1.5);
 
+		if(debug)
+			start = processor::rdtsc();
 		// 0. find candidates
+		VMA* candidate_vma = vmas.begin()->second;
 		for(const auto& p: vmas){
-			p.second->chooseEvictionCandidates(evict_batch/vmas.size(), toEvict);
+			if(candidate_vma->usedPhysSize.load() < p.second->usedPhysSize.load()){
+				candidate_vma = p.second;
+			}
 		}
+		if(candidate_vma->usedPhysSize/candidate_vma->pageSize <= evict_batch){
+			printf("vma: %p, %lu\n", candidate_vma, candidate_vma->usedPhysSize.load());
+		}
+		assert_crash(candidate_vma->usedPhysSize/candidate_vma->pageSize > evict_batch);
+		candidate_vma->chooseEvictionCandidates(evict_batch, toEvict);
+		if(debug)
+			m1 = processor::rdtsc();
 
     // write single pages that are dirty.
     flushBuffers(toEvict);
+	
+		if(debug)
+			m2 = processor::rdtsc();
     
     // checking if the page have been remapped only improve performance
     // we need to settle on which pages to flush from the TLB at some point anyway
@@ -763,6 +815,9 @@ void uCache::evict(){
         mmu::flush_tlb_all();
     }
 		tlbFlush++;
+	
+		if(debug)
+			m3 = processor::rdtsc();
 
     u64 actuallyEvictedSize = 0;
 		std::map<VMA*, u64> evictedSizePerVMA;
@@ -801,7 +856,14 @@ void uCache::evict(){
 			vma->usedPhysSize -= p.second; 
 		}
     usedPhysSize -= actuallyEvictedSize;
-		//printf("evicted: %lu\n", actuallyEvictedSize/mmu::page_size);
+		if(debug){
+			end = processor::rdtsc();
+			percore_evict_choose[sched::cpu::current()->id] += (m1 - start);
+			percore_evict_write[sched::cpu::current()->id] += (m2 - m1);
+			percore_evict_tlb[sched::cpu::current()->id] += (m3 - m2);
+			percore_evict_unmap[sched::cpu::current()->id] += (end - m3);
+			percore_evict_count[sched::cpu::current()->id]++;
+		}
 }
 
 void uCache::ensureFreePages(u64 additionalSize) {
@@ -831,7 +893,7 @@ void uCache::flushBuffers(std::vector<Buffer*>& toWrite){
 			// best case, the last buffer is dirty and we can ring the doorbell directly
 			// note that this is only possible when there is one device, if not then we have to ring each of the doorbells at the end
 			//if(i == toWrite.size()-1) { ring_doorbell = true; } 
-			buf->snap->reqs = buf->vma->file->awrite(buf->baseVirt, (u64)buf->baseVirt - (u64)buf->vma->start, buf->vma->pageSize);
+			buf->snap->reqs = buf->vma->file->awrite(buf->baseVirt, (u64)buf->baseVirt - (u64)buf->vma->start, buf->vma->pageSize, false);
 			assert_crash(buf->snap->reqs);
 			requests.push_back(buf);
 		}

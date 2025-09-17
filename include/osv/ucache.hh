@@ -30,7 +30,8 @@ namespace ucache {
 
 inline const u64 DEFAULT_LB_PER_STRIPE = 256;
 
-const bool debug = false;
+const bool debug = true;
+void reset_stats(int i);
 const bool batch_io_request = true;
 void print_stats();
 
@@ -506,6 +507,14 @@ class VMA {
     }
 };
 
+struct VMACandidate {
+    VMA* vma;
+    u64 nbToEvict;
+
+    VMACandidate(VMA* c, u64 nb): vma(c), nbToEvict(nb) {}
+    ~VMACandidate(){}
+};
+
 inline bool pte_isDirty(Buffer* buf){
 	int dirty = 0;
 	for(size_t i=0; i<buf->vma->nbPages; i++){
@@ -601,6 +610,7 @@ class uCache {
     void handleFault(VMA* vma, Buffer* buffer, bool newPage=false);
     void prefetch(VMA* vma, PrefetchList pl);
    	void evict();
+		void getVMACandidates(std::vector<VMACandidate*> *vmaCandidates);
 
 };
 

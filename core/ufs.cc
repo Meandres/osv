@@ -48,28 +48,33 @@ ufile* ufs::open_ufile(const char* name, u64 req_size){
     return nuf;
 }
 
-ufile::ufile(const char* n, u64 req_size, ufs* filesys){
-    fs = filesys;
-    current_seek_pos = 0;
+ufile::ufile(ufs* filesys): fs(filesys), current_seek_pos(0)
+{
+}
+
+ufile::ufile(const char* n, u64 req_size, ufs* filesys): ufile(filesys){
     name = (char*)malloc((strlen(n)+1)*sizeof(char));
     strcpy(name, n);
-    //this->size = req_size;
     fd = open(name, O_RDWR);
     if(fd < 0){
         perror("Error");
     }
-    assert_crash(fd > 0);
+    assert_crash(fd >= 0);
     struct file* fp;
     fget(fd, &fp);
     assert_crash(fp != NULL);
     struct stat stats;
     fp->stat(&stats);
     assert_crash(req_size <= (u64)stats.st_size);
-    this->size = req_size;
+    if(req_size == 0){
+        this->size = (u64)stats.st_size;
+    }else{
+        this->size = req_size;
+    }
     u64 nb_blocks = (size/ext4_block_size)+1;
     this->lbas.reserve(nb_blocks);
     for(u64 i=0; i<nb_blocks; i++){
-        ioctl_req req;
+        ioctl_req_lba req;
         req.l_idx = i;
         req.p_idx = ~0ul;
         int ret = fp->ioctl(req_lba, &req);
@@ -132,11 +137,11 @@ void ufile::write(void* addr, u64 offset, u64 r_size){
     poll_reqs(reqs);
 }
 
-aio_req_t* ufile::aread(void* addr, u64 offset, u64 r_size){
+aio_req_t* ufile::aread(void* addr, u64 offset, u64 r_size, bool ring){
     return async_io(BIO_READ, addr, offset, r_size);
 }
 
-aio_req_t* ufile::awrite(void* addr, u64 offset, u64 r_size){
+aio_req_t* ufile::awrite(void* addr, u64 offset, u64 r_size, bool ring){
     return async_io(BIO_WRITE, addr, offset, r_size);
 }
 
