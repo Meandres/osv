@@ -76,6 +76,7 @@
               curl
               glog
               lz4
+              openssl
             ];
 
             buildInputs = with pkgs; [

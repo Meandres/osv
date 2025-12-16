@@ -605,7 +605,7 @@ ext_ioctl(vnode_t *vp, file_t *fp, u_long com, void *data)
     if(com == req_close_file){
         ucache::ioctl_req_ucache* req = (ucache::ioctl_req_ucache*)data;
         ucache::VMA* vma = ucache::uCacheManager->getVMA(req->ret);
-        close(vma->file->fd);
+        vma->file->close();
     }
     if(com == req_lba){
         ucache::ioctl_req_lba* req = (ucache::ioctl_req_lba*)data;
