@@ -30,7 +30,7 @@ namespace ucache {
 
   inline const u64 DEFAULT_LB_PER_STRIPE = 256;
 
-  const bool debug = true;
+  const bool debug = false;
   void reset_stats(int i);
   const bool batch_io_request = true;
   void print_stats();
