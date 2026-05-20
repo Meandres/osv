@@ -18,61 +18,6 @@ run:
     cd {{osv_dir}}
     ./scripts/run.py -k -i build/last/loader.img --pass-pci "0000:{{ssd_id}}"
 
-# ── NVMe setup ────────────────────────────────────────────────────────────────
-
-# Format the NVMe SSD (ssd_id) as ext4, copy TPC-H Parquet files, then bind
-# it to vfio-pci ready for PCI passthrough. WARNING: destroys all data on the SSD.
-# Requires: driverctl, sudo.
-setup-nvme-ssd tpch="tpch10" confirm="yes":
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    src="/scratch/ilya/{{tpch}}"
-
-    if [[ ! -d "${src}" ]]; then
-        echo "Error: source directory '${src}' not found" >&2; exit 1
-    fi
-    if [[ ! -d "/sys/bus/pci/devices/0000:{{ssd_id}}" ]]; then
-        echo "Error: PCI device '0000:{{ssd_id}}' not found" >&2; exit 1
-    fi
-
-    if [[ "{{confirm}}" == "yes" ]]; then
-        read -p "WARNING: ALL DATA ON 0000:{{ssd_id}} WILL BE DESTROYED. Continue? (y/N) " -n 1 -r
-        echo
-        [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-    fi
-
-    # Ensure the device is bound to the nvme driver so we can reach the block device.
-    current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
-    if [[ "${current_driver}" != "nvme" ]]; then
-        echo "==> Binding 0000:{{ssd_id}} to nvme driver ..."
-        sudo driverctl set-override "0000:{{ssd_id}}" nvme
-        sleep 1
-    fi
-
-    nvme_dev="/dev/$(ls /sys/bus/pci/devices/0000:{{ssd_id}}/nvme)n1"
-    echo "==> Block device: ${nvme_dev}"
-
-    echo "==> Formatting ${nvme_dev} as ext4 ..."
-    sudo mke2fs -F -t ext4 -O ^metadata_csum "${nvme_dev}"
-
-    mnt=$(mktemp -d)
-    cleanup() { sudo umount "${mnt}" 2>/dev/null || true; rmdir "${mnt}" 2>/dev/null || true; }
-    trap cleanup EXIT
-
-    echo "==> Copying Parquet files from ${src} ..."
-    sudo mount "${nvme_dev}" "${mnt}"
-    sudo mkdir -p "${mnt}/tpch"
-    sudo cp -v "${src}"/*.parquet "${mnt}/tpch/"
-    sudo umount "${mnt}"
-    rmdir "${mnt}"
-    trap - EXIT
-
-    echo "==> Binding 0000:{{ssd_id}} to vfio-pci ..."
-    sudo driverctl set-override "0000:{{ssd_id}}" vfio-pci
-
-    echo "Done. Run with: just run"
-
 # ── DuckDB TPC-H runner ───────────────────────────────────────────────────────
 
 # Run the DuckDB TPC-H benchmark on OSv with the NVMe SSD (ssd_id).
@@ -118,79 +63,6 @@ run-duckdb query="1" repeat="1" mem="8G" vcpus="4" cache="" duckdb="" evict_batc
         -m "{{mem}}" -c "{{vcpus}}" \
         -e "${osv_env}" \
         --pass-pci "0000:{{ssd_id}}"
-
-# Run the DuckDB TPC-H benchmark directly on Linux (no VM).
-# Ensures the SSD is bound to the nvme kernel driver and mounted at /nvme,
-# then launches benchmarks/duckdb/duckdb_bench with the same env-var knobs
-# as run-duckdb (OSv).
-#
-# Results without prefetching
-# === TPC-H Q01 x3 ===
-# Added a vm_area @ 0x2000ac1d9000 of size: 69053081120, with pageSize: 4096, for file: /nvme/tpch/lineitem.parquet
-#   [run 1] rows=4  time=35234.1 ms
-# readSize: 16128188416
-#   [run 2] rows=4  time=62922.7 ms
-# readSize: 15073402880
-#   [run 3] rows=4  time=74899.7 ms
-# readSize: 16123678720
-# Examples:
-#   just run-duckdb-linux query=1
-#   just run-duckdb-linux query=6 repeat=3 file_cache=4G threads=8
-#   just run-duckdb-linux query=all duckdb=20G file_cache=8G threads=32
-#
-# threads    — total thread count including the main thread (default: nproc)
-#              DuckDB worker threads = threads-1, main thread pinned to CPU threads-1
-# duckdb     — DuckDB buffer pool limit; K/M/G suffix accepted (default: 40% of RAM)
-# file_cache — DuckDB CachingFileSystem cap; K/M/G suffix (default: enabled, no cap)
-#              pass 0 or "off" to disable
-run-duckdb-linux query="1" repeat="1" threads="" file_cache="" duckdb="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    bench_bin="{{osv_dir}}/benchmarks/duckdb/duckdb_bench"
-    if [ ! -x "${bench_bin}" ]; then
-        echo "Error: ${bench_bin} not found — run 'make linux' in benchmarks/duckdb/ first" >&2
-        exit 1
-    fi
-
-    # Ensure the SSD is bound to the nvme kernel driver.
-    current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
-    if [ "${current_driver}" != "nvme" ]; then
-        echo "==> Binding 0000:{{ssd_id}} to nvme driver ..."
-        sudo driverctl set-override "0000:{{ssd_id}}" nvme
-        sleep 1
-    fi
-
-    # Discover the block device exposed by the NVMe controller.
-    nvme_dev="/dev/$(ls /sys/bus/pci/devices/0000:{{ssd_id}}/nvme)n1"
-    echo "==> NVMe block device: ${nvme_dev}"
-
-    # Mount at /nvme if not already mounted.
-    if ! mountpoint -q /nvme; then
-        sudo mkdir -p /nvme
-        sudo mount -o ro "${nvme_dev}" /nvme
-        echo "==> Mounted ${nvme_dev} at /nvme (read-only)"
-    else
-        echo "==> /nvme already mounted"
-    fi
-
-    # Build the env for duckdb_bench.
-    export TPCH_QUERY="{{query}}"
-    export TPCH_REPEAT="{{repeat}}"
-    if [ -n "{{duckdb}}" ]; then
-        export DUCKDB_MEM="{{duckdb}}"
-    fi
-    if [ -n "{{file_cache}}" ]; then
-        export DUCKDB_FILE_CACHE="{{file_cache}}"
-    fi
-
-    nthreads="{{threads}}"
-    if [ -z "${nthreads}" ]; then
-        nthreads="$(nproc)"
-    fi
-
-    echo "==> Running DuckDB TPC-H (TPCH_QUERY={{query}} TPCH_REPEAT={{repeat}} threads=${nthreads})"
-    taskset -c 0-63 "${bench_bin}" "${nthreads}"
 
 # Build DuckDB as a static archive with LTO, then link it into the kernel.
 #
@@ -272,68 +144,121 @@ bind-ssd-nvme:
         sudo driverctl set-override 0000:{{ssd_id}} nvme
     fi
 
-reset_fs confirm="yes":
+# Run the DuckDB TPC-H benchmark directly on Linux (no VM).
+# Ensures the SSD is bound to the nvme kernel driver and mounted at /nvme,
+# then launches benchmarks/duckdb/duckdb_bench with the same env-var knobs
+# as run-duckdb (OSv).
+#
+# Examples:
+#   just run-duckdb-linux query=1
+#   just run-duckdb-linux query=6 repeat=3 file_cache=4G threads=8
+#   just run-duckdb-linux query=all duckdb=20G file_cache=8G threads=32
+#
+# threads    — total thread count including the main thread (default: nproc)
+#              DuckDB worker threads = threads-1, main thread pinned to CPU threads-1
+# duckdb     — DuckDB buffer pool limit; K/M/G suffix accepted (default: 40% of RAM)
+# file_cache — DuckDB CachingFileSystem cap; K/M/G suffix (default: enabled, no cap)
+#              pass 0 or "off" to disable
+run-duckdb-linux query="1" repeat="1" threads="" file_cache="" duckdb="":
     #!/usr/bin/env bash
-    current_driver=$(sudo driverctl list-devices | grep {{ssd_id}} | awk '{print $2 }')
-    if [ "$current_driver" != "nvme" ]
-    then
-        sudo driverctl set-override 0000:{{ssd_id}} nvme
-    fi
-    nvme_path="/dev/$(ls /sys/bus/pci/devices/0000\:{{ssd_id}}/nvme)n1"
-    echo "$nvme_path"
-    if [ "{{confirm}}" == "yes" ]
-    then
-      read -p "This will overwrite SSD {{ssd_id}} (Host block device path: $nvme_path). Are you sure you want to continue? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      echo "Cancelling"
-      exit 1
-    fi
-    fi
-    sudo mke2fs -F -t ext4 -O ^metadata_csum ${nvme_path}
-    tmpdir=$(mktemp -d)
-    sudo mount ${nvme_path} $tmpdir
-    sudo touch $tmpdir/cache
-    sudo fallocate -z -l 1500G $tmpdir/cache
-    sudo dd if=/dev/zero of=$tmpdir/cache bs=1M count=1331200 oflag=nonblock,direct status=progress
-    sudo umount $tmpdir
-    sudo driverctl set-override 0000:{{ssd_id}} vfio-pci
+    set -euo pipefail
 
-check_downgraded_link:
-    #!/usr/bin/env bash
-    output=$(cat /sys/bus/pci/devices/0000\:{{ssd_id}}/current_link_speed | cut -d' ' -f1)
-    if [[ "$output" == "2.5" ]]; then
-      # Taken from https://alexforencich.com/wiki/en/pcie/set-speed
-      dev="{{ssd_id}}"
-      speed="32"
-      if [ ! -e "/sys/bus/pci/devices/$dev" ]; then
-        dev="0000:$dev"
-      fi
-      if [ ! -e "/sys/bus/pci/devices/$dev" ]; then
-        echo "Error: device $dev not found"
+    bench_bin="{{osv_dir}}/benchmarks/duckdb/duckdb_bench"
+    if [ ! -x "${bench_bin}" ]; then
+        echo "Error: ${bench_bin} not found — run 'make linux' in benchmarks/duckdb/ first" >&2
         exit 1
-      fi
-      pciec=$(sudo setpci -s $dev CAP_EXP+02.W)
-      pt=$((("0x$pciec" & 0xF0) >> 4))
-      port=$(basename $(dirname $(readlink "/sys/bus/pci/devices/$dev")))
-      if (($pt == 0)) || (($pt == 1)) || (($pt == 5)); then
-        dev=$port
-      fi
-      lc=$(sudo setpci -s $dev CAP_EXP+0c.L)
-      ls=$(sudo setpci -s $dev CAP_EXP+12.W)
-      max_speed=$(("0x$lc" & 0xF))
-      if [ -z "$speed" ]; then
-        speed=$max_speed
-      fi
-      if (($speed > $max_speed)); then
-        speed=$max_speed
-      fi
-      lc2=$(sudo setpci -s $dev CAP_EXP+30.L)
-      lc2n=$(printf "%08x" $((("0x$lc2" & 0xFFFFFFF0) | $speed)))
-      sudo setpci -s $dev CAP_EXP+30.L=$lc2n
-      lc=$(sudo setpci -s $dev CAP_EXP+10.L)
-      lcn=$(printf "%08x" $(("0x$lc" | 0x20)))
-      sudo setpci -s $dev CAP_EXP+10.L=$lcn
-      sleep 0.1
-      ls=$(sudo setpci -s $dev CAP_EXP+12.W)
     fi
+
+    # Ensure the SSD is bound to the nvme kernel driver.
+    current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
+    if [ "${current_driver}" != "nvme" ]; then
+        echo "==> Binding 0000:{{ssd_id}} to nvme driver ..."
+        sudo driverctl set-override "0000:{{ssd_id}}" nvme
+        sleep 1
+    fi
+
+    # Discover the block device exposed by the NVMe controller.
+    nvme_dev="/dev/$(ls /sys/bus/pci/devices/0000:{{ssd_id}}/nvme)n1"
+    echo "==> NVMe block device: ${nvme_dev}"
+
+    # Mount at /nvme if not already mounted.
+    if ! mountpoint -q /nvme; then
+        sudo mkdir -p /nvme
+        sudo mount -o ro "${nvme_dev}" /nvme
+        echo "==> Mounted ${nvme_dev} at /nvme (read-only)"
+    else
+        echo "==> /nvme already mounted"
+    fi
+
+    # Build the env for duckdb_bench.
+    export TPCH_QUERY="{{query}}"
+    export TPCH_REPEAT="{{repeat}}"
+    if [ -n "{{duckdb}}" ]; then
+        export DUCKDB_MEM="{{duckdb}}"
+    fi
+    if [ -n "{{file_cache}}" ]; then
+        export DUCKDB_FILE_CACHE="{{file_cache}}"
+    fi
+
+    nthreads="{{threads}}"
+    if [ -z "${nthreads}" ]; then
+        nthreads="$(nproc)"
+    fi
+
+    echo "==> Running DuckDB TPC-H (TPCH_QUERY={{query}} TPCH_REPEAT={{repeat}} threads=${nthreads})"
+    taskset -c 0-63 "${bench_bin}" "${nthreads}"
+
+# ── NVMe setup ────────────────────────────────────────────────────────────────
+
+# Format the NVMe SSD (ssd_id) as ext4, copy TPC-H Parquet files, then bind
+# it to vfio-pci ready for PCI passthrough. WARNING: destroys all data on the SSD.
+# Requires: driverctl, sudo.
+setup-nvme-ssd tpch="tpch10" confirm="yes":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src="/scratch/ilya/{{tpch}}"
+
+    if [[ ! -d "${src}" ]]; then
+        echo "Error: source directory '${src}' not found" >&2; exit 1
+    fi
+    if [[ ! -d "/sys/bus/pci/devices/0000:{{ssd_id}}" ]]; then
+        echo "Error: PCI device '0000:{{ssd_id}}' not found" >&2; exit 1
+    fi
+
+    if [[ "{{confirm}}" == "yes" ]]; then
+        read -p "WARNING: ALL DATA ON 0000:{{ssd_id}} WILL BE DESTROYED. Continue? (y/N) " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+    fi
+
+    # Ensure the device is bound to the nvme driver so we can reach the block device.
+    current_driver=$(sudo driverctl list-devices | grep "{{ssd_id}}" | awk '{print $2}')
+    if [[ "${current_driver}" != "nvme" ]]; then
+        echo "==> Binding 0000:{{ssd_id}} to nvme driver ..."
+        sudo driverctl set-override "0000:{{ssd_id}}" nvme
+        sleep 1
+    fi
+
+    nvme_dev="/dev/$(ls /sys/bus/pci/devices/0000:{{ssd_id}}/nvme)n1"
+    echo "==> Block device: ${nvme_dev}"
+
+    echo "==> Formatting ${nvme_dev} as ext4 ..."
+    sudo mke2fs -F -t ext4 -O ^metadata_csum "${nvme_dev}"
+
+    mnt=$(mktemp -d)
+    cleanup() { sudo umount "${mnt}" 2>/dev/null || true; rmdir "${mnt}" 2>/dev/null || true; }
+    trap cleanup EXIT
+
+    echo "==> Copying Parquet files from ${src} ..."
+    sudo mount "${nvme_dev}" "${mnt}"
+    sudo mkdir -p "${mnt}/tpch"
+    sudo cp -v "${src}"/*.parquet "${mnt}/tpch/"
+    sudo umount "${mnt}"
+    rmdir "${mnt}"
+    trap - EXIT
+
+    echo "==> Binding 0000:{{ssd_id}} to vfio-pci ..."
+    sudo driverctl set-override "0000:{{ssd_id}}" vfio-pci
+
+    echo "Done. Run with: just run"
