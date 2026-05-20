@@ -498,12 +498,16 @@ int driver::make_async_request(struct bio* bio, u32 nsid){
 
 void driver::poll_req(struct bio* bio, u32 nsid){
     unsigned int qidx = sched::current_cpu->id % _io_queues.size();
-    while((bio->bio_flags & BIO_DONE) == 0 && (bio->bio_flags & BIO_ERROR) == 0){
-        _io_queues[qidx]->poll_cq();
+    if(sched::current_cpu->id + 1 != _io_queues[qidx]->_id){
+        printf("Current CPU id %d does not match queue id %d (qidx: %d)\n", sched::current_cpu->id+1, _io_queues[qidx]->_id, qidx);
     }
-    if((bio->bio_flags & BIO_ERROR) == 1){
-        printf("io error\n");
-    }
+    assert(sched::current_cpu->id + 1 == _io_queues[qidx]->_id);
+    _io_queues[qidx]->drain_until(bio);
+}
+
+void driver::poll_req_on_queue(struct bio* bio, int cpu_id){
+    unsigned int qidx = (unsigned)cpu_id % _io_queues.size();
+    _io_queues[qidx]->drain_until(bio);
 }
 
 void driver::register_admin_interrupt()

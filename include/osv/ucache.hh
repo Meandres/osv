@@ -94,6 +94,18 @@ namespace ucache {
   /// Get total amount of physical memory
   u64 stat_total_phys_mem();
 
+  /// Reserve physSize bytes from the global llfree into a private pool used
+  /// exclusively by frames_alloc_phys_addr / frames_free_phys_addr.
+  /// Must be called once at the start of createCache().
+  void ucache_frames_init(u64 physSize);
+
+  /// Returns number of 2 MiB blocks in global llfree where all 512 pages are free
+  /// (these are the only blocks alloc_huge_page can use; 0 → next call OOMs).
+  size_t stat_free_huge_blocks();
+
+  /// Prints per-tree-kind breakdown of global llfree free memory.
+  void print_llfree_stats();
+
   struct pt_elem {
     union {
       u64 word;
@@ -275,7 +287,7 @@ namespace ucache {
     std::atomic<u64>* pteRefs;
     void* baseVirt;
     VMA* vma;
-    BufferSnapshot *snap; // only used during eviction to avoid passing std::pair around
+    std::atomic<BufferSnapshot*> snap{nullptr};
 
     Buffer(void* addr, u64 size, VMA* vma);
     ~Buffer(){}
@@ -337,7 +349,7 @@ namespace ucache {
         return 3;
       case 65536:
         return 4;
-      case 20971252:
+      case 2097152:
         return 9;
       default:
         return -1;
@@ -489,18 +501,18 @@ namespace ucache {
         }
         if(residentSet->remove(buf)){
           if(buf->CachedToEvicting(bs)){
-            if(bs->ptes[0].present == 0 && buf->snap != NULL){ // misprediction where the IO bit was cleared when polling for another request
-              delete buf->snap;
-              buf->snap = NULL;
+            if(bs->ptes[0].present == 0 && buf->snap.load(std::memory_order_relaxed) != nullptr){ // misprediction where the IO bit was cleared when polling for another request
+              delete buf->snap.load(std::memory_order_relaxed);
+              buf->snap.store(nullptr, std::memory_order_relaxed);
             }
             assert_crash(bs->state == BufferState::Evicting);
-            assert_crash(buf->snap == NULL);
-            buf->snap = bs;
+            assert_crash(buf->snap.load(std::memory_order_relaxed) == nullptr);
+            buf->snap.store(bs, std::memory_order_relaxed);
             el.push_back(buf);
             return true;
           }else{
             assert(residentSet->insert(buf));
-            assert_crash(buf->snap == NULL);
+            assert_crash(buf->snap.load(std::memory_order_relaxed) == nullptr);
           }
         }
         return false;
@@ -517,16 +529,18 @@ namespace ucache {
 
   inline bool pte_isDirty(Buffer* buf){
     int dirty = 0;
+    auto* s = buf->snap.load(std::memory_order_relaxed);
     for(size_t i=0; i<buf->vma->nbPages; i++){
-      dirty += buf->snap->ptes[i].dirty;
+      dirty += s->ptes[i].dirty;
     }
     return dirty > 0;
   }
 
   inline bool pte_isAccessed(Buffer* buf){
     int accessed = 0;
+    auto* s = buf->snap.load(std::memory_order_relaxed);
     for(size_t i=0; i<buf->vma->nbPages; i++){
-      accessed += buf->snap->ptes[i].accessed;
+      accessed += s->ptes[i].accessed;
     }
     return accessed > 0;
   }
@@ -536,14 +550,15 @@ namespace ucache {
   }
 
   inline void pte_clearDirty(Buffer* buf){
-    if(buf->snap == NULL){
+    if(buf->snap.load(std::memory_order_relaxed) == nullptr){
       printf("shouldn't happen\n");
       BufferSnapshot* bs = new BufferSnapshot(buf->vma->nbPages);
       buf->updateSnapshot(bs);
-      buf->snap = bs;
+      buf->snap.store(bs, std::memory_order_relaxed);
     }
-    for(size_t i = 0; i < buf->vma->nbPages; i++){ // just try to 
-      PTE pte = buf->snap->ptes[i];
+    auto* s = buf->snap.load(std::memory_order_relaxed);
+    for(size_t i = 0; i < buf->vma->nbPages; i++){ // just try to
+      PTE pte = s->ptes[i];
       if(pte.dirty == 0){ // simply skip
         continue;
       }
@@ -568,17 +583,37 @@ namespace ucache {
   }
 
   void default_transparent_eviction(VMA*, u64, EvictList);
+  // Global eviction policy: scans across all VMAs via a single shared
+  // HashTableResidentSet.  Replaces default_transparent_eviction as the
+  // default evict_pol.  vma is ignored; pass nullptr.
+  void global_default_transparent_eviction(VMA*, u64, EvictList);
 
-  class uCache {	
+  class uCache {
     public:
       // core
       std::map<u64, VMA*> vmas;
       u64 totalPhysSize;
 
+      // Single shared ResidentSet that spans all VMAs using the default
+      // eviction policy.  Enables eviction across the entire buffer pool
+      // instead of being limited to the most-loaded single VMA.
+      // Initialised by init(); owned by uCache.
+      // VMAs with a custom evict_pol may use their own per-VMA ResidentSet
+      // instead (set vma->residentSet after VMA creation).
+      HashTableResidentSet* globalResidentSet = nullptr;
+
       // accessory
       u64 evict_batch;
       u64 prefetch_batch;
       ufs* fs;
+
+      // Per-CPU in-flight prefetch counter.
+      // per_cpu_inflight_count[cpu_id] counts buffers whose async IO was started
+      // by that CPU and not yet completed (ReadyToInsertToCached).  Incremented
+      // by the owning CPU in prefetch(); decremented using getPrefetcher()-1 in
+      // ReadyToInsertToCached() so cross-CPU completion is handled correctly.
+      // Allocated in uCache::init().
+      std::atomic<int>* per_cpu_inflight_count = nullptr;
 
       // accounting
       std::atomic<u64> usedPhysSize;
@@ -588,11 +623,12 @@ namespace ucache {
       std::atomic<u64> tlbFlush;
       std::atomic<u64> mispredictions;
       std::atomic<u64> prefetchedSize;
+      std::atomic<u64> prefetch_issued_bytes;   // bytes for which async IO was actually launched
       std::atomic<u64> poll_depth;
       std::atomic<u64> poll_depth_count;
 
       uCache();
-      void init(u64 physSize, int batch);
+      void init(u64 physSize, int evict_batch, int prefetch_batch);
       ~uCache();
 
       VMA* mmap(const char* name, u64 req_size, u64 pageSize=mmu::page_size, ufile* f=NULL);
@@ -616,7 +652,7 @@ namespace ucache {
 
   extern uCache* uCacheManager;
 
-  void createCache(u64 physSize, int batch);
+  void createCache(u64 physSize, int evict_batch, int prefetch_batch);
   void initFile(const char* name, size_t size);
 }; // namespace ucache
 

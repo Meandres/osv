@@ -73,6 +73,10 @@ public:
 
   // returns the currently free memory in bytes
   size_t free_memory();
+  // returns the number of 2 MiB child blocks fully free (usable by alloc_huge_page)
+  size_t free_huge_pages();
+  // fills *out with per-tree-kind statistics
+  void get_llfree_stats(llfree_stats_t *out);
 private:
   /// The actual llfree instance
   llfree_t *self{nullptr};

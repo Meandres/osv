@@ -290,6 +290,27 @@ void arch_init_premain()
 #endif
 
     disable_pic();
+
+    // Enable SSE/AVX before static constructors run.  Static constructors in
+    // third-party code (e.g. DuckDB) may use VEX-encoded vector instructions.
+    // Without CR4.OSXSAVE those instructions fault (#UD) and, since the IDT
+    // is not yet loaded, the CPU triple-faults.  The full per-CPU init
+    // (init_on_cpu) runs later in main(); this minimal setup is enough to let
+    // the constructor phase execute safely.
+    ulong cr4 = processor::read_cr4();
+    cr4 |= processor::cr4_osfxsr | processor::cr4_osxmmexcpt;
+    if (processor::features().xsave) {
+        cr4 |= processor::cr4_osxsave;
+    }
+    processor::write_cr4(cr4);
+    if (processor::features().xsave) {
+        auto bits = processor::xcr0_x87 | processor::xcr0_sse;
+        if (processor::features().avx) {
+            bits |= processor::xcr0_avx;
+        }
+        processor::write_xcr(processor::xcr0, bits);
+    }
+    processor::init_fpu();
 }
 
 #include "drivers/driver.hh"

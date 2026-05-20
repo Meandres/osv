@@ -378,7 +378,7 @@ gc-flags = $(gc-flags-$(conf_hide_symbols))
 
 gcc-opt-Og := $(call compiler-flag, -Og, -Og, compiler/empty.cc)
 
-CXXFLAGS = -std=$(conf_cxx_level) $(COMMON) $(cxx-hide-flags)
+CXXFLAGS = -std=$(conf_cxx_level) $(COMMON) $(cxx-hide-flags) $(EXTRA_CXXFLAGS)
 CFLAGS = -std=gnu99 $(COMMON)
 
 # should be limited to files under libc/ eventually
@@ -2193,6 +2193,14 @@ objects += fs/ext/ext_null_vfsops.o
 $(out)/loader.o: CXXFLAGS += -DHIDE_SYMBOLS=$(conf_hide_symbols)
 $(out)/core/trace.o: CXXFLAGS += -DHIDE_SYMBOLS=$(conf_hide_symbols)
 
+# Application objects to link directly into the kernel image.
+# Set APP_OBJECTS="path/to/app.o" on the make command line (no $(out)/ prefix; paths relative to OSv root).
+# The standard compilation rules apply: .c files use CFLAGS, .cc files use CXXFLAGS.
+# Example: make APP_OBJECTS="benchmarks/example/example.o"
+ifdef APP_OBJECTS
+objects += $(APP_OBJECTS)
+endif
+
 # The OSv kernel is linked into an ordinary, non-PIE, executable, so there is no point in compiling
 # with -fPIC or -fpie and objects that can be linked into a PIE. On the contrary, PIE-compatible objects
 # have overheads and can cause problems (see issue #1112). Recently, on some systems gcc's
@@ -2255,11 +2263,37 @@ def_symbols = --defsym=OSV_KERNEL_BASE=$(kernel_base) \
               --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift)
 endif
 
-$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/bootfs.o $(out)/libvdso-content.o $(loader_options_dep) $(version_script_file)
-	$(call quiet, $(LD) -o $@ $(def_symbols) \
+# Pre-built static archives to link into the kernel (e.g., from a CMake build).
+# Linked with --whole-archive so every object in the archive is included.
+# Must be absolute paths or paths relative to the OSv source root.
+# Example: make APP_LIBS="/abs/path/to/libduckdb.a"
+ifdef APP_LIBS
+app_libs_flags = --whole-archive $(APP_LIBS) --no-whole-archive
+endif
+
+# Optional LTO: compile all kernel objects with -flto and invoke ld.bfd via the
+# GCC LTO plugin so that a whole-program optimization pass runs at link time.
+# Enable with: make lto=1
+# Works best when APP_LIBS are also compiled with -flto -ffat-lto-objects.
+lto ?= 0
+ifeq ($(lto),1)
+# -ffat-lto-objects embeds normal machine code alongside the LTO IR so that
+# ld.bfd can link without the plugin when it cannot be located (e.g. Nix).
+# If the plugin IS found, ld will still use the IR for whole-program opts.
+COMMON += -flto -ffat-lto-objects
+lto_plugin := $(shell $(CC) -print-file-name=liblto_plugin.so 2>/dev/null)
+ifneq ($(lto_plugin),liblto_plugin.so)
+ifneq ($(lto_plugin),)
+lto_ld_flags := --plugin=$(lto_plugin)
+endif
+endif
+endif
+
+$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/bootfs.o $(out)/libvdso-content.o $(loader_options_dep) $(version_script_file) $(APP_LIBS)
+	$(call quiet, $(LD) $(lto_ld_flags) -o $@ $(def_symbols) \
 		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags -L$(out)/arch/$(arch) \
-            $(patsubst %version_script,--version-script=%version_script,$(patsubst %.ld,-T %.ld,$^)) \
-	    $(linker_archives_options) $(conf_linker_extra_options), \
+            $(patsubst %version_script,--version-script=%version_script,$(patsubst %.ld,-T %.ld,$(filter-out $(APP_LIBS),$^))) \
+	    $(app_libs_flags) $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
 	@# Build libosv.so matching this loader.elf. This is not a separate
 	@# rule because that caused bug #545.

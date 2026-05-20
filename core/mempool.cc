@@ -823,6 +823,14 @@ size_t llf::free_memory(){
     return llfree_free_frames(self) * page_size;
 }
 
+size_t llf::free_huge_pages(){
+    return llfree_free_huge(self);
+}
+
+void llf::get_llfree_stats(llfree_stats_t *out){
+    llfree_get_stats(self, out);
+}
+
 void llf::add_region(void *mem_start, size_t mem_size){
     assert(!is_ready());
 
@@ -1694,11 +1702,127 @@ extern "C" void free_contiguous_aligned(void* p)
 }
 
 namespace ucache {
-    void* frames_alloc(unsigned order){ return memory::llfree_allocator.alloc_huge_page(order); }
-    u64 frames_alloc_phys_addr(size_t size) { return memory::llfree_allocator.alloc_page_phys_addr(memory::llfree_allocator.order(size)); }
-    void free_frames(void* addr, unsigned order){ memory::llfree_allocator.free_page(addr, order); }
-    void frames_free_phys_addr(u64 idx, size_t size){ memory::llfree_allocator.free_page_phys_addr(idx, memory::llfree_allocator.order(size)); }
 
-    u64 stat_free_phys_mem() { return memory::llfree_allocator.free_memory(); }
-    u64 stat_total_phys_mem() { return memory::total_memory.load(); }
+// Private llfree instance: owns all physical frames reserved for uCache.
+// Set once by ucache_frames_init(); nullptr before createCache() is called.
+static llfree_t *s_ucache_llfree = nullptr;
+
+// Called once from createCache() before uCacheManager->init().
+// Bulk-allocates physSize/page_size frames from the global llfree and
+// releases them into a private llfree, isolating uCache page faults from
+// malloc's alloc_huge_page.
+void ucache_frames_init(u64 physSize) {
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    printf("[ucache_frames_init] physSize=%.2f GiB  total_mem=%.2f GiB\n",
+           physSize / GiB,
+           (double)memory::total_memory.load() / GiB);
+
+    if (physSize == 0) {
+        printf("[ucache_frames_init] physSize=0, skipping private pool\n");
+        return;
+    }
+
+    const size_t n_pages = physSize / mmu::page_size;
+    const size_t ncores  = sched::cpus.size();
+
+    // Phase 1: steal all uCache pages from the global llfree, recording each
+    // frame index.  Track the maximum frame index seen — that determines the
+    // minimum size the private llfree must cover.
+    // Use order-8 (1 MiB = 256-page) chunks: order < LLFREE_HUGE_ORDER (9),
+    // so llfree assigns these to TREE_FIXED rather than TREE_HUGE, preserving
+    // the huge-page pool for DuckDB's alloc_huge_page calls.
+    std::vector<u64> frame_list;
+    frame_list.reserve(n_pages);
+    u64 max_frame = 0;
+
+    const unsigned CHUNK_ORDER = 8;            // must be < LLFREE_HUGE_ORDER (9)
+    const size_t   CHUNK_PAGES = 1UL << CHUNK_ORDER;
+    size_t remaining = n_pages;
+
+    while (remaining >= CHUNK_PAGES) {
+        u64 base = memory::llfree_allocator.alloc_page_phys_addr(CHUNK_ORDER);
+        for (size_t j = 0; j < CHUNK_PAGES; j++) {
+            frame_list.push_back(base + j);
+            if (base + j > max_frame) max_frame = base + j;
+        }
+        remaining -= CHUNK_PAGES;
+    }
+    while (remaining > 0) {
+        u64 frame = memory::llfree_allocator.alloc_page_phys_addr(0);
+        frame_list.push_back(frame);
+        if (frame > max_frame) max_frame = frame;
+        remaining--;
+    }
+
+    printf("[ucache_frames_init] stole %zu pages (%.2f GiB)  max_frame=%zu\n",
+           frame_list.size(), frame_list.size() * (double)mmu::page_size / GiB,
+           (size_t)max_frame);
+
+    // Phase 2: create the private llfree.  Size it to max_frame+1 so every
+    // collected frame index is in range.  LLFREE_INIT_ALLOC marks all frames as
+    // allocated; we free only the uCache frames in Phase 3.
+    s_ucache_llfree = llfree_setup(ncores, max_frame + 1, LLFREE_INIT_ALLOC);
+    assert(s_ucache_llfree != nullptr);
+
+    // Phase 3: release all uCache frames into the private pool.
+    for (u64 fi : frame_list)
+        llfree_put(s_ucache_llfree, 0, fi, llflags(0));
+
+    printf("[ucache_frames_init] private llfree ready: free=%zu pages (%.2f GiB)\n",
+           llfree_free_frames(s_ucache_llfree),
+           llfree_free_frames(s_ucache_llfree) * (double)mmu::page_size / GiB);
+    printf("[ucache_frames_init] global llfree remaining: %.2f GiB\n",
+           memory::llfree_allocator.free_memory() / GiB);
 }
+
+void* frames_alloc(unsigned order) {
+    return memory::llfree_allocator.alloc_huge_page(order);
+}
+
+u64 frames_alloc_phys_addr(size_t size) {
+    if (s_ucache_llfree) {
+        llfree_result_t r = llfree_get(s_ucache_llfree, memory::mempool_cpuid(), llflags(0));
+        if (llfree_is_ok(r)) return r.frame;
+        assert(false && "uCache private frame pool exhausted");
+        return 0;
+    }
+    return memory::llfree_allocator.alloc_page_phys_addr(
+        memory::llfree_allocator.order(size));
+}
+
+void free_frames(void* addr, unsigned order) {
+    memory::llfree_allocator.free_page(addr, order);
+}
+
+void frames_free_phys_addr(u64 idx, size_t size) {
+    if (s_ucache_llfree) {
+        llfree_result_t res = llfree_put(s_ucache_llfree, memory::mempool_cpuid(),
+                                         idx, llflags(0));
+        assert(llfree_is_ok(res));
+        return;
+    }
+    memory::llfree_allocator.free_page_phys_addr(
+        idx, memory::llfree_allocator.order(size));
+}
+
+u64 stat_free_phys_mem()  { return memory::llfree_allocator.free_memory(); }
+u64 stat_total_phys_mem() { return memory::total_memory.load(); }
+
+size_t stat_free_huge_blocks() { return memory::llfree_allocator.free_huge_pages(); }
+
+void print_llfree_stats() {
+    llfree_stats_t s;
+    memory::llfree_allocator.get_llfree_stats(&s);
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    const double page = mmu::page_size;
+    printf("  [llfree] huge_blocks=%zu"
+           "  fixed=%zu trees %.2f GiB"
+           "  movable=%zu trees %.2f GiB"
+           "  huge_pool=%zu trees %.2f GiB\n",
+           s.free_huge_blocks,
+           s.fixed.trees,   s.fixed.free_frames   * page / GiB,
+           s.movable.trees, s.movable.free_frames  * page / GiB,
+           s.huge.trees,    s.huge.free_frames     * page / GiB);
+}
+
+} // namespace ucache

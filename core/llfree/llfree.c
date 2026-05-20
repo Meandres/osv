@@ -84,7 +84,7 @@ llfree_t *llfree_setup(size_t cores, size_t frames, uint8_t init) {
   };
 
   llfree_result_t ret =
-      llfree_init(self, cores, frames, LLFREE_INIT_FREE, meta);
+      llfree_init(self, cores, frames, init, meta);
 
   return llfree_is_ok(ret) ? self : NULL;
 }
@@ -655,6 +655,37 @@ size_t llfree_free_huge(llfree_t *self) {
   assert(self != NULL);
   // Count in the lower allocator
   return lower_free_huge(&self->lower);
+}
+
+void llfree_get_stats(llfree_t *self, llfree_stats_t *out) {
+  assert(self != NULL && out != NULL);
+  *out = (llfree_stats_t){0};
+
+  for (size_t i = 0; i < self->trees_len; i++) {
+    tree_t t = atom_load(&self->trees[i]);
+    llfree_kind_stat_t *ks;
+    if      (t.kind == TREE_MOVABLE) ks = &out->movable;
+    else if (t.kind == TREE_HUGE)    ks = &out->huge;
+    else                              ks = &out->fixed;
+    ks->trees++;
+    ks->free_frames += t.free;
+  }
+
+  // Add frames held in per-CPU reserved slots (subtracted from global tree counters when reserved)
+  for (size_t core = 0; core < self->cores; core++) {
+    local_t *local = get_local(self, core);
+    for (size_t kind = 0; kind < TREE_KINDS; kind++) {
+      reserved_t rsv = atom_load(&local->reserved[kind]);
+      if (!rsv.present) continue;
+      llfree_kind_stat_t *ks;
+      if      (kind == TREE_MOVABLE) ks = &out->movable;
+      else if (kind == TREE_HUGE)    ks = &out->huge;
+      else                            ks = &out->fixed;
+      ks->free_frames += rsv.free;
+    }
+  }
+
+  out->free_huge_blocks = lower_free_huge(&self->lower);
 }
 
 bool llfree_is_free(llfree_t *self, uint64_t frame, size_t order) {

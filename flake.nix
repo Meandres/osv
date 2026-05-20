@@ -5,9 +5,10 @@
     flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:nixos/nixpkgs?ref=23.11";
     nixpkgs-2211.url = "github:nixos/nixpkgs?ref=22.11";
+    nur-niwa.url = "github:Meandres/nur-niwa";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-2211, flake-utils, }@inputs:
+  outputs = { self, nixpkgs, nixpkgs-2211, flake-utils, nur-niwa }@inputs:
     flake-utils.lib.eachDefaultSystem
       (system:
         let
@@ -15,7 +16,7 @@
             inherit system;
             overlays = [ (import ./overlays.nix { inherit inputs; }) ];
           };
-          #glibc-2-38 = inputs.nixpkgs-2311.legacyPackages.${pkgs.system}.glibc.all;
+          niwa-pkgs = nur-niwa.packages.x86_64-linux;
         in
         {
           devShell = pkgs.mkShell {
@@ -77,6 +78,7 @@
               glog
               lz4
               openssl
+              niwa-pkgs.driverctl
             ];
 
             buildInputs = with pkgs; [
@@ -100,29 +102,8 @@
             LIBZ_DIR="${pkgs.libz}";
             LIBSELINUX_DIR="${pkgs.libselinux.out}";
             DPDK_DIR="${pkgs.dpdk}";
-
-            CAPSTAN_QEMU_PATH = "${pkgs.qemu}/bin/qemu-system-x86_64";
-
-            /*shellHook = ''
-              mkdir $TMP/openssl-all
-              ln -rsf ${pkgs.openssl}/* $TMP/openssl-all
-              ln -rsf ${pkgs.openssl.dev}/* $TMP/openssl-all
-              ln -rsf ${pkgs.openssl.out}/* $TMP/openssl-all
-              export OPENSSL_DIR="$TMP/openssl-all";
-              export OPENSSL_LIB_PATH="$TMP/openssl-all/lib";
-            '';*/
           };
         }
       );
 }
-              #/bin/bash --version >/dev/null 2>&1 || {
-               # echo >&2 "Error: /bin/bash is required but was not found.  Aborting."
-                #echo >&2 "If you're on NixOs, consider using https://github.com/Mic92/envfs."
-                #exit 1
-                #}
-
-              #mkdir $TMP/libboost
-              #ln -s ${pkgs.osv-boost}/lib/* $TMP/libboost/
-              #for file in $TMP/libboost/*-x64*; do mv "$file" "''${file//-x64/}"; done
-              #export boost_base="$TMP/libboost"
 

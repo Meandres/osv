@@ -4,8 +4,17 @@ bool tree_reserve(tree_t *self, treeF_t min, treeF_t max, uint8_t kind)
 {
 	assert(min < max);
 
-	if (!self->reserved && min <= self->free && self->free <= max &&
-	    (self->kind == kind || self->free == LLFREE_TREE_SIZE)) {
+	// A tree can be reserved for `kind` if it is already that kind, fully free
+	// (free == LLFREE_TREE_SIZE → can adopt any kind), or — for TREE_HUGE only —
+	// has at least one 2 MiB child worth of free pages.  The last case lets
+	// alloc_huge_page use TREE_FIXED trees whose ucache-stolen pages prevent them
+	// from ever reaching LLFREE_TREE_SIZE, but that still contain fully-free
+	// 2 MiB child blocks.
+	bool kind_ok = (self->kind == kind) ||
+	               (self->free == LLFREE_TREE_SIZE) ||
+	               (kind == TREE_HUGE &&
+	                self->free >= (treeF_t)(1u << LLFREE_HUGE_ORDER));
+	if (!self->reserved && min <= self->free && self->free <= max && kind_ok) {
 		*self = tree_new(0, true, kind);
 		return true;
 	}

@@ -53,6 +53,7 @@
 #include <osv/mount.h>
 #include <dirent.h>
 #include <mntent.h>
+#include <osv/application.hh>
 
 #include "drivers/zfs.hh"
 #include "drivers/random.hh"
@@ -158,7 +159,7 @@ static bool opt_list_tracepoints = false;
 static bool opt_strace = false;
 #endif
 #endif
-static bool opt_mount = true;
+static bool opt_mount = false;
 static bool opt_nvme_ext = false;
 static bool opt_pivot = true;
 static std::string opt_rootfs;
@@ -452,7 +453,7 @@ std::vector<std::vector<std::string> > prepare_commands(char* app_cmdline)
     return commands;
 }
 
-static std::string read_file(std::string fn)
+/*static std::string read_file(std::string fn)
 {
     FILE *fp = fopen(fn.c_str(), "r");
     if (!fp) {
@@ -477,7 +478,7 @@ static void stop_all_remaining_app_threads()
     while(!application::unsafe_stop_and_abandon_other_threads()) {
         usleep(100000);
     }
-}
+}*/
 
 static int load_fs_library(const char* fs_library_path, std::function<int()> on_load_fun = nullptr)
 {
@@ -553,8 +554,6 @@ static int load_ext_library_and_mount_ext_root(bool pivot_when_error = false)
 
 void* do_main_thread(void *_main_args)
 {
-    auto app_cmdline = static_cast<char*>(_main_args);
-
     if (!arch_setup_console(opt_console)) {
         abort("Unknown console:%s\n", opt_console.c_str());
     }
@@ -736,9 +735,24 @@ void* do_main_thread(void *_main_args)
         }
     }
 
+    char* app_cmdline = static_cast<char*>(_main_args);
+    std::vector<char*> app_argv;
+    if (app_cmdline && *app_cmdline != '\0') {
+        char* saveptr;
+        char* tok = strtok_r(app_cmdline, " \t", &saveptr);
+        while (tok) {
+            app_argv.push_back(tok);
+            tok = strtok_r(nullptr, " \t", &saveptr);
+        }
+    }
+    int app_argc = static_cast<int>(app_argv.size());
+    app_argv.push_back(nullptr);
+    app_main(app_argc, app_argv.data());
+
+    /*
     auto commands = prepare_commands(app_cmdline);
 
-    // Run command lines in /init/* before the manual command line
+    // Run command lines in /init/ * before the manual command line
     if (opt_init) {
         std::vector<std::vector<std::string>> init_commands;
         struct dirent **namelist = nullptr;
@@ -809,6 +823,7 @@ void* do_main_thread(void *_main_args)
     }
 
     application::join_all();
+    */
     return nullptr;
 }
 

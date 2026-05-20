@@ -263,6 +263,10 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
 {
 #endif
     trace_sched_sched();
+    if (sched::exception_depth > 1) {
+        debug_early_u64("CRASH: exception_depth=", sched::exception_depth);
+        debug_early("\n");
+    }
     assert(sched::exception_depth <= 1);
     need_reschedule = false;
     handle_incoming_wakeups();

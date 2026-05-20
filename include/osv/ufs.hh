@@ -70,6 +70,7 @@ namespace ucache {
       virtual aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring) = 0;
       virtual aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring) = 0;
       virtual void poll(aio_req_t* reqs) = 0;
+      virtual void poll_on_cpu(aio_req_t* reqs, int cpu_id) = 0;
       virtual void close() = 0;
   };
 
@@ -86,6 +87,7 @@ namespace ucache {
       aio_req_t* aread(void* buf, u64 offset, u64 size, bool ring);
       aio_req_t* awrite(void* buf, u64 offset, u64 size, bool ring);
       void poll(aio_req_t* reqs);
+      void poll_on_cpu(aio_req_t* reqs, int cpu_id);
       void close();
       //void commit_io();//std::vector<int> &devices); 
 

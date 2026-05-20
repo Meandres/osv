@@ -163,6 +163,25 @@ size_t llfree_free_frames(llfree_t *self);
 /// Returns number of currently free frames
 size_t llfree_free_huge(llfree_t *self);
 
+// == Per-kind statistics ==
+
+/// Free-frame summary for one tree kind
+typedef struct llfree_kind_stat {
+  size_t trees;        // number of trees tagged with this kind
+  size_t free_frames;  // total free frames in these trees (including reserved CPU slots)
+} llfree_kind_stat_t;
+
+/// Snapshot of llfree state broken down by tree kind
+typedef struct llfree_stats {
+  llfree_kind_stat_t fixed;    // TREE_FIXED: order < LLFREE_HUGE_ORDER
+  llfree_kind_stat_t movable;  // TREE_MOVABLE
+  llfree_kind_stat_t huge;     // TREE_HUGE: order >= LLFREE_HUGE_ORDER
+  size_t free_huge_blocks;     // 2 MiB child blocks with ALL pages free (alloc_huge_page candidates)
+} llfree_stats_t;
+
+/// Fill *out with a consistent snapshot of free frames per tree kind.
+void llfree_get_stats(llfree_t *self, llfree_stats_t *out);
+
 // == Ballooning ==
 
 /// Search for a free and not reclaimed huge page and mark it reclaimed (and

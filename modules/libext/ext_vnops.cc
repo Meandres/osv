@@ -597,7 +597,7 @@ ext_ioctl(vnode_t *vp, file_t *fp, u_long com, void *data)
     if(com == req_create_ucache){
         ucache::ioctl_req_ucache* req = (ucache::ioctl_req_ucache*)data;
         if(ucache::uCacheManager->totalPhysSize == 0){
-            ucache::createCache(req->physSize, req->batch);
+            ucache::createCache(req->physSize, req->batch, 32);
         }
         ucache::VMA* vma = ucache::uCacheManager->mmap(req->filename.c_str(), req->virtSize, req->bufsize);
         req->ret = (void*)vma->start;

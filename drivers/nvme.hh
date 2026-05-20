@@ -29,7 +29,7 @@
 #define NVME_ADMIN_QUEUE_SIZE 8
 
 //Will be lower if the device doesnt support the specified queue size
-#define NVME_IO_QUEUE_SIZE 1024
+#define NVME_IO_QUEUE_SIZE 4096
 
 namespace nvme {
 
@@ -57,7 +57,8 @@ public:
 
     // poll-based
     int make_async_request(struct bio* bio, u32 nsid = 1);
-    void poll_req(struct bio* bio, u32 nsid = 1); 
+    void poll_req(struct bio* bio, u32 nsid = 1);
+    void poll_req_on_queue(struct bio* bio, int cpu_id);
     bool poll_mode;
 
     static hw_driver* probe(hw_device* dev);

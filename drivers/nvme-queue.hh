@@ -146,7 +146,9 @@ public:
 
     int make_async_request(struct bio* bio, u32 nsid);
     void poll_cq();
+    void drain_until(struct bio* bio);
 private:
+    void poll_cq_locked();
     void init_pending_bios(u32 level);
 
     inline u16 cid_to_row(u16 cid) { return cid / _qsize; }
